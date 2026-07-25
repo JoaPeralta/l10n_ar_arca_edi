@@ -9,9 +9,8 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
-from odoo.exceptions import UserError
-
 from odoo.addons.l10n_ar.tests.common import TestArCommon
+from odoo.exceptions import UserError
 
 # Valid CUIT (verification digit checked): 30-71234567-1
 TEST_CUIT = "30-71234567-1"
