@@ -69,5 +69,57 @@ Step 6: Configure Sales Journal
 #. Go to **Invoicing > Configuration > Journals**.
 #. Open your sales journal.
 #. Enable **Use Documents** and **Is ARCA POS?**.
-#. Set **ARCA POS System** to **Online Invoice** (``RLI_RLM`` mode).
+#. Set **ARCA POS System** to **Electronic Invoice - Web Service**
+   (``RAW_MAW``). This is the value that enables ARCA electronic invoicing on
+   the journal. *Online Invoice* (``RLI_RLM``) means the invoices are typed
+   into ARCA's own portal by hand, and does not enable it.
 #. Set the **ARCA POS Number** matching your point of sale registered in ARCA.
+
+Step 7: Align the numbering
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The number Odoo prints is the number sent to ARCA, so the two counters must
+start in step. Before the first invoice, check what ARCA already has for that
+point of sale and document type, and make sure Odoo's next number is exactly one
+more.
+
+If they differ, the first authorization is refused with a message naming both
+numbers rather than issuing under a number the accounting does not show.
+
+Running the homologacion tests
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The suite in ``tests/test_homologation.py`` talks to the real homologacion
+environment. It skips cleanly unless all four variables are set, and it never
+touches production: the certificate environment is pinned to ``testing`` and
+asserted before every test.
+
+.. code-block:: bash
+
+   export ARCA_HOMO_CUIT=20-12345678-9
+   export ARCA_HOMO_CERT="$(base64 -w0 homologacion.crt)"
+   export ARCA_HOMO_PRIVATE_KEY="$(base64 -w0 homologacion.key)"
+   export ARCA_HOMO_POS=1
+
+   odoo -d <db> -i l10n_ar_arca_edi --test-enable         --test-tags 'arca_homologation' --stop-after-init
+
+What it checks:
+
+* ``FEDummy`` answers and the three ARCA subsystems report OK
+* WSAA issues an access ticket for this certificate
+* the configured point of sale is enabled for this CUIT
+* the receptor VAT condition table embedded in the module still matches what
+  ARCA reports
+* an invoice is authorized end to end, and reading it back with
+  ``FECompConsultar`` returns the same CAE
+* querying a voucher that does not exist returns nothing, which is the
+  behaviour reconciliation depends on
+
+The certificate and key are read from the environment and never written to the
+repository. The ``secrets`` job in CI fails the build if key material is ever
+committed.
+
+.. warning::
+
+   These tests issue real vouchers in homologacion, consuming numbers at that
+   point of sale. Use a point of sale reserved for testing.
