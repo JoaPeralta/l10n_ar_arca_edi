@@ -167,19 +167,33 @@ jobs:
             --max-cron-threads=0 \
             --stop-after-init 2>&1 | tee odoo-test.log
 
-      - name: Fail on any test failure
+      - name: Check the test summary
         run: |
-          # odoo's exit status is checked by the step above; this catches
-          # failures that are only reported in the log.
-          if grep -E '^[0-9-]+ [0-9:,]+ [0-9]+ (ERROR|CRITICAL)' odoo-test.log \
-             | grep -viE 'werkzeug|Failed to load registry|database .* does not exist'; then
-            echo "::error::Errors were reported during the test run"
+          # Odoo's exit status already covers failures; this reads its own
+          # summary so a suite that silently did not run is caught too. Grepping
+          # for ERROR lines is not usable here: one test deliberately violates a
+          # unique index to prove the database enforces the invariant, and
+          # PostgreSQL logs that at ERROR level.
+          summary=$(grep -oE '[0-9]+ failed, [0-9]+ error\(s\) of [0-9]+ tests' odoo-test.log | tail -1)
+          if [ -z "$summary" ]; then
+            echo "::error::No test summary was produced; the suite did not run."
             exit 1
           fi
-          if ! grep -q 'tests.*failed, .* error(s) of .* tests\|0 failed, 0 error(s)' odoo-test.log; then
-            echo "Test summary line not found; relying on the exit status above."
+          echo "$summary"
+          failed=${summary%% failed*}
+          rest=${summary#* failed, }
+          errors=${rest%% error*}
+          total=${summary##* of }
+          total=${total%% tests}
+          if [ "$failed" != "0" ] || [ "$errors" != "0" ]; then
+            echo "::error::$summary"
+            exit 1
           fi
-          echo "Test run clean"
+          if [ "$total" -lt 100 ]; then
+            echo "::error::Only $total tests ran; the suite looks truncated."
+            exit 1
+          fi
+          echo "$total tests passed"
 
       - name: Upload the log
         if: always()
