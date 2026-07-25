@@ -226,15 +226,28 @@ class TestArcaConcurrentWorkers(ArcaTestCommon):
         release = threading.Event()
         order = []
         results = {}
+        failures = []
 
-        def first_worker():
+        def worker(name, body):
+            """Surface a thread's failure instead of letting it look like a pass."""
+            # Odoo's own worker threads carry the database they serve; the
+            # logging and pooling code reads it.
+            threading.current_thread().dbname = self.env.cr.dbname
+            try:
+                body()
+            except BaseException as exc:  # noqa: BLE001 - reported, not swallowed
+                failures.append(f"{name}: {exc!r}")
+                release.set()
+                inside.release()
+
+        def first_body():
             with fiscal_transaction(self.env, PROBE_KEY_A):
                 order.append("first-in")
                 inside.release()
                 release.wait(timeout=15)
                 order.append("first-out")
 
-        def second_worker():
+        def second_body():
             inside.acquire(timeout=15)
             try:
                 with fiscal_transaction(self.env, PROBE_KEY_A):
@@ -245,14 +258,15 @@ class TestArcaConcurrentWorkers(ArcaTestCommon):
                 release.set()
 
         threads = [
-            threading.Thread(target=first_worker),
-            threading.Thread(target=second_worker),
+            threading.Thread(target=worker, args=("first", first_body)),
+            threading.Thread(target=worker, args=("second", second_body)),
         ]
         for thread in threads:
             thread.start()
         for thread in threads:
             thread.join(timeout=30)
 
+        self.assertEqual(failures, [], "A worker thread failed")
         self.assertEqual(order, ["first-in", "first-out"])
         self.assertFalse(
             results.get("entered_while_held", True),
