@@ -89,7 +89,7 @@ class TestCertificateUpload(ArcaTestCommon):
         with self.assertRaisesRegex(UserError, "does not match the private key"):
             certificate.action_process_certificate(base64.b64encode(foreign_cert))
 
-    def test_certificate_for_a_different_cuit_is_refused(self):
+    def test_certificate_issued_to_another_holder_is_refused(self):
         certificate = self._draft_certificate()
         certificate.action_generate_key_and_csr()
         key_pem = certificate.sudo().private_key
@@ -117,7 +117,7 @@ class TestCertificateUpload(ArcaTestCommon):
             .not_valid_after(now + datetime.timedelta(days=30))
             .sign(key, hashes.SHA256())
         )
-        with self.assertRaisesRegex(UserError, "issued for CUIT"):
+        with self.assertRaisesRegex(UserError, "as its holder"):
             certificate.action_process_certificate(
                 base64.b64encode(other.public_bytes(serialization.Encoding.PEM))
             )
