@@ -147,7 +147,7 @@ class TestArcaHomologation(ArcaTestCommon):
                 "align the journal sequence before running this test"
             )
 
-        invoice._l10n_ar_arca_authorize(with_commit=False)
+        invoice._l10n_ar_arca_authorize()
         self.assertEqual(invoice.l10n_ar_arca_state, "authorized")
         self.assertTrue(invoice.l10n_ar_arca_cae)
 

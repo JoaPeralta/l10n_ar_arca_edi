@@ -287,8 +287,9 @@ class TestArcaAuthorization(ArcaTestCommon):
         """Validation 10016, checked before sending rather than after."""
         invoice = self._new_invoice()
         self._post_invoice(invoice)
-        _pos, number = invoice._l10n_ar_arca_document_number_parts()
-        self.service.last_authorized = number + 5
+        pos, number = invoice._l10n_ar_arca_document_number_parts()
+        doc_type = int(invoice.l10n_latam_document_type_id.code)
+        self.service.set_last_authorized(pos, doc_type, number + 5)
         with self.assertRaisesRegex(UserError, "already authorized"):
             self._authorize(invoice)
         self.assertFalse(self.service.requests)
@@ -296,8 +297,9 @@ class TestArcaAuthorization(ArcaTestCommon):
     def test_a_gap_in_the_numbering_is_reported(self):
         invoice = self._new_invoice()
         self._post_invoice(invoice)
-        _pos, number = invoice._l10n_ar_arca_document_number_parts()
-        self.service.last_authorized = number - 5
+        pos, number = invoice._l10n_ar_arca_document_number_parts()
+        doc_type = int(invoice.l10n_latam_document_type_id.code)
+        self.service.set_last_authorized(pos, doc_type, number - 5)
         with self.assertRaisesRegex(UserError, "gap in the numbering"):
             self._authorize(invoice)
         self.assertFalse(self.service.requests)

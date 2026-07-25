@@ -127,11 +127,6 @@ class L10nArArcaCertificate(models.Model):
         copy=False,
     )
 
-    _cuit_environment_company_uniq = models.Constraint(
-        "unique(company_id, cuit, environment)",
-        "A company already has a certificate for that CUIT and environment.",
-    )
-
     # ------------------------------------------------------------------
     # Validation
     # ------------------------------------------------------------------

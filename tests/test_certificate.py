@@ -57,7 +57,7 @@ class TestCertificateUpload(ArcaTestCommon):
     def _draft_certificate(self, cuit=TEST_CUIT):
         return self.env["l10n_ar.arca.certificate"].create(
             {
-                "name": f"Draft {cuit}",
+                "name": f"Draft {cuit} {self.env.cr.dbname[:4]}",
                 "company_id": self.company_ri.id,
                 "cuit": cuit,
                 "environment": "testing",
@@ -215,17 +215,29 @@ class TestPrivateKeyProtection(ArcaTestCommon):
             }
         )
 
+    def _assert_field_is_out_of_reach(self, record, field_name):
+        """The field must be either refused or absent -- never returned."""
+        try:
+            values = record.read([field_name])
+        except AccessError:
+            return
+        self.assertNotIn(
+            field_name,
+            values[0],
+            f"{field_name} was handed to a user who should not see it",
+        )
+
     def test_an_invoicing_user_cannot_read_the_private_key(self):
         user = self._invoicing_user()
-        certificate = self.certificate.with_user(user)
-        with self.assertRaises((AccessError, KeyError)):
-            certificate.read(["private_key"])
+        self._assert_field_is_out_of_reach(
+            self.certificate.with_user(user), "private_key"
+        )
 
     def test_an_invoicing_user_cannot_read_the_ticket_cache(self):
         user = self._invoicing_user()
-        certificate = self.certificate.with_user(user)
-        with self.assertRaises((AccessError, KeyError)):
-            certificate.read(["l10n_ar_arca_token_cache"])
+        self._assert_field_is_out_of_reach(
+            self.certificate.with_user(user), "l10n_ar_arca_token_cache"
+        )
 
     def test_an_invoicing_user_still_sees_that_a_key_exists(self):
         """Enough to diagnose configuration, not enough to exfiltrate."""

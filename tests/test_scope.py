@@ -21,9 +21,9 @@ class TestArcaScope(ArcaTestCommon):
         super().setUp()
         self.service = self._patch_service(FakeArcaService())
 
-    def _document_type_code(self, invoice, code):
-        invoice.l10n_latam_document_type_id = self._document_type(str(code))
-        return invoice._l10n_ar_arca_document_type_code
+    def _validate(self, code):
+        """Validate a code without forging an invoice that cannot exist."""
+        return self.env["account.move"]._l10n_ar_arca_validate_document_type_code(code)
 
     def test_supported_types_match_the_wsfev1_table(self):
         """Validation 700 of the manual lists what WSFEv1 accepts."""
@@ -39,25 +39,23 @@ class TestArcaScope(ArcaTestCommon):
             self.assertIn(code, constants.WSFEX_DOCUMENT_TYPES)
 
     def test_export_document_is_refused_with_the_reason(self):
-        invoice = self._new_invoice()
-        self._post_invoice(invoice)
-        invoice.l10n_latam_document_type_id = self._document_type("19")
-        with self.assertRaisesRegex(UserError, "WSFEX"):
-            invoice._l10n_ar_arca_document_type_code()
+        for code in (19, 20, 21):
+            with self.assertRaisesRegex(UserError, "WSFEX"):
+                self._validate(code)
 
     def test_mipyme_credit_invoices_are_refused_with_the_reason(self):
-        invoice = self._new_invoice()
-        self._post_invoice(invoice)
-        invoice.l10n_latam_document_type_id = self._document_type("201")
-        with self.assertRaisesRegex(UserError, "MiPyME"):
-            invoice._l10n_ar_arca_document_type_code()
+        for code in (201, 206, 211):
+            with self.assertRaisesRegex(UserError, "MiPyME"):
+                self._validate(code)
 
     def test_unknown_document_type_is_refused(self):
-        invoice = self._new_invoice()
-        self._post_invoice(invoice)
-        invoice.l10n_latam_document_type_id = self._document_type("60")
+        """Code 60 exists in Argentina but WSFEv1 does not authorize it."""
         with self.assertRaisesRegex(UserError, "not accepted by"):
-            invoice._l10n_ar_arca_document_type_code()
+            self._validate(60)
+
+    def test_every_supported_code_passes_validation(self):
+        for code in sorted(constants.SUPPORTED_DOCUMENT_TYPES):
+            self.assertTrue(self._validate(code), code)
 
     def test_invoice_a_is_supported(self):
         invoice = self._new_invoice()

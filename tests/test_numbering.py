@@ -62,10 +62,19 @@ class TestArcaDocumentNumberParts(ArcaTestCommon):
             invoice._l10n_ar_arca_document_number_parts()
 
     def test_a_number_from_another_point_of_sale_is_refused(self):
-        """The journal and the printed number must agree."""
+        """The journal and the printed number must agree.
+
+        l10n_ar locks a journal's point of sale once it has posted invoices, so
+        the mismatch is induced on the number instead -- which is exactly the
+        drift this guard exists to catch.
+        """
         invoice = self._new_invoice()
         self._post_invoice(invoice)
-        self.arca_journal.l10n_ar_afip_pos_number = TEST_POS_NUMBER + 1
+        self.patch(
+            type(invoice),
+            "_l10n_ar_arca_document_number_parts",
+            lambda self: (TEST_POS_NUMBER + 1, 1),
+        )
         with self.assertRaisesRegex(UserError, "belongs to point of sale"):
             self._authorize(invoice)
 

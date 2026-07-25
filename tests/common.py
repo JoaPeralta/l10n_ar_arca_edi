@@ -26,7 +26,10 @@ class FakeArcaService:
     """
 
     def __init__(self, last_authorized=0, cae="70123456789012", raise_on_request=None):
-        self.last_authorized = last_authorized
+        # ARCA numbers each (point of sale, document type) separately, so the
+        # fake does too: a credit note does not continue the invoice sequence.
+        self.last_authorized = {}
+        self.default_last_authorized = last_authorized
         self.cae = cae
         self.raise_on_request = raise_on_request
         self.requests = []
@@ -36,7 +39,12 @@ class FakeArcaService:
 
     # -- FECompUltimoAutorizado --------------------------------------
     def fe_comp_ultimo_autorizado(self, certificate, pos_number, doc_type_code):
-        return self.last_authorized
+        return self.last_authorized.get(
+            (pos_number, doc_type_code), self.default_last_authorized
+        )
+
+    def set_last_authorized(self, pos_number, doc_type_code, number):
+        self.last_authorized[(pos_number, doc_type_code)] = number
 
     # -- FECAESolicitar ----------------------------------------------
     def fe_cae_solicitar(self, certificate, header, detail):
@@ -48,7 +56,7 @@ class FakeArcaService:
         if self.raise_on_request is not None:
             raise self.raise_on_request
         number = detail["CbteDesde"]
-        self.last_authorized = number
+        self.last_authorized[(header["PtoVta"], header["CbteTipo"])] = number
         self.known_vouchers[(header["PtoVta"], header["CbteTipo"], number)] = self.cae
         return {
             "result": "A",
@@ -204,8 +212,12 @@ class ArcaTestCommon(TestArCommon):
         return service
 
     def _authorize(self, invoice):
-        """Run the authorization protocol inside the test transaction."""
-        return invoice._l10n_ar_arca_authorize(with_commit=False)
+        """Run the authorization protocol.
+
+        The checkpoint commits are no-ops under tests, so the ordering is still
+        exercised without breaking the test cursor.
+        """
+        return invoice._l10n_ar_arca_authorize()
 
     def _document_type(self, code):
         return self.env["l10n_latam.document.type"].search(

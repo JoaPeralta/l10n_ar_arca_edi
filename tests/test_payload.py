@@ -170,10 +170,15 @@ class TestArcaPayload(ArcaTestCommon):
         self.assertEqual(detail["ImpTotal"], 100.0)
 
     def test_perceptions_are_reported_as_imp_trib(self):
+        """A IIBB perception is a tribute: not VAT, and not "untaxed" either."""
+        self.tax_perc_iibb.active = True
         invoice = self._new_invoice(
             lines=[
                 self._prepare_invoice_line(
-                    product_id=self.product_iva_105_perc, price_unit=100.0, quantity=1
+                    product_id=self.product_iva_21,
+                    price_unit=100.0,
+                    quantity=1,
+                    tax_ids=[(6, 0, (self.tax_21 + self.tax_perc_iibb).ids)],
                 )
             ]
         )
@@ -254,17 +259,32 @@ class TestArcaPayload(ArcaTestCommon):
     # ------------------------------------------------------------------
 
     def test_class_c_reports_no_vat(self):
-        """Validations 10018-10022: class C carries no Iva group."""
+        """Validations 10018-10022: class C carries no Iva group.
+
+        A Responsable Inscripto never issues class C, so rather than forging an
+        invoice that could not exist, the mapping is checked against the amounts
+        l10n_ar produces for a class C document: everything in ImpNeto.
+        """
         invoice = self._new_invoice()
         self._post_invoice(invoice)
-        detail = invoice._l10n_ar_arca_prepare_request(
-            self.certificate, 11, TEST_POS_NUMBER, 1
-        )[1]
-        self.assertNotIn("Iva", detail)
-        self.assertEqual(detail["ImpIVA"], 0.0)
-        self.assertEqual(detail["ImpTotConc"], 0.0)
-        self.assertEqual(detail["ImpOpEx"], 0.0)
-        self.assertEqual(detail["ImpNeto"], detail["ImpTotal"] - detail["ImpTrib"])
+        total = invoice.amount_total
+        self.patch(
+            type(invoice),
+            "_l10n_ar_get_amounts",
+            lambda self, base_lines=None: {
+                "vat_amount": 0.0,
+                "vat_taxable_amount": total,
+                "vat_exempt_base_amount": 0.0,
+                "vat_untaxed_base_amount": 0.0,
+                "not_vat_taxes_amount": 0.0,
+            },
+        )
+        amounts, vat_lines = invoice._l10n_ar_arca_amounts(11)
+        self.assertEqual(vat_lines, [])
+        self.assertEqual(amounts["ImpIVA"], 0.0)
+        self.assertEqual(amounts["ImpTotConc"], 0.0)
+        self.assertEqual(amounts["ImpOpEx"], 0.0)
+        self.assertEqual(amounts["ImpNeto"], amounts["ImpTotal"] - amounts["ImpTrib"])
 
     # ------------------------------------------------------------------
     # Receptor
@@ -370,7 +390,8 @@ class TestArcaPayload(ArcaTestCommon):
         self.assertEqual(detail["FchServHasta"], "20260630")
         self.assertEqual(detail["FchVtoPago"], "20260810")
 
-    def test_service_dates_fall_back_to_the_invoice_date(self):
+    def test_service_period_defaults_to_the_invoice_month(self):
+        """l10n_ar fills the period on post; the request must carry that."""
         invoice = self._new_invoice(
             lines=[
                 self._prepare_invoice_line(
@@ -379,8 +400,29 @@ class TestArcaPayload(ArcaTestCommon):
             ]
         )
         detail = self._sent_detail(invoice)
-        self.assertEqual(detail["FchServDesde"], "20260725")
-        self.assertEqual(detail["FchServHasta"], "20260725")
+        self.assertEqual(detail["FchServDesde"], "20260701")
+        self.assertEqual(detail["FchServHasta"], "20260731")
+        self.assertEqual(
+            detail["FchServDesde"],
+            invoice.l10n_ar_afip_service_start.strftime("%Y%m%d"),
+        )
+
+    def test_service_dates_fall_back_to_the_invoice_date(self):
+        """With no period recorded, the invoice date is used rather than nothing."""
+        invoice = self._new_invoice(
+            lines=[
+                self._prepare_invoice_line(
+                    product_id=self.service_iva_27, price_unit=100.0, quantity=1
+                )
+            ]
+        )
+        self._post_invoice(invoice)
+        invoice.write(
+            {"l10n_ar_afip_service_start": False, "l10n_ar_afip_service_end": False}
+        )
+        dates = invoice._l10n_ar_arca_service_dates(invoice.invoice_date)
+        self.assertEqual(dates["FchServDesde"], "20260725")
+        self.assertEqual(dates["FchServHasta"], "20260725")
 
     def test_mixed_products_and_services_use_concept_3(self):
         invoice = self._new_invoice(

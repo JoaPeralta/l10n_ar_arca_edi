@@ -4,7 +4,7 @@
 import logging
 import uuid
 
-from odoo import _, api, fields, models
+from odoo import _, api, fields, models, modules
 
 _logger = logging.getLogger(__name__)
 
@@ -248,12 +248,15 @@ class L10nArArcaAttempt(models.Model):
             order="id asc",
             limit=limit,
         )
+        in_test = modules.module.current_test
         for attempt in open_attempts:
             try:
                 attempt._reconcile()
-                self.env.cr.commit()
+                if not in_test:
+                    self.env.cr.commit()
             except Exception as exc:  # noqa: BLE001 - one bad attempt must not stop the rest
-                self.env.cr.rollback()
+                if not in_test:
+                    self.env.cr.rollback()
                 _logger.warning(
                     "Could not reconcile ARCA attempt %s: %s",
                     attempt.correlation_id,

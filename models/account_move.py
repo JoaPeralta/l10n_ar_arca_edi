@@ -7,7 +7,7 @@ import json
 import logging
 from contextlib import contextmanager
 
-from odoo import _, api, fields, models
+from odoo import _, api, fields, models, modules
 from odoo.exceptions import UserError
 from odoo.tools import float_round
 
@@ -141,7 +141,7 @@ class AccountMove(models.Model):
                 moves = new_env["account.move"].browse(move_ids).exists()
                 for move in moves:
                     try:
-                        move._l10n_ar_arca_authorize(with_commit=True)
+                        move._l10n_ar_arca_authorize()
                     except Exception:  # noqa: BLE001 - one invoice must not stop the batch
                         cr.rollback()
                         _logger.exception(
@@ -201,10 +201,10 @@ class AccountMove(models.Model):
     def action_l10n_ar_arca_authorize(self):
         """Button: request the CAE for this invoice."""
         self.ensure_one()
-        self._l10n_ar_arca_authorize(with_commit=True)
+        self._l10n_ar_arca_authorize()
         return self._l10n_ar_arca_notify_state()
 
-    def _l10n_ar_arca_authorize(self, with_commit=True):
+    def _l10n_ar_arca_authorize(self):
         """Obtain a CAE for this invoice.
 
         The order of operations is the whole point:
@@ -306,7 +306,7 @@ class AccountMove(models.Model):
 
             # Durable evidence must exist before the request leaves. Everything
             # after this point can fail without losing track of the voucher.
-            self._l10n_ar_arca_checkpoint(with_commit)
+            self._l10n_ar_arca_checkpoint()
 
             try:
                 result = wsfe.fe_cae_solicitar(certificate, header, detail)
@@ -318,7 +318,7 @@ class AccountMove(models.Model):
                         "l10n_ar_arca_error_message": str(exc),
                     }
                 )
-                self._l10n_ar_arca_checkpoint(with_commit)
+                self._l10n_ar_arca_checkpoint()
                 raise UserError(
                     _(
                         "The request was sent to ARCA but the answer was lost, so "
@@ -342,7 +342,7 @@ class AccountMove(models.Model):
                         "l10n_ar_arca_error_message": str(exc),
                     }
                 )
-                self._l10n_ar_arca_checkpoint(with_commit)
+                self._l10n_ar_arca_checkpoint()
                 raise UserError(_("ARCA did not authorize the invoice:\n\n%s", exc)) from exc
 
             attempt._mark_authorized(
@@ -364,7 +364,7 @@ class AccountMove(models.Model):
                     "l10n_ar_arca_error_message": False,
                 }
             )
-            self._l10n_ar_arca_checkpoint(with_commit)
+            self._l10n_ar_arca_checkpoint()
 
         _logger.info(
             "ARCA authorized move %s as %s-%08d (type %s), CAE %s",
@@ -376,19 +376,23 @@ class AccountMove(models.Model):
         )
         return True
 
-    def _l10n_ar_arca_checkpoint(self, with_commit):
+    def _l10n_ar_arca_checkpoint(self):
         """Persist progress so far.
 
         ARCA is not transactional. Committing between the steps of the protocol
         is what keeps the local record in step with an external system that
-        cannot roll back. Callers running inside a test transaction pass
-        ``with_commit=False``: a test transaction is never committed, so the
-        commit would break the test cursor.
+        cannot roll back: whatever happens next, the attempt row is already on
+        disk.
+
+        A test transaction is never committed, and committing from inside one
+        breaks the cursor the test will roll back, so under tests this degrades
+        to a flush. The ordering being asserted -- attempt written before the
+        request is sent -- still holds.
         """
-        if with_commit:
-            self.env.cr.commit()
-        else:
+        if modules.module.current_test:
             self.env.cr.flush()
+            return
+        self.env.cr.commit()
 
     def _l10n_ar_arca_check_sequence(self, last_authorized, number, pos_number):
         """Refuse to send a number that is not the one ARCA expects.
@@ -494,9 +498,10 @@ class AccountMove(models.Model):
             if not move._l10n_ar_arca_is_edi():
                 continue
             try:
-                move._l10n_ar_arca_authorize(with_commit=True)
-            except Exception as exc:  # noqa: BLE001
-                self.env.cr.rollback()
+                move._l10n_ar_arca_authorize()
+            except Exception as exc:  # noqa: BLE001 - one invoice must not stop the batch
+                if not modules.module.current_test:
+                    self.env.cr.rollback()
                 _logger.warning("Scheduled ARCA authorization failed for %s: %s", move.id, exc)
         return True
 
@@ -531,13 +536,20 @@ class AccountMove(models.Model):
                 _("Document type '%s' has a non numeric code.", doc_type.display_name)
             ) from exc
 
+        self._l10n_ar_arca_validate_document_type_code(code, doc_type.display_name)
+        return code
+
+    @api.model
+    def _l10n_ar_arca_validate_document_type_code(self, code, label=None):
+        """Refuse a document type this module cannot really authorize."""
+        label = label or code
         if code in constants.WSFEX_DOCUMENT_TYPES:
             raise UserError(
                 _(
                     "'%s' is an export document. Export vouchers are authorized by "
                     "WSFEX, a different ARCA web service that this module does not "
                     "implement.",
-                    doc_type.display_name,
+                    label,
                 )
             )
         if code in constants.FCE_DOCUMENT_TYPES:
@@ -545,7 +557,7 @@ class AccountMove(models.Model):
                 _(
                     "'%s' is a MiPyME credit invoice (FCE). Those require the "
                     "Opcionales group that this module does not implement yet.",
-                    doc_type.display_name,
+                    label,
                 )
             )
         if code not in constants.SUPPORTED_DOCUMENT_TYPES:
@@ -553,11 +565,11 @@ class AccountMove(models.Model):
                 _(
                     "Document type '%(name)s' (code %(code)s) is not accepted by "
                     "WSFEv1.",
-                    name=doc_type.display_name,
+                    name=label,
                     code=code,
                 )
             )
-        return code
+        return True
 
     def _l10n_ar_arca_document_number_parts(self):
         """Split the Odoo document number into point of sale and number.
