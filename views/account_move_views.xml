@@ -179,9 +179,11 @@
         <field name="view_mode">list,form</field>
     </record>
 
+    <!-- Under Accounting > Review > Logs: this is an audit trail, not a
+         transaction the user creates. -->
     <menuitem id="l10n_ar_arca_attempt_menu"
         name="ARCA Authorizations"
-        parent="account.menu_finance_entries_management"
+        parent="account.account_logs_menu"
         action="l10n_ar_arca_attempt_action"
         groups="account.group_account_manager"
         sequence="90"/>
