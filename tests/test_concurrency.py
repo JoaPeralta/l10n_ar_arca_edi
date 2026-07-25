@@ -225,7 +225,13 @@ class TestArcaConcurrentWorkers(ArcaTestCommon):
     """
 
     def _connect(self):
-        return psycopg2.connect(self.env.cr._cnx.dsn)
+        """A backend of our own, built from the credentials Odoo itself uses.
+
+        psycopg2 strips the password out of a connection's reported dsn, so it
+        has to come from the configuration rather than from the live cursor.
+        """
+        _dbname, connection_info = odoo.sql_db.connection_info_for(self.env.cr.dbname)
+        return psycopg2.connect(**connection_info)
 
     def test_only_one_thread_is_inside_the_critical_section(self):
         dsn_probe = AdvisoryLockProbe(self.registry)
