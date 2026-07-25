@@ -215,13 +215,20 @@ class TestArcaLockPrimitive(ArcaTestCommon):
 
 @tagged("post_install", "-at_install")
 class TestArcaConcurrentWorkers(ArcaTestCommon):
-    """Two real threads on two real connections, one sequence."""
+    """Two operating-system threads, two PostgreSQL backends, one key.
 
-    def setUp(self):
-        super().setUp()
-        self.patch(odoo.modules.module, "current_test", False)
+    Deliberately below the ORM: the invariant being measured belongs to
+    PostgreSQL, and running Odoo's connection pool and environment machinery
+    inside bare threads would only add a second thing that can go wrong. That
+    the module's own code path honours the same invariant is covered by
+    :class:`TestArcaLockPrimitive`, which drives ``fiscal_transaction`` itself.
+    """
+
+    def _connect(self):
+        return psycopg2.connect(self.env.cr._cnx.dsn)
 
     def test_only_one_thread_is_inside_the_critical_section(self):
+        dsn_probe = AdvisoryLockProbe(self.registry)
         inside = threading.Semaphore(0)
         release = threading.Event()
         order = []
@@ -230,9 +237,6 @@ class TestArcaConcurrentWorkers(ArcaTestCommon):
 
         def worker(name, body):
             """Surface a thread's failure instead of letting it look like a pass."""
-            # Odoo's own worker threads carry the database they serve; the
-            # logging and pooling code reads it.
-            threading.current_thread().dbname = self.env.cr.dbname
             try:
                 body()
             except BaseException as exc:  # noqa: BLE001 - reported, not swallowed
@@ -241,20 +245,35 @@ class TestArcaConcurrentWorkers(ArcaTestCommon):
                 inside.release()
 
         def first_body():
-            with fiscal_transaction(self.env, PROBE_KEY_A):
-                order.append("first-in")
-                inside.release()
-                release.wait(timeout=15)
-                order.append("first-out")
+            connection = self._connect()
+            try:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT pg_try_advisory_xact_lock(%s)", (PROBE_KEY_A,)
+                    )
+                    if not cursor.fetchone()[0]:
+                        raise AssertionError("The first worker could not take the lock")
+                    order.append("first-in")
+                    inside.release()
+                    release.wait(timeout=15)
+                    order.append("first-out")
+            finally:
+                # Ending the transaction is the whole release mechanism.
+                connection.rollback()
+                connection.close()
 
         def second_body():
             inside.acquire(timeout=15)
+            connection = self._connect()
             try:
-                with fiscal_transaction(self.env, PROBE_KEY_A):
-                    results["entered_while_held"] = True
-            except ArcaSequenceBusy:
-                results["entered_while_held"] = False
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT pg_try_advisory_xact_lock(%s)", (PROBE_KEY_A,)
+                    )
+                    results["entered_while_held"] = cursor.fetchone()[0]
             finally:
+                connection.rollback()
+                connection.close()
                 release.set()
 
         threads = [
@@ -264,13 +283,17 @@ class TestArcaConcurrentWorkers(ArcaTestCommon):
         for thread in threads:
             thread.start()
         for thread in threads:
-            thread.join(timeout=30)
+            thread.join(timeout=25)
 
         self.assertEqual(failures, [], "A worker thread failed")
         self.assertEqual(order, ["first-in", "first-out"])
         self.assertFalse(
             results.get("entered_while_held", True),
             "Two workers were inside the same numbering sequence at once",
+        )
+        self.assertFalse(
+            dsn_probe.is_held(PROBE_KEY_A),
+            "A worker left the lock behind after its thread finished",
         )
 
 
