@@ -8,7 +8,7 @@ from odoo import fields
 from odoo.exceptions import UserError
 from odoo.tests import tagged
 
-from ..models.arca_errors import ArcaBusinessError
+from ..models.arca_errors import ArcaAborted, ArcaBusinessError
 from .common import ArcaTestCommon
 
 LOGIN_RESPONSE = """<?xml version="1.0" encoding="UTF-8"?>
@@ -156,3 +156,43 @@ class TestWsaaTicketRequest(ArcaTestCommon):
         # Parsing it back proves it is a real CMS structure, not a blob.
         certificates = pkcs7.load_der_pkcs7_certificates(der)
         self.assertTrue(certificates)
+
+
+@tagged("post_install", "-at_install")
+class TestWsaaTicketLock(ArcaTestCommon):
+    """Obtaining a ticket is serialized, and the lock cannot outlive it."""
+
+    def setUp(self):
+        super().setUp()
+        self.wsaa = self.env["l10n_ar.arca.wsaa"]
+
+    def test_each_service_has_its_own_lock(self):
+        """Fetching a wsfex ticket must not wait behind a wsfe one."""
+        wsfe_key = self.wsaa._token_lock_key(self.certificate, "wsfe")
+        wsfex_key = self.wsaa._token_lock_key(self.certificate, "wsfex")
+        self.assertNotEqual(wsfe_key, wsfex_key)
+
+    def test_each_certificate_has_its_own_lock(self):
+        other = self._create_certificate(self.company_ri, "20-29318820-4")
+        self.assertNotEqual(
+            self.wsaa._token_lock_key(self.certificate, "wsfe"),
+            self.wsaa._token_lock_key(other, "wsfe"),
+        )
+
+    def test_a_busy_ticket_lock_sends_nothing(self):
+        """Being turned away is safe: no request left the process."""
+        key = self.wsaa._token_lock_key(self.certificate, "wsfe")
+        calls = []
+
+        def fake_authenticate(model, certificate, service):
+            calls.append(service)
+            raise AssertionError("Authentication ran while the lock was held")
+
+        self.patch(type(self.wsaa), "_authenticate", fake_authenticate)
+
+        with self.registry.cursor() as holder:
+            holder.execute("SELECT pg_advisory_xact_lock(%s)", (key,))
+            with self.assertRaises(ArcaAborted):
+                self.wsaa._get_or_refresh_token(self.certificate, service="wsfe")
+
+        self.assertEqual(calls, [])

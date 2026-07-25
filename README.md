@@ -40,12 +40,15 @@ See [`readme/ROADMAP.rst`](readme/ROADMAP.rst).
 
 ## How an invoice reaches ARCA
 
+Registering the sale and authorizing it are two separate steps, and the second
+one is deliberate:
+
 ```
-post invoice          -> committed, marked pending. ARCA is not called yet.
+post invoice           -> a complete, committed invoice. ARCA status: pending.
+                          ARCA is not contacted at all.
   |
-  v
-authorization          -> runs after the commit, so a failure at ARCA
-  |                       cannot roll back the posting
+  v   "Request CAE"  (button, scheduled action, or after-commit if opted in)
+fiscal process         -> runs on transactions it owns, never the request's
   |
   +-- take the sequence lock (company + point of sale + document type)
   +-- check our number against FECompUltimoAutorizado
@@ -58,11 +61,27 @@ authorization          -> runs after the commit, so a failure at ARCA
                     reconcile with FECompConsultar instead
 ```
 
-### Why authorization is not part of posting
+Requesting the CAE automatically on post is available but **off by default**.
 
-A PostgreSQL transaction can be rolled back. An ARCA authorization cannot. If
-the CAE were requested inside the posting transaction, any later failure would
-undo the invoice while ARCA kept a voucher issued in the company's name.
+### Why the fiscal process owns its transactions
+
+A PostgreSQL transaction can be rolled back. An ARCA authorization cannot. Two
+consequences shape the design:
+
+- **Posting never calls ARCA.** The invoice is committed first, so no
+  irreversible act rides on a transaction that can still be undone.
+- **The protocol never commits the cursor Odoo made for the request.** It opens
+  its own connections: one for the work, which it may commit freely because that
+  transaction contains nothing else, and one that does nothing but hold the
+  numbering lock. So a fiscal commit cannot confirm unrelated changes the user
+  had pending, and a rollback in the browser cannot erase evidence of a request
+  that already reached ARCA.
+
+The numbering lock is transaction scoped on purpose. A session scoped lock
+survives `ROLLBACK`, and a rollback is all Odoo does before returning a
+connection to the pool -- so a failed unlock would leave a live connection
+holding a fiscal lock. PostgreSQL releases a transaction scoped lock when the
+transaction ends, which needs no cooperation from an aborted one.
 
 ### Uncertain invoices
 

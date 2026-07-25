@@ -6,7 +6,6 @@ import datetime
 import hashlib
 import logging
 import secrets
-from contextlib import contextmanager
 
 import zeep
 from cryptography.hazmat.primitives import hashes, serialization
@@ -18,7 +17,8 @@ from zeep.transports import Transport
 
 from odoo import _, api, fields, models
 
-from .arca_errors import ArcaAborted, ArcaBusinessError
+from .arca_errors import ArcaAborted, ArcaBusinessError, ArcaSequenceBusy
+from .fiscal_transaction import fiscal_transaction
 
 _logger = logging.getLogger(__name__)
 
@@ -63,7 +63,14 @@ class L10nArArcaWsaa(models.AbstractModel):
 
     @api.model
     def _get_or_refresh_token(self, certificate, service="wsfe"):
-        """Return valid credentials for ``service``, authenticating if needed."""
+        """Return valid credentials for ``service``, authenticating if needed.
+
+        A ticket ARCA has issued cannot be un-issued: ARCA refuses to grant a
+        second one while the first is valid. So the cache is written on a
+        transaction of its own and committed straight away -- if it rode on the
+        caller's transaction, a rollback would lose our copy of a ticket ARCA
+        still considers live, and the next request would be refused.
+        """
         certificate.ensure_one()
         certificate._check_usable()
 
@@ -71,13 +78,32 @@ class L10nArArcaWsaa(models.AbstractModel):
         if cached:
             return cached
 
-        with self._authentication_lock(certificate, service):
-            # Another worker may have authenticated while we waited.
-            certificate.invalidate_recordset(["l10n_ar_arca_token_cache"])
-            cached = self._read_cached_token(certificate, service)
-            if cached:
-                return cached
-            return self._authenticate(certificate, service)
+        lock_key = self._token_lock_key(certificate, service)
+        try:
+            with fiscal_transaction(self.env, lock_key) as fiscal:
+                scoped = fiscal.env["l10n_ar.arca.certificate"].browse(certificate.id)
+                # Another worker may have authenticated and committed while we
+                # were on our way here.
+                cached = self._read_cached_token(scoped, service)
+                if cached:
+                    return cached
+                credentials = self.with_env(fiscal.env)._authenticate(scoped, service)
+                fiscal.checkpoint()
+                return credentials
+        except ArcaSequenceBusy as exc:
+            raise ArcaAborted(
+                _(
+                    "Another process is already obtaining an ARCA access ticket "
+                    "for this certificate. Nothing was sent; try again in a moment."
+                )
+            ) from exc
+
+    @api.model
+    def _token_lock_key(self, certificate, service):
+        """Stable 63-bit key for one certificate's ticket for one service."""
+        raw = f"l10n_ar_arca_wsaa:{certificate.id}:{service}".encode()
+        digest = hashlib.blake2b(raw, digest_size=8).digest()
+        return int.from_bytes(digest, "big") & 0x7FFFFFFFFFFFFFFF
 
     @api.model
     def _read_cached_token(self, certificate, service):
@@ -107,23 +133,6 @@ class L10nArArcaWsaa(models.AbstractModel):
             "expiration": fields.Datetime.to_string(expiration),
         }
         certificate.sudo().l10n_ar_arca_token_cache = cache
-
-    @contextmanager
-    def _authentication_lock(self, certificate, service):
-        """Stop several workers from asking ARCA for the same ticket at once.
-
-        ARCA rejects a second ticket request while the first is still valid, so
-        an unsynchronised stampede does not just waste calls, it fails.
-        """
-        raw = f"l10n_ar_arca_wsaa:{certificate.id}:{service}".encode()
-        key = int.from_bytes(hashlib.blake2b(raw, digest_size=8).digest(), "big")
-        key &= 0x7FFFFFFFFFFFFFFF
-        cr = self.env.cr
-        cr.execute("SELECT pg_advisory_lock(%s)", (key,))
-        try:
-            yield
-        finally:
-            cr.execute("SELECT pg_advisory_unlock(%s)", (key,))
 
     # ------------------------------------------------------------------
     # Authentication

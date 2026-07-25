@@ -245,6 +245,83 @@ Fixed: the form shows whether a key is stored, and nothing more.
   exist. Restoring it is a one-line change to `depends` if it is wanted for
   forward compatibility.
 
+## Second round: transactions and the lock
+
+Baseline for this round: `cbc399da5c7e675bc5cb17a9e7e8f11706e33522`.
+
+### R1 - The protocol committed a cursor it did not own
+
+`_l10n_ar_arca_checkpoint()` called `self.env.cr.commit()`. For the button that
+cursor is the one Odoo created for the RPC, and committing it confirms whatever
+else the request had pending -- changes the module knows nothing about. Odoo
+owns that cursor's atomicity; a module deciding when it becomes durable is
+outside its remit.
+
+The requirement that produced it stands: the attempt must be on disk before
+FECAESolicitar. So the protocol now runs on connections it opens itself. See
+`models/fiscal_transaction.py`:
+
+* a **work** connection, which the protocol commits at each checkpoint -- safe
+  precisely because that transaction contains nothing but its own writes;
+* a **lock** connection, which does nothing but hold the numbering lock.
+
+The caller's cursor is only read. A rollback in the browser's request cannot
+erase an attempt already sent, and a fiscal commit cannot confirm an unrelated
+edit.
+
+### R2 - A session advisory lock can outlive its transaction
+
+The lock was `pg_advisory_lock` -- session scoped -- released by an explicit
+`pg_advisory_unlock` in a `finally`. That unlock is not guaranteed to run: a
+failed statement leaves the transaction aborted, and PostgreSQL then rejects
+every command on it except `ROLLBACK`. `Cursor._close()` (odoo/sql_db.py) does
+exactly one thing before handing the connection back: `self.rollback()`. And
+`ConnectionPool.give_back()` resets nothing.
+
+So the sequence was: SQL error inside the critical section, `pg_advisory_unlock`
+refused, rollback, connection back in the pool **still holding a fiscal lock on
+(company, point of sale, document type)** until that backend died.
+
+Now the lock is `pg_try_advisory_xact_lock` on a connection whose transaction
+exists only to hold it. PostgreSQL releases a transaction scoped lock when the
+transaction ends, without being asked -- and the transaction always ends,
+because closing the cursor rolls it back and `__exit__` closes it even when the
+commit raises. There is no command that can be refused.
+
+Keeping it on a second connection is what allows the work transaction to commit
+mid-protocol: a transaction scoped lock taken on the working transaction would
+be released by the very commit that makes the attempt durable, leaving the
+request in flight unprotected. Both properties are asserted in
+`tests/test_concurrency.py`.
+
+### R3 - The WSAA ticket cache had both problems
+
+`_authentication_lock` was a session advisory lock on the caller's cursor, and
+the ticket was written in the caller's transaction. Two consequences: the same
+phantom-lock risk, and -- worse -- a rollback could discard our copy of a ticket
+ARCA still considered valid, after which ARCA refuses to issue another. The
+cache now uses the same fiscal transaction and is committed immediately.
+
+### R4 - The reconciler could race a live request
+
+`_cron_reconcile_open_attempts` reconciled every attempt in `sent` state,
+including one whose request was still on the wire. FECompConsultar would
+correctly report "no voucher", the invoice would go back to `pending`, and the
+real request could then land -- or be sent a second time.
+
+The reconciler now takes the same sequence lock, so a running protocol shuts it
+out, and only touches a `sent` attempt once it is older than any request could
+still be (`STALE_ATTEMPT_MINUTES`). `uncertain` attempts are taken immediately:
+their request has already finished.
+
+### R5 - Requesting the CAE on post was the default
+
+Posting an invoice and authorizing it fiscally are separate decisions, and
+`l10n_ar_arca_auto_request_cae` now defaults to off. Posting produces a complete,
+committed invoice with ARCA status `pending` and no call to ARCA at all; the CAE
+is requested by the button, the scheduled action, or -- for companies that opt
+in -- after the posting commits.
+
 ## Verification status
 
 Wording used deliberately, per the brief:
