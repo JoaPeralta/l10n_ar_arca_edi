@@ -2,66 +2,55 @@
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
 
 import base64
+import hashlib
 import json
 import logging
+from contextlib import contextmanager
 
-from odoo import api, fields, models, _
+from odoo import _, api, fields, models
 from odoo.exceptions import UserError
+from odoo.tools import float_round
+
+from . import constants
+from .arca_errors import ArcaAborted, ArcaBusinessError, ArcaUncertain
 
 _logger = logging.getLogger(__name__)
 
-# Mapping from l10n_ar document type codes to ARCA CbteTipo codes
-# l10n_ar uses the same codes as ARCA, so this is a validation set
-SUPPORTED_ARCA_DOC_TYPES = {
-    # Facturas
-    1, 6, 11, 19, 51,
-    # Notas de Débito
-    2, 7, 12, 20,
-    # Notas de Crédito
-    3, 8, 13, 21,
-    # Recibos
-    4, 9, 15,
-    # Facturas de Crédito MiPyme
-    201, 206, 211,
-}
+QR_BASE_URL = "https://www.afip.gob.ar/fe/qr/?p="
 
-# ARCA responsibility -> condition IVA receptor (RG 5616)
-RESPONSIBILITY_TO_IVA_CONDITION = {
-    1: 1,    # IVA Responsable Inscripto
-    4: 4,    # IVA Sujeto Exento
-    5: 5,    # Consumidor Final
-    6: 6,    # Responsable Monotributo
-    8: 8,    # Proveedor del Exterior
-    9: 9,    # Cliente del Exterior
-    10: 10,  # IVA Liberado
-    11: 11,  # IVA Responsable Inscripto - Agente de Percepción
-    13: 13,  # Monotributista Social
-    15: 15,  # IVA No Alcanzado
-}
+# States from which an authorization request may legitimately start.
+AUTHORIZABLE_STATES = ("pending", "rejected")
 
 
 class AccountMove(models.Model):
     _inherit = "account.move"
 
+    l10n_ar_arca_state = fields.Selection(
+        [
+            ("not_required", "Not required"),
+            ("pending", "Pending"),
+            ("processing", "Processing"),
+            ("authorized", "Authorized"),
+            ("rejected", "Rejected"),
+            ("uncertain", "Uncertain"),
+        ],
+        string="ARCA Status",
+        default="not_required",
+        copy=False,
+        readonly=True,
+        index=True,
+        tracking=True,
+        help="Authorization status of this invoice at ARCA.",
+    )
     l10n_ar_arca_cae = fields.Char(
         string="CAE",
         readonly=True,
         copy=False,
+        index="btree_not_null",
         help="Código de Autorización Electrónico assigned by ARCA.",
     )
-    l10n_ar_arca_cae_due_date = fields.Char(
+    l10n_ar_arca_cae_due_date = fields.Date(
         string="CAE Due Date",
-        readonly=True,
-        copy=False,
-        help="CAE expiration date (YYYYMMDD format).",
-    )
-    l10n_ar_arca_result = fields.Selection(
-        [
-            ("A", "Approved"),
-            ("R", "Rejected"),
-            ("O", "Observed"),
-        ],
-        string="ARCA Result",
         readonly=True,
         copy=False,
     )
@@ -69,477 +58,980 @@ class AccountMove(models.Model):
         string="ARCA Observations",
         readonly=True,
         copy=False,
+        help="Non-blocking remarks returned by ARCA together with the CAE.",
     )
-    l10n_ar_arca_barcode = fields.Char(
-        string="ARCA Barcode",
-        readonly=True,
-        copy=False,
-        help="Barcode data for Interleaved 2 of 5 code on invoice PDF.",
-    )
+    l10n_ar_arca_error_code = fields.Char(readonly=True, copy=False)
+    l10n_ar_arca_error_message = fields.Text(readonly=True, copy=False)
     l10n_ar_arca_qr_code = fields.Char(
         string="ARCA QR Code",
+        compute="_compute_l10n_ar_arca_qr_code",
+        help="Verification URL printed on the invoice (RG 4892/2020).",
+    )
+    l10n_ar_arca_attempt_ids = fields.One2many(
+        "l10n_ar.arca.attempt",
+        "move_id",
+        string="ARCA Attempts",
         readonly=True,
-        copy=False,
-        help="URL for ARCA QR code verification (RG 4892/2020).",
+    )
+    l10n_ar_arca_attempt_count = fields.Integer(
+        compute="_compute_l10n_ar_arca_attempt_count"
     )
 
-    def action_verify_arca(self):
-        """Verify this invoice's CAE against ARCA servers."""
+    # ------------------------------------------------------------------
+    # Applicability
+    # ------------------------------------------------------------------
+
+    def _l10n_ar_arca_is_edi(self):
+        """Is this move meant to be authorized by ARCA through this module."""
         self.ensure_one()
-        if not self.l10n_ar_arca_cae:
-            raise UserError(_("This invoice has no CAE to verify."))
-
-        certificate = self.company_id.l10n_ar_arca_certificate_id
-        if not certificate:
-            raise UserError(
-                _("No active ARCA certificate configured for company '%s'.",
-                  self.company_id.name)
-            )
-
-        doc_type_code = self._get_arca_doc_type_code()
-        pos_number = self.journal_id.l10n_ar_afip_pos_number
-        invoice_number = int(
-            self.l10n_latam_document_number.split("-")[-1]
+        return bool(
+            self.country_code == "AR"
+            and self.is_sale_document()
+            and self.l10n_latam_use_documents
+            and self.journal_id.l10n_ar_arca_edi_enabled
         )
 
-        wsfe = self.env["l10n_ar.arca.wsfe"]
-        try:
-            result = wsfe.fe_comp_consultar(
-                certificate, pos_number, doc_type_code, invoice_number
-            )
-        except UserError:
-            raise
-        except Exception as e:
-            raise UserError(
-                _("ARCA verification failed: %s", str(e))
-            ) from e
+    @api.depends("l10n_ar_arca_attempt_ids")
+    def _compute_l10n_ar_arca_attempt_count(self):
+        for move in self:
+            move.l10n_ar_arca_attempt_count = len(move.l10n_ar_arca_attempt_ids)
 
-        # Compare CAE from ARCA with local CAE
-        # FECompConsultar returns CodAutorizacion, not CAE
-        arca_cae = result.CodAutorizacion if hasattr(result, 'CodAutorizacion') else None
-        arca_result = result.Resultado if hasattr(result, 'Resultado') else None
-        arca_total = result.ImpTotal if hasattr(result, 'ImpTotal') else None
-        raw_date = result.CbteFch if hasattr(result, 'CbteFch') else None
-        arca_date = (
-            f"{raw_date[6:8]}/{raw_date[4:6]}/{raw_date[0:4]}"
-            if raw_date and len(str(raw_date)) == 8
-            else raw_date
-        )
-
-        env_label = "Testing" if certificate.environment == "testing" else "Production"
-
-        if arca_cae and str(arca_cae) == str(self.l10n_ar_arca_cae):
-            return {
-                "type": "ir.actions.client",
-                "tag": "display_notification",
-                "params": {
-                    "title": _("ARCA Verification - %s", env_label),
-                    "message": _(
-                        "CAE verified successfully.\n"
-                        "CAE: %s\n"
-                        "Result: %s\n"
-                        "Total: %s\n"
-                        "Date: %s",
-                        arca_cae, arca_result, arca_total, arca_date,
-                    ),
-                    "type": "success",
-                    "sticky": True,
-                },
-            }
-        else:
-            return {
-                "type": "ir.actions.client",
-                "tag": "display_notification",
-                "params": {
-                    "title": _("ARCA Verification - %s", env_label),
-                    "message": _(
-                        "CAE mismatch!\n"
-                        "Local CAE: %s\n"
-                        "ARCA CAE: %s",
-                        self.l10n_ar_arca_cae, arca_cae or "Not found",
-                    ),
-                    "type": "warning",
-                    "sticky": True,
-                },
-            }
-
-    def action_request_cae(self):
-        """Manually request CAE from ARCA for this invoice."""
-        self.ensure_one()
-        if self.l10n_ar_arca_cae:
-            raise UserError(
-                _("This invoice already has a CAE: %s", self.l10n_ar_arca_cae)
-            )
-        self._l10n_ar_arca_request_cae()
-        return {
-            "type": "ir.actions.client",
-            "tag": "display_notification",
-            "params": {
-                "title": _("CAE Obtained"),
-                "message": _(
-                    "CAE: %s (valid until %s)",
-                    self.l10n_ar_arca_cae,
-                    self.l10n_ar_arca_cae_due_date,
-                ),
-                "type": "success",
-                "sticky": False,
-            },
-        }
+    # ------------------------------------------------------------------
+    # Posting
+    # ------------------------------------------------------------------
 
     def _post(self, soft=True):
-        """Override _post to automatically request CAE on invoice validation."""
+        """Post the invoice, then authorize it -- never the other way round.
+
+        Requesting a CAE inside this transaction would put an irreversible
+        external action inside something PostgreSQL can still roll back: ARCA
+        would hold an authorized voucher that Odoo has no record of. Instead the
+        move is only marked as pending here, and the actual request is scheduled
+        to run once this transaction has committed.
+        """
         posted = super()._post(soft=soft)
 
-        for move in posted:
-            if (
-                move.country_code == "AR"
-                and move.is_invoice()
-                and move.journal_id.l10n_ar_arca_edi_enabled
-                and not move.l10n_ar_arca_cae
-            ):
-                try:
-                    move._l10n_ar_arca_request_cae()
-                except Exception as e:
-                    _logger.error(
-                        "Failed to get CAE for invoice %s: %s",
-                        move.name,
-                        str(e),
-                    )
-                    raise
+        arca_moves = posted.filtered(lambda m: m._l10n_ar_arca_is_edi())
+        if not arca_moves:
+            return posted
+
+        to_mark = arca_moves.filtered(
+            lambda m: m.l10n_ar_arca_state in ("not_required", False)
+        )
+        if to_mark:
+            to_mark.l10n_ar_arca_state = "pending"
+
+        auto_moves = arca_moves.filtered(
+            lambda m: m.company_id.l10n_ar_arca_auto_request_cae
+            and m.l10n_ar_arca_state == "pending"
+        )
+        if auto_moves:
+            self._l10n_ar_arca_schedule_after_commit(auto_moves.ids)
 
         return posted
 
-    def _l10n_ar_arca_request_cae(self):
-        """Build invoice data and request CAE from ARCA."""
+    def _l10n_ar_arca_schedule_after_commit(self, move_ids):
+        """Run the authorization once the invoices are durably committed."""
+        move_ids = tuple(move_ids)
+        env = self.env
+
+        def _run():
+            with env.registry.cursor() as cr:
+                new_env = env(cr=cr)
+                moves = new_env["account.move"].browse(move_ids).exists()
+                for move in moves:
+                    try:
+                        move._l10n_ar_arca_authorize(with_commit=True)
+                    except Exception:  # noqa: BLE001 - one invoice must not stop the batch
+                        cr.rollback()
+                        _logger.exception(
+                            "Automatic ARCA authorization failed for move %s", move.id
+                        )
+
+        self.env.cr.postcommit.add(_run)
+
+    # ------------------------------------------------------------------
+    # Concurrency
+    # ------------------------------------------------------------------
+
+    @api.model
+    def _l10n_ar_arca_lock_key(self, company_id, pos_number, doc_type_code):
+        """Stable 63-bit advisory lock key for one numbering sequence."""
+        raw = f"l10n_ar_arca:{company_id}:{pos_number}:{doc_type_code}".encode()
+        digest = hashlib.blake2b(raw, digest_size=8).digest()
+        return int.from_bytes(digest, "big") & 0x7FFFFFFFFFFFFFFF
+
+    @contextmanager
+    def _l10n_ar_arca_sequence_lock(self, pos_number, doc_type_code):
+        """Serialize authorizations for one company / POS / document type.
+
+        ARCA requires each voucher number to be exactly one more than the last
+        authorized for the same point of sale and document type, so two workers
+        must not be in flight on the same sequence at once. The lock is session
+        scoped rather than transaction scoped on purpose: the attempt row is
+        committed in the middle of the protocol, and a transaction-scoped lock
+        would be released by that commit while the request is still in flight.
+
+        Independent sequences never block each other.
+        """
+        self.ensure_one()
+        key = self._l10n_ar_arca_lock_key(self.company_id.id, pos_number, doc_type_code)
+        cr = self.env.cr
+        cr.execute("SELECT pg_try_advisory_lock(%s)", (key,))
+        acquired = cr.fetchone()[0]
+        if not acquired:
+            raise UserError(
+                _(
+                    "Another process is already authorizing vouchers for point of "
+                    "sale %(pos)s and document type %(doc_type)s. Try again in a "
+                    "moment.",
+                    pos=pos_number,
+                    doc_type=doc_type_code,
+                )
+            )
+        try:
+            yield
+        finally:
+            cr.execute("SELECT pg_advisory_unlock(%s)", (key,))
+
+    # ------------------------------------------------------------------
+    # Authorization protocol
+    # ------------------------------------------------------------------
+
+    def action_l10n_ar_arca_authorize(self):
+        """Button: request the CAE for this invoice."""
+        self.ensure_one()
+        self._l10n_ar_arca_authorize(with_commit=True)
+        return self._l10n_ar_arca_notify_state()
+
+    def _l10n_ar_arca_authorize(self, with_commit=True):
+        """Obtain a CAE for this invoice.
+
+        The order of operations is the whole point:
+
+        1. refuse to start from a state where the fiscal outcome is unknown;
+        2. take the sequence lock;
+        3. check our number against ARCA's last authorized one;
+        4. write and commit the attempt -- the durable evidence;
+        5. only then send the request.
+
+        Step 4 before step 5 is what makes a lost answer recoverable.
+        """
         self.ensure_one()
 
+        if self.state != "posted":
+            raise UserError(_("Only posted invoices can be authorized by ARCA."))
+        if not self._l10n_ar_arca_is_edi():
+            raise UserError(
+                _("This invoice is not configured for ARCA electronic invoicing.")
+            )
+        if self.l10n_ar_arca_state == "authorized":
+            raise UserError(
+                _("This invoice already has CAE %s.", self.l10n_ar_arca_cae)
+            )
+        if self.l10n_ar_arca_state == "uncertain":
+            raise UserError(
+                _(
+                    "The fiscal status of this invoice is unknown: a request was "
+                    "sent to ARCA and the answer was lost. Reconcile it against "
+                    "ARCA first -- sending it again could authorize the same "
+                    "invoice twice."
+                )
+            )
+        if self.l10n_ar_arca_state == "processing":
+            raise UserError(
+                _("This invoice is already being authorized by another process.")
+            )
+        if self.l10n_ar_arca_state not in AUTHORIZABLE_STATES:
+            raise UserError(
+                _(
+                    "This invoice is not ready to be authorized (status: %s).",
+                    self.l10n_ar_arca_state,
+                )
+            )
+
+        certificate = self._l10n_ar_arca_get_certificate()
+        doc_type_code = self._l10n_ar_arca_document_type_code()
+        pos_number, number = self._l10n_ar_arca_document_number_parts()
+
+        if pos_number != self.journal_id.l10n_ar_afip_pos_number:
+            raise UserError(
+                _(
+                    "The invoice number belongs to point of sale %(number_pos)s but "
+                    "its journal is configured for point of sale %(journal_pos)s.",
+                    number_pos=pos_number,
+                    journal_pos=self.journal_id.l10n_ar_afip_pos_number,
+                )
+            )
+
+        wsfe = self.env["l10n_ar.arca.wsfe"]
+
+        with self._l10n_ar_arca_sequence_lock(pos_number, doc_type_code):
+            # Re-read under the lock: another worker may have finished between
+            # the checks above and the moment we acquired it.
+            self.invalidate_recordset(["l10n_ar_arca_state"])
+            if self.l10n_ar_arca_state not in AUTHORIZABLE_STATES:
+                raise UserError(
+                    _(
+                        "This invoice changed status while waiting for the "
+                        "authorization lock (now: %s).",
+                        self.l10n_ar_arca_state,
+                    )
+                )
+
+            last_authorized = wsfe.fe_comp_ultimo_autorizado(
+                certificate, pos_number, doc_type_code
+            )
+            self._l10n_ar_arca_check_sequence(last_authorized, number, pos_number)
+
+            header, detail = self._l10n_ar_arca_prepare_request(
+                certificate, doc_type_code, pos_number, number
+            )
+
+            attempt = self.env["l10n_ar.arca.attempt"].create(
+                {
+                    "move_id": self.id,
+                    "company_id": self.company_id.id,
+                    "certificate_id": certificate.id,
+                    "environment": certificate.environment,
+                    "cuit": certificate._get_clean_cuit(),
+                    "pos_number": pos_number,
+                    "document_type_code": doc_type_code,
+                    "document_number": number,
+                    "state": "sent",
+                    "request_payload": json.dumps(detail, indent=2, default=str),
+                }
+            )
+            self.l10n_ar_arca_state = "processing"
+
+            # Durable evidence must exist before the request leaves. Everything
+            # after this point can fail without losing track of the voucher.
+            self._l10n_ar_arca_checkpoint(with_commit)
+
+            try:
+                result = wsfe.fe_cae_solicitar(certificate, header, detail)
+            except ArcaUncertain as exc:
+                attempt._mark_uncertain(str(exc))
+                self.write(
+                    {
+                        "l10n_ar_arca_state": "uncertain",
+                        "l10n_ar_arca_error_message": str(exc),
+                    }
+                )
+                self._l10n_ar_arca_checkpoint(with_commit)
+                raise UserError(
+                    _(
+                        "The request was sent to ARCA but the answer was lost, so "
+                        "it is unknown whether the voucher was authorized. The "
+                        "invoice is marked as uncertain and must be reconciled "
+                        "against ARCA. Do not issue it again.\n\n%s",
+                        exc,
+                    )
+                ) from exc
+            except (ArcaAborted, ArcaBusinessError) as exc:
+                # Neither of these creates a fiscal document, so the number
+                # stays available and the invoice can be corrected and retried.
+                if isinstance(exc, ArcaAborted):
+                    attempt._mark_aborted(str(exc))
+                else:
+                    attempt._mark_rejected(getattr(exc, "code", None), str(exc))
+                self.write(
+                    {
+                        "l10n_ar_arca_state": "rejected",
+                        "l10n_ar_arca_error_code": getattr(exc, "code", None),
+                        "l10n_ar_arca_error_message": str(exc),
+                    }
+                )
+                self._l10n_ar_arca_checkpoint(with_commit)
+                raise UserError(_("ARCA did not authorize the invoice:\n\n%s", exc)) from exc
+
+            attempt._mark_authorized(
+                cae=result["cae"],
+                cae_due_date=result["cae_due_date"],
+                response_payload=result.get("raw"),
+                duration_ms=result.get("duration_ms", 0),
+            )
+            observations = "\n".join(
+                f"[{obs['code']}] {obs['message']}" for obs in result.get("observations", [])
+            )
+            self.write(
+                {
+                    "l10n_ar_arca_state": "authorized",
+                    "l10n_ar_arca_cae": result["cae"],
+                    "l10n_ar_arca_cae_due_date": result["cae_due_date"],
+                    "l10n_ar_arca_observations": observations or False,
+                    "l10n_ar_arca_error_code": False,
+                    "l10n_ar_arca_error_message": False,
+                }
+            )
+            self._l10n_ar_arca_checkpoint(with_commit)
+
+        _logger.info(
+            "ARCA authorized move %s as %s-%08d (type %s), CAE %s",
+            self.id,
+            pos_number,
+            number,
+            doc_type_code,
+            result["cae"],
+        )
+        return True
+
+    def _l10n_ar_arca_checkpoint(self, with_commit):
+        """Persist progress so far.
+
+        ARCA is not transactional. Committing between the steps of the protocol
+        is what keeps the local record in step with an external system that
+        cannot roll back. Callers running inside a test transaction pass
+        ``with_commit=False``: a test transaction is never committed, so the
+        commit would break the test cursor.
+        """
+        if with_commit:
+            self.env.cr.commit()
+        else:
+            self.env.cr.flush()
+
+    def _l10n_ar_arca_check_sequence(self, last_authorized, number, pos_number):
+        """Refuse to send a number that is not the one ARCA expects.
+
+        Validation 10016 requires the number to be exactly one more than the
+        last authorized one. Detecting a gap here turns a cryptic ARCA rejection
+        into an actionable message, and -- more importantly -- stops us from
+        silently issuing under a number the accounting does not show.
+        """
+        expected = last_authorized + 1
+        if number == expected:
+            return True
+        if number <= last_authorized:
+            raise UserError(
+                _(
+                    "ARCA already authorized number %(last)s for point of sale "
+                    "%(pos)s, but this invoice is numbered %(number)s. Reconcile "
+                    "the invoices in between before issuing this one.",
+                    last=last_authorized,
+                    pos=pos_number,
+                    number=number,
+                )
+            )
+        raise UserError(
+            _(
+                "There is a gap in the numbering: ARCA expects number %(expected)s "
+                "for point of sale %(pos)s and this invoice is numbered "
+                "%(number)s. Authorize the missing invoices first.",
+                expected=expected,
+                pos=pos_number,
+                number=number,
+            )
+        )
+
+    # ------------------------------------------------------------------
+    # Reconciliation
+    # ------------------------------------------------------------------
+
+    def action_l10n_ar_arca_reconcile(self):
+        """Ask ARCA what happened to the requests we lost the answer to."""
+        self.ensure_one()
+        attempts = self.env["l10n_ar.arca.attempt"]._find_open_for_move(self)
+        if not attempts:
+            raise UserError(_("This invoice has no unresolved ARCA request."))
+        for attempt in attempts:
+            attempt._reconcile()
+        return self._l10n_ar_arca_notify_state()
+
+    def _l10n_ar_arca_apply_reconciliation(self, attempt, authorized):
+        """Bring the invoice in line with what ARCA reports."""
+        self.ensure_one()
+        if authorized:
+            self.write(
+                {
+                    "l10n_ar_arca_state": "authorized",
+                    "l10n_ar_arca_cae": attempt.cae,
+                    "l10n_ar_arca_cae_due_date": attempt.cae_due_date,
+                    "l10n_ar_arca_error_message": False,
+                    "l10n_ar_arca_error_code": False,
+                }
+            )
+            self.message_post(
+                body=_(
+                    "ARCA confirmed this invoice was authorized with CAE %s. "
+                    "The status was reconciled automatically.",
+                    attempt.cae,
+                )
+            )
+        else:
+            self.write(
+                {
+                    "l10n_ar_arca_state": "pending",
+                    "l10n_ar_arca_error_message": _(
+                        "ARCA has no record of the previous request; the invoice "
+                        "can be authorized again."
+                    ),
+                }
+            )
+            self.message_post(
+                body=_(
+                    "ARCA has no voucher for the number attempted earlier. "
+                    "The invoice was returned to pending."
+                )
+            )
+        return True
+
+    @api.model
+    def _cron_l10n_ar_arca_authorize_pending(self, limit=50):
+        """Authorize invoices left pending, oldest number first.
+
+        Ordering matters: ARCA only accepts the next number in the sequence, so
+        a newer invoice cannot overtake an older one.
+        """
+        pending = self.search(
+            [
+                ("l10n_ar_arca_state", "=", "pending"),
+                ("state", "=", "posted"),
+            ],
+            order="invoice_date asc, name asc",
+            limit=limit,
+        )
+        for move in pending:
+            if not move._l10n_ar_arca_is_edi():
+                continue
+            try:
+                move._l10n_ar_arca_authorize(with_commit=True)
+            except Exception as exc:  # noqa: BLE001
+                self.env.cr.rollback()
+                _logger.warning("Scheduled ARCA authorization failed for %s: %s", move.id, exc)
+        return True
+
+    # ------------------------------------------------------------------
+    # Request building
+    # ------------------------------------------------------------------
+
+    def _l10n_ar_arca_get_certificate(self):
+        self.ensure_one()
         certificate = self.company_id.l10n_ar_arca_certificate_id
         if not certificate:
             raise UserError(
                 _(
-                    "No active ARCA certificate configured for company '%s'. "
+                    "No ARCA certificate is configured for company '%s'. "
                     "Go to Settings > Invoicing > ARCA Electronic Invoicing.",
-                    self.company_id.name,
+                    self.company_id.display_name,
                 )
             )
+        certificate._check_usable()
+        return certificate
 
-        journal = self.journal_id
-        if not journal.l10n_ar_arca_edi_enabled:
-            raise UserError(
-                _(
-                    "ARCA electronic invoicing is not enabled for journal '%s'.",
-                    journal.name,
-                )
-            )
-
-        # Get document type code
-        doc_type_code = self._get_arca_doc_type_code()
-
-        # Get last authorized number
-        wsfe = self.env["l10n_ar.arca.wsfe"]
-        last_number = wsfe.fe_comp_ultimo_autorizado(
-            certificate,
-            journal.l10n_ar_afip_pos_number,
-            doc_type_code,
-        )
-        next_number = last_number + 1
-
-        # Build invoice data
-        invoice_data = self._prepare_arca_invoice_data(
-            certificate, journal, doc_type_code, next_number
-        )
-
-        # Request CAE
-        result = wsfe.fe_cae_solicitar(certificate, invoice_data)
-
-        # Build barcode data
-        barcode = self._build_arca_barcode(
-            certificate, doc_type_code, journal, result
-        )
-
-        # Build QR code URL (RG 4892/2020)
-        qr_url = self._build_arca_qr_code(
-            certificate, doc_type_code, journal, next_number, result
-        )
-
-        # Store results
-        observations = ""
-        if result.get("observations"):
-            observations = "\n".join(
-                f"[{o['code']}] {o['message']}"
-                for o in result["observations"]
-            )
-
-        self.write({
-            "l10n_ar_arca_cae": result["cae"],
-            "l10n_ar_arca_cae_due_date": result["cae_due_date"],
-            "l10n_ar_arca_result": result["result"],
-            "l10n_ar_arca_observations": observations or False,
-            "l10n_ar_arca_barcode": barcode,
-            "l10n_ar_arca_qr_code": qr_url,
-        })
-
-    def _get_arca_doc_type_code(self):
-        """Get the ARCA document type code for this invoice."""
+    def _l10n_ar_arca_document_type_code(self):
+        """Validate and return the ARCA document type code."""
         self.ensure_one()
         doc_type = self.l10n_latam_document_type_id
         if not doc_type:
-            raise UserError(_("No document type set for this invoice."))
-        code = int(doc_type.code)
-        if code not in SUPPORTED_ARCA_DOC_TYPES:
+            raise UserError(_("This invoice has no document type."))
+        try:
+            code = int(doc_type.code)
+        except (TypeError, ValueError) as exc:
+            raise UserError(
+                _("Document type '%s' has a non numeric code.", doc_type.display_name)
+            ) from exc
+
+        if code in constants.WSFEX_DOCUMENT_TYPES:
             raise UserError(
                 _(
-                    "Document type '%s' (code %s) is not supported for "
-                    "electronic invoicing.",
-                    doc_type.name,
-                    doc_type.code,
+                    "'%s' is an export document. Export vouchers are authorized by "
+                    "WSFEX, a different ARCA web service that this module does not "
+                    "implement.",
+                    doc_type.display_name,
+                )
+            )
+        if code in constants.FCE_DOCUMENT_TYPES:
+            raise UserError(
+                _(
+                    "'%s' is a MiPyME credit invoice (FCE). Those require the "
+                    "Opcionales group that this module does not implement yet.",
+                    doc_type.display_name,
+                )
+            )
+        if code not in constants.SUPPORTED_DOCUMENT_TYPES:
+            raise UserError(
+                _(
+                    "Document type '%(name)s' (code %(code)s) is not accepted by "
+                    "WSFEv1.",
+                    name=doc_type.display_name,
+                    code=code,
                 )
             )
         return code
 
-    def _prepare_arca_invoice_data(
-        self, certificate, journal, doc_type_code, invoice_number
-    ):
-        """Prepare the data dict for FECAESolicitar."""
+    def _l10n_ar_arca_document_number_parts(self):
+        """Split the Odoo document number into point of sale and number.
+
+        The number sent to ARCA is the one Odoo assigned, never one derived from
+        ARCA's counter: otherwise the number printed on the invoice and the
+        number authorized at ARCA can drift apart.
+        """
+        self.ensure_one()
+        document_number = self.l10n_latam_document_number
+        if not document_number:
+            raise UserError(
+                _("This invoice has no document number yet; post it before authorizing.")
+            )
+        parts = self._l10n_ar_get_document_number_parts(
+            document_number, self.l10n_latam_document_type_id.code
+        )
+        return parts["point_of_sale"], parts["invoice_number"]
+
+    def _l10n_ar_arca_currency_values(self):
+        """Return (MonId, MonCotiz).
+
+        MonCotiz is how many pesos one unit of the invoice currency is worth,
+        while Odoo's ``invoice_currency_rate`` is the rate from company currency
+        to document currency -- the inverse. Getting this backwards produces an
+        invoice that is off by orders of magnitude, so the conversion is done
+        here, once.
+        """
+        self.ensure_one()
+        if self.currency_id == self.company_currency_id:
+            return constants.ARS_CURRENCY_CODE, 1.0
+
+        code = self.currency_id.l10n_ar_afip_code
+        if not code:
+            raise UserError(
+                _(
+                    "Currency %s has no ARCA code. Set it in Accounting > "
+                    "Configuration > Currencies.",
+                    self.currency_id.name,
+                )
+            )
+        rate = self.invoice_currency_rate
+        if not rate:
+            raise UserError(
+                _("This invoice has no exchange rate, so ARCA cannot be told one.")
+            )
+        return code, float_round(1.0 / rate, precision_digits=6)
+
+    def _l10n_ar_arca_customer_document(self, doc_type_code):
+        """Return (DocTipo, DocNro) for the receptor."""
+        self.ensure_one()
+        partner = self.partner_id.commercial_partner_id
+        identification = partner.l10n_latam_identification_type_id
+        raw_vat = (partner.vat or "").replace("-", "").replace(" ", "").replace(".", "")
+
+        afip_code = identification.l10n_ar_afip_code if identification else None
+        is_class_a_m = doc_type_code in constants.CLASS_A_M_DOCUMENT_TYPES
+
+        if not afip_code or not raw_vat:
+            if is_class_a_m:
+                raise UserError(
+                    _(
+                        "Customer '%s' needs a CUIT to be invoiced with a class A "
+                        "or M document.",
+                        partner.display_name,
+                    )
+                )
+            # Validation 10015: unidentified receptor means DocTipo 99, DocNro 0.
+            return constants.DOC_TYPE_UNIDENTIFIED, 0
+
+        doc_type = int(afip_code)
+        if doc_type == constants.DOC_TYPE_UNIDENTIFIED:
+            return constants.DOC_TYPE_UNIDENTIFIED, 0
+
+        if is_class_a_m and doc_type != constants.DOC_TYPE_CUIT:
+            raise UserError(
+                _(
+                    "Class A and M documents require the customer to be identified "
+                    "by CUIT, but '%(partner)s' is identified by %(id_type)s.",
+                    partner=partner.display_name,
+                    id_type=identification.display_name,
+                )
+            )
+        if not raw_vat.isdigit():
+            raise UserError(
+                _(
+                    "The identification number of '%s' must contain digits only to "
+                    "be reported to ARCA.",
+                    partner.display_name,
+                )
+            )
+        return doc_type, int(raw_vat)
+
+    def _l10n_ar_arca_iva_condition(self, doc_type_code):
+        """Return CondicionIVAReceptorId, validated against the document class.
+
+        ARCA rejects a condition that does not match the class of the voucher
+        (error 10243), so the combination is checked here where the message can
+        name the customer.
+        """
+        self.ensure_one()
+        partner = self.partner_id.commercial_partner_id
+        responsibility = partner.l10n_ar_afip_responsibility_type_id
+        if not responsibility:
+            raise UserError(
+                _(
+                    "Customer '%s' has no ARCA responsibility type. It is required "
+                    "to report the receptor VAT condition (RG 5616).",
+                    partner.display_name,
+                )
+            )
+        try:
+            condition_id = int(responsibility.code)
+        except (TypeError, ValueError) as exc:
+            raise UserError(
+                _("ARCA responsibility '%s' has a non numeric code.", responsibility.name)
+            ) from exc
+
+        letter = self.l10n_latam_document_type_id.l10n_ar_letter
+        allowed = constants.IVA_CONDITION_BY_CLASS.get(letter)
+        if allowed is None:
+            raise UserError(
+                _(
+                    "Document class %r has no known receptor VAT conditions.",
+                    letter,
+                )
+            )
+        if condition_id not in allowed:
+            raise UserError(
+                _(
+                    "Customer '%(partner)s' is registered as '%(responsibility)s', "
+                    "which ARCA does not accept on a class %(letter)s document. "
+                    "Either change the customer's ARCA responsibility or issue a "
+                    "different document type.",
+                    partner=partner.display_name,
+                    responsibility=responsibility.name,
+                    letter=letter,
+                )
+            )
+        return condition_id
+
+    def _l10n_ar_arca_associated_documents(self, doc_type_code):
+        """Build CbtesAsoc for credit and debit notes."""
+        self.ensure_one()
+        if doc_type_code not in constants.NOTE_DOCUMENT_TYPES:
+            return []
+
+        origin = self.reversed_entry_id
+        if not origin and "debit_origin_id" in self._fields:
+            origin = self.debit_origin_id
+
+        if not origin:
+            raise UserError(
+                _(
+                    "A credit or debit note must reference the invoice it adjusts. "
+                    "Create it from the original invoice so ARCA can be told which "
+                    "voucher it corrects."
+                )
+            )
+
+        try:
+            origin_code = int(origin.l10n_latam_document_type_id.code)
+        except (TypeError, ValueError) as exc:
+            raise UserError(
+                _("The referenced invoice has no usable ARCA document type.")
+            ) from exc
+
+        allowed = constants.ASSOCIATED_DOCUMENT_RULES.get(doc_type_code, set())
+        if origin_code not in allowed:
+            raise UserError(
+                _(
+                    "ARCA does not allow a %(note)s to reference a %(origin)s.",
+                    note=self.l10n_latam_document_type_id.display_name,
+                    origin=origin.l10n_latam_document_type_id.display_name,
+                )
+            )
+
+        origin_pos, origin_number = origin._l10n_ar_arca_document_number_parts()
+        associated = {
+            "Tipo": origin_code,
+            "PtoVta": origin_pos,
+            "Nro": origin_number,
+        }
+        if origin.invoice_date:
+            associated["CbteFch"] = origin.invoice_date.strftime("%Y%m%d")
+        return [associated]
+
+    def _l10n_ar_arca_amounts(self, doc_type_code):
+        """Fiscal totals, taken from l10n_ar rather than recomputed here.
+
+        ``_l10n_ar_get_amounts`` is the localization's own breakdown, already
+        used for the VAT digital books, and it knows the things that are easy to
+        get wrong: which tax groups are aliquots versus exempt versus untaxed,
+        how perceptions are separated, the sign of a credit note, and that class
+        C documents put everything in ImpNeto.
+        """
+        self.ensure_one()
+        base_lines = self._get_rounded_base_and_tax_lines()[0]
+        amounts = self._l10n_ar_get_amounts(base_lines=base_lines)
+        is_class_c = doc_type_code in constants.CLASS_C_DOCUMENT_TYPES
+
+        if is_class_c:
+            # Validation 10043 / 10048: class C reports no VAT breakdown.
+            values = {
+                "ImpTotConc": 0.0,
+                "ImpNeto": amounts["vat_taxable_amount"],
+                "ImpOpEx": 0.0,
+                "ImpIVA": 0.0,
+                "ImpTrib": amounts["not_vat_taxes_amount"],
+            }
+            vat_lines = []
+        else:
+            values = {
+                "ImpTotConc": amounts["vat_untaxed_base_amount"],
+                "ImpNeto": amounts["vat_taxable_amount"],
+                "ImpOpEx": amounts["vat_exempt_base_amount"],
+                "ImpIVA": amounts["vat_amount"],
+                "ImpTrib": amounts["not_vat_taxes_amount"],
+            }
+            vat_lines = self._get_vat(base_lines=base_lines)
+
+        values = {key: float_round(value, precision_digits=2) for key, value in values.items()}
+        total = float_round(sum(values.values()), precision_digits=2)
+        self._l10n_ar_arca_check_total(total)
+        values["ImpTotal"] = total
+        return values, self._l10n_ar_arca_aggregate_vat(vat_lines)
+
+    def _l10n_ar_arca_check_total(self, computed_total):
+        """Ensure the breakdown adds up to what the customer was invoiced.
+
+        A mismatch means the tax decomposition is wrong. ARCA would reject it
+        with 10048, but more importantly the customer would be shown one total
+        and the tax authority another, so this refuses instead of adjusting.
+        """
+        self.ensure_one()
+        invoice_total = float_round(abs(self.amount_total), precision_digits=2)
+        difference = abs(invoice_total - computed_total)
+        relative = difference / invoice_total if invoice_total else difference
+        if (
+            difference > constants.AMOUNT_ABSOLUTE_TOLERANCE
+            and relative > constants.AMOUNT_RELATIVE_TOLERANCE
+        ):
+            raise UserError(
+                _(
+                    "The ARCA amount breakdown does not add up to the invoice "
+                    "total: the invoice totals %(invoice)s but the breakdown adds "
+                    "up to %(computed)s. Check the taxes used on this invoice.",
+                    invoice=invoice_total,
+                    computed=computed_total,
+                )
+            )
+        return True
+
+    @api.model
+    def _l10n_ar_arca_aggregate_vat(self, vat_lines):
+        """Total the VAT lines per aliquot.
+
+        Validation 10022: an aliquot Id must appear at most once.
+        """
+        aggregated = {}
+        for line in vat_lines:
+            aliquot_id = int(line["Id"])
+            if aliquot_id not in constants.VAT_ALIQUOT_IDS:
+                raise UserError(
+                    _(
+                        "VAT aliquot code %s is not one ARCA accepts inside the "
+                        "AlicIva group.",
+                        aliquot_id,
+                    )
+                )
+            entry = aggregated.setdefault(
+                aliquot_id, {"Id": aliquot_id, "BaseImp": 0.0, "Importe": 0.0}
+            )
+            entry["BaseImp"] += line["BaseImp"]
+            entry["Importe"] += line["Importe"]
+
+        for entry in aggregated.values():
+            entry["BaseImp"] = float_round(entry["BaseImp"], precision_digits=2)
+            entry["Importe"] = float_round(entry["Importe"], precision_digits=2)
+        return [aggregated[key] for key in sorted(aggregated)]
+
+    def _l10n_ar_arca_concept(self):
+        """ARCA concept, from the localization's own computation."""
+        self.ensure_one()
+        concept = self.l10n_ar_afip_concept
+        if not concept:
+            return constants.CONCEPT_PRODUCTS
+        return int(concept)
+
+    def _l10n_ar_arca_prepare_request(self, certificate, doc_type_code, pos_number, number):
+        """Build the FECAESolicitar header and detail."""
         self.ensure_one()
 
-        partner = self.partner_id.commercial_partner_id
+        invoice_date = self.invoice_date or fields.Date.context_today(self)
+        concept = self._l10n_ar_arca_concept()
+        doc_type, doc_number = self._l10n_ar_arca_customer_document(doc_type_code)
+        currency_code, currency_rate = self._l10n_ar_arca_currency_values()
+        amounts, vat_lines = self._l10n_ar_arca_amounts(doc_type_code)
 
-        # Determine concept type
-        concept = self._get_arca_concept_type()
-
-        # Customer document
-        customer_doc_type, customer_doc_number = self._get_arca_customer_doc(
-            partner
-        )
-
-        # Date
-        invoice_date = self.invoice_date or fields.Date.today()
-        date_str = invoice_date.strftime("%Y%m%d")
-
-        # Amounts
-        total = abs(self.amount_total)
-
-        # Factura C (codes 11, 13, 15) does not discriminate IVA
-        # All amount goes to ImpNeto, everything else is 0
-        is_type_c = doc_type_code in (11, 13, 15)
-
-        if is_type_c:
-            net_taxed = total
-            net_untaxed = 0
-            tax_exempt = 0
-            iva_total = 0
-            iva_lines = []
-        else:
-            iva_total = 0
-            net_taxed = 0
-            tax_exempt = 0
-            iva_lines = []
-
-            for tax_line in self.line_ids.filtered(
-                lambda l: l.tax_line_id
-                and l.tax_line_id.tax_group_id.l10n_ar_vat_afip_code
-            ):
-                afip_code = int(
-                    tax_line.tax_line_id.tax_group_id.l10n_ar_vat_afip_code
-                )
-                amount = abs(tax_line.balance)
-                base = abs(tax_line.tax_base_amount)
-
-                if afip_code == 3:  # Exento
-                    tax_exempt += base
-                else:
-                    iva_total += amount
-                    net_taxed += base
-                    iva_lines.append({
-                        "iva_id": afip_code,
-                        "base": base,
-                        "amount": amount,
-                    })
-
-            # Net untaxed (no gravado)
-            net_untaxed = total - net_taxed - iva_total - tax_exempt
-
-        data = {
-            "pos_number": journal.l10n_ar_afip_pos_number,
-            "doc_type_code": doc_type_code,
-            "concept": concept,
-            "customer_doc_type": customer_doc_type,
-            "customer_doc_number": customer_doc_number,
-            "invoice_number": invoice_number,
-            "date": date_str,
-            "total": total,
-            "net_untaxed": max(net_untaxed, 0),
-            "net_taxed": net_taxed,
-            "tax_exempt": tax_exempt,
-            "iva_total": iva_total,
-            "iva_lines": iva_lines,
+        detail = {
+            "Concepto": concept,
+            "DocTipo": doc_type,
+            "DocNro": doc_number,
+            # Class A, C and M require CbteDesde == CbteHasta (validation 10012);
+            # this module authorizes one invoice at a time in every case.
+            "CbteDesde": number,
+            "CbteHasta": number,
+            "CbteFch": invoice_date.strftime("%Y%m%d"),
+            "ImpTotal": amounts["ImpTotal"],
+            "ImpTotConc": amounts["ImpTotConc"],
+            "ImpNeto": amounts["ImpNeto"],
+            "ImpOpEx": amounts["ImpOpEx"],
+            "ImpIVA": amounts["ImpIVA"],
+            "ImpTrib": amounts["ImpTrib"],
+            "MonId": currency_code,
+            "MonCotiz": currency_rate,
+            "CondicionIVAReceptorId": self._l10n_ar_arca_iva_condition(doc_type_code),
         }
 
-        # Service dates
-        if concept in (2, 3):
-            data["service_date_from"] = date_str
-            data["service_date_to"] = date_str
-            due_date = self.invoice_date_due or invoice_date
-            data["payment_due_date"] = due_date.strftime("%Y%m%d")
+        if concept in constants.CONCEPTS_REQUIRING_SERVICE_DATES:
+            detail.update(self._l10n_ar_arca_service_dates(invoice_date))
 
-        # Associated documents (credit/debit notes)
-        if self.move_type in ("out_refund", "in_refund"):
-            origin = self.reversed_entry_id
-            if origin:
-                data["associated_docs"] = [
-                    {
-                        "type": int(
-                            origin.l10n_latam_document_type_id.code
-                        ),
-                        "pos_number": journal.l10n_ar_afip_pos_number,
-                        "number": int(
-                            origin.l10n_latam_document_number.split("-")[-1]
-                        ),
-                        "cuit": certificate.cuit.replace("-", ""),
-                        "date": origin.invoice_date.strftime("%Y%m%d"),
-                    }
-                ]
+        if vat_lines:
+            detail["Iva"] = {"AlicIva": vat_lines}
 
-        # Customer IVA condition (RG 5616)
-        if partner.l10n_ar_afip_responsibility_type_id:
-            resp_code = int(
-                partner.l10n_ar_afip_responsibility_type_id.code
-            )
-            if resp_code in RESPONSIBILITY_TO_IVA_CONDITION:
-                data["customer_iva_condition"] = (
-                    RESPONSIBILITY_TO_IVA_CONDITION[resp_code]
-                )
+        associated = self._l10n_ar_arca_associated_documents(doc_type_code)
+        if associated:
+            detail["CbtesAsoc"] = {"CbteAsoc": associated}
 
-        # Currency
-        if self.currency_id != self.company_currency_id:
-            data["currency_code"] = (
-                self.currency_id.l10n_ar_afip_code or "PES"
-            )
-            data["currency_rate"] = self.currency_id.rate or 1
+        header = {
+            "CantReg": 1,
+            "PtoVta": pos_number,
+            "CbteTipo": doc_type_code,
+        }
+        return header, detail
 
-        return data
+    def _l10n_ar_arca_service_dates(self, invoice_date):
+        """Service period and payment due date (validation 10049).
 
-    def _get_arca_concept_type(self):
-        """Determine ARCA concept type (1=products, 2=services, 3=both)."""
+        The dates come from the fields l10n_ar already provides for this, so a
+        service invoice reports the period it actually covers rather than the
+        day it happened to be issued.
+        """
         self.ensure_one()
-        has_product = any(
-            line.product_id.type == "consu"
-            for line in self.invoice_line_ids
-            if line.product_id
-        )
-        has_service = any(
-            line.product_id.type == "service"
-            for line in self.invoice_line_ids
-            if line.product_id
-        )
-        if has_product and has_service:
-            return 3
-        if has_service:
-            return 2
-        return 1
-
-    def _get_arca_customer_doc(self, partner):
-        """Get ARCA document type and number for the customer."""
-        vat = partner.vat
-        id_type = partner.l10n_latam_identification_type_id
-
-        if not vat or not id_type:
-            # Consumidor Final
-            return 99, 0
-
-        id_code = id_type.l10n_ar_afip_code
-        if id_code:
-            return int(id_code), int(
-                vat.replace("-", "").replace(" ", "")
+        start = self.l10n_ar_afip_service_start or invoice_date
+        end = self.l10n_ar_afip_service_end or invoice_date
+        if end < start:
+            raise UserError(
+                _("The ARCA service end date cannot be earlier than the start date.")
             )
+        due = self.invoice_date_due or invoice_date
+        return {
+            "FchServDesde": start.strftime("%Y%m%d"),
+            "FchServHasta": end.strftime("%Y%m%d"),
+            "FchVtoPago": due.strftime("%Y%m%d"),
+        }
 
-        # Fallback
-        return 99, 0
+    # ------------------------------------------------------------------
+    # QR code (RG 4892/2020)
+    # ------------------------------------------------------------------
 
-    def _build_arca_barcode(
-        self, certificate, doc_type_code, journal, cae_result
-    ):
+    @api.depends(
+        "l10n_ar_arca_cae",
+        "l10n_ar_arca_state",
+        "l10n_latam_document_number",
+        "amount_total",
+    )
+    def _compute_l10n_ar_arca_qr_code(self):
+        for move in self:
+            move.l10n_ar_arca_qr_code = False
+            if move.l10n_ar_arca_state != "authorized" or not move.l10n_ar_arca_cae:
+                continue
+            try:
+                move.l10n_ar_arca_qr_code = move._l10n_ar_arca_build_qr_url()
+            except (UserError, ValueError) as exc:
+                _logger.warning("Could not build the ARCA QR for move %s: %s", move.id, exc)
+
+    def _l10n_ar_arca_qr_payload(self):
+        """The JSON document encoded in the QR, before base64.
+
+        Kept separate from the URL so the payload itself can be asserted on:
+        checking only the final string would hide a wrong field inside it.
         """
-        Build the ARCA barcode data string for Interleaved 2 of 5.
+        self.ensure_one()
+        certificate = self.company_id.l10n_ar_arca_certificate_id
+        cuit = certificate._get_clean_cuit() if certificate else ""
+        pos_number, number = self._l10n_ar_arca_document_number_parts()
+        doc_type_code = int(self.l10n_latam_document_type_id.code)
+        currency_code, currency_rate = self._l10n_ar_arca_currency_values()
+        receptor_type, receptor_number = self._l10n_ar_arca_customer_document(doc_type_code)
+        invoice_date = self.invoice_date or fields.Date.context_today(self)
 
-        Format: CUIT + CbteTipo + PtoVta + CAE + CAEFchVto + DigitoVerificador
-
-        The barcode encodes:
-        - CUIT (11 digits)
-        - Tipo de comprobante (3 digits, zero-padded)
-        - Punto de venta (5 digits, zero-padded)
-        - CAE (14 digits)
-        - Fecha vencimiento CAE (8 digits, YYYYMMDD)
-        - Dígito verificador (1 digit, mod 10)
-        """
-        if not cae_result.get("cae") or not cae_result.get("cae_due_date"):
-            return False
-
-        cuit = certificate.cuit.replace("-", "").replace(" ", "")
-        cbte_tipo = str(doc_type_code).zfill(3)
-        pto_vta = str(journal.l10n_ar_afip_pos_number).zfill(5)
-        cae = str(cae_result["cae"]).zfill(14)
-        cae_due = str(cae_result["cae_due_date"]).replace("-", "")
-
-        # Build barcode without check digit
-        barcode_data = f"{cuit}{cbte_tipo}{pto_vta}{cae}{cae_due}"
-
-        # Calculate mod 10 check digit (Luhn-like for I2of5)
-        odd_sum = sum(int(d) for d in barcode_data[::2])
-        even_sum = sum(int(d) for d in barcode_data[1::2])
-        total = odd_sum * 3 + even_sum
-        check_digit = (10 - (total % 10)) % 10
-
-        return f"{barcode_data}{check_digit}"
-
-    def _build_arca_qr_code(
-        self, certificate, doc_type_code, journal, invoice_number, cae_result
-    ):
-        """
-        Build the ARCA QR code URL per RG 4892/2020.
-
-        The QR encodes a JSON payload in base64:
-        https://www.afip.gob.ar/fe/qr/?p={base64_json}
-        """
-        if not cae_result.get("cae") or not cae_result.get("cae_due_date"):
-            return False
-
-        cuit = certificate.cuit.replace("-", "").replace(" ", "")
-        invoice_date = self.invoice_date or fields.Date.today()
-
-        # Customer document
-        partner = self.partner_id.commercial_partner_id
-        customer_doc_type, customer_doc_number = self._get_arca_customer_doc(
-            partner
-        )
-
-        # Currency code (PES = Argentine Peso)
-        currency_code = "PES"
-        currency_rate = 1
-        if self.currency_id != self.company_currency_id:
-            currency_code = (
-                self.currency_id.l10n_ar_afip_code or "PES"
-            )
-            currency_rate = self.currency_id.rate or 1
-
-        qr_data = {
+        return {
             "ver": 1,
             "fecha": invoice_date.strftime("%Y-%m-%d"),
             "cuit": int(cuit),
-            "ptoVta": journal.l10n_ar_afip_pos_number,
+            "ptoVta": pos_number,
             "tipoCmp": doc_type_code,
-            "nroCmp": invoice_number,
-            "importe": round(abs(self.amount_total), 2),
+            "nroCmp": number,
+            "importe": float_round(abs(self.amount_total), precision_digits=2),
             "moneda": currency_code,
             "ctz": currency_rate,
-            "tipoDocRec": customer_doc_type,
-            "nroDocRec": customer_doc_number,
-            "tipoCodAut": "E",  # E = CAE
-            "codAut": int(cae_result["cae"]),
+            "tipoDocRec": receptor_type,
+            "nroDocRec": receptor_number,
+            "tipoCodAut": "E",
+            "codAut": int(self.l10n_ar_arca_cae),
         }
 
-        json_str = json.dumps(qr_data, separators=(",", ":"))
-        encoded = base64.b64encode(json_str.encode("utf-8")).decode("utf-8")
+    def _l10n_ar_arca_build_qr_url(self):
+        self.ensure_one()
+        payload = self._l10n_ar_arca_qr_payload()
+        encoded = base64.b64encode(
+            json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        ).decode("ascii")
+        return f"{QR_BASE_URL}{encoded}"
 
-        return f"https://www.afip.gob.ar/fe/qr/?p={encoded}"
+    # ------------------------------------------------------------------
+    # UI helpers
+    # ------------------------------------------------------------------
+
+    def _l10n_ar_arca_notify_state(self):
+        self.ensure_one()
+        if self.l10n_ar_arca_state == "authorized":
+            title = _("Invoice authorized")
+            message = _(
+                "CAE %(cae)s, valid until %(due)s.",
+                cae=self.l10n_ar_arca_cae,
+                due=self.l10n_ar_arca_cae_due_date,
+            )
+            kind = "success"
+        elif self.l10n_ar_arca_state == "uncertain":
+            title = _("Fiscal status unknown")
+            message = _("Reconcile this invoice against ARCA before issuing it again.")
+            kind = "warning"
+        else:
+            title = _("ARCA status")
+            message = self.l10n_ar_arca_error_message or dict(
+                self._fields["l10n_ar_arca_state"].selection
+            ).get(self.l10n_ar_arca_state, "")
+            kind = "warning"
+        return {
+            "type": "ir.actions.client",
+            "tag": "display_notification",
+            "params": {"title": title, "message": message, "type": kind, "sticky": False},
+        }
+
+    def action_l10n_ar_arca_view_attempts(self):
+        self.ensure_one()
+        return {
+            "type": "ir.actions.act_window",
+            "name": _("ARCA Attempts"),
+            "res_model": "l10n_ar.arca.attempt",
+            "view_mode": "list,form",
+            "domain": [("move_id", "=", self.id)],
+        }
+
+    def button_draft(self):
+        """Refuse to reopen an invoice that ARCA has already authorized."""
+        authorized = self.filtered(lambda m: m.l10n_ar_arca_state == "authorized")
+        if authorized:
+            raise UserError(
+                _(
+                    "Invoice %s was authorized by ARCA and cannot be set back to "
+                    "draft. Issue a credit note instead.",
+                    authorized[0].display_name,
+                )
+            )
+        uncertain = self.filtered(lambda m: m.l10n_ar_arca_state == "uncertain")
+        if uncertain:
+            raise UserError(
+                _(
+                    "Invoice %s has an unresolved ARCA request. Reconcile it "
+                    "before changing its state.",
+                    uncertain[0].display_name,
+                )
+            )
+        return super().button_draft()
