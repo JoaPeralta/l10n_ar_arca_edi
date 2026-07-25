@@ -100,8 +100,7 @@ class TestArcaAuthorization(ArcaTestCommon):
         self.service.raise_on_request = ArcaUncertain("read timed out")
         invoice = self._new_invoice()
         self._post_invoice(invoice)
-        with self.assertRaisesRegex(UserError, "answer was lost"):
-            self._authorize(invoice)
+        self._authorize_expecting_failure(invoice, "answer was lost")
         self.assertEqual(invoice.l10n_ar_arca_state, "uncertain")
         self.assertEqual(invoice.l10n_ar_arca_attempt_ids.state, "uncertain")
         self.assertFalse(invoice.l10n_ar_arca_cae)
@@ -111,13 +110,11 @@ class TestArcaAuthorization(ArcaTestCommon):
         self.service.raise_on_request = ArcaUncertain("read timed out")
         invoice = self._new_invoice()
         self._post_invoice(invoice)
-        with self.assertRaises(UserError):
-            self._authorize(invoice)
+        self._authorize_expecting_failure(invoice)
 
         self.service.raise_on_request = None
         sent_before = len(self.service.requests)
-        with self.assertRaisesRegex(UserError, "Reconcile"):
-            self._authorize(invoice)
+        self._authorize_expecting_failure(invoice, "Reconcile")
         self.assertEqual(len(self.service.requests), sent_before)
 
     def test_reconciling_finds_the_voucher_arca_actually_authorized(self):
@@ -130,8 +127,7 @@ class TestArcaAuthorization(ArcaTestCommon):
         self.service.known_vouchers[(TEST_POS_NUMBER, doc_type, number)] = "70999999999999"
         self.service.raise_on_request = ArcaUncertain("connection reset")
 
-        with self.assertRaises(UserError):
-            self._authorize(invoice)
+        self._authorize_expecting_failure(invoice)
         self.assertEqual(invoice.l10n_ar_arca_state, "uncertain")
 
         invoice.action_l10n_ar_arca_reconcile()
@@ -144,8 +140,7 @@ class TestArcaAuthorization(ArcaTestCommon):
         self.service.raise_on_request = ArcaUncertain("connection reset")
         invoice = self._new_invoice()
         self._post_invoice(invoice)
-        with self.assertRaises(UserError):
-            self._authorize(invoice)
+        self._authorize_expecting_failure(invoice)
 
         invoice.action_l10n_ar_arca_reconcile()
         self.assertEqual(invoice.l10n_ar_arca_state, "pending")
@@ -159,8 +154,7 @@ class TestArcaAuthorization(ArcaTestCommon):
         self.service.raise_on_request = ArcaUncertain("timeout")
         invoice = self._new_invoice()
         self._post_invoice(invoice)
-        with self.assertRaises(UserError):
-            self._authorize(invoice)
+        self._authorize_expecting_failure(invoice)
         _pos, number = invoice._l10n_ar_arca_document_number_parts()
 
         invoice.action_l10n_ar_arca_reconcile()
@@ -173,8 +167,7 @@ class TestArcaAuthorization(ArcaTestCommon):
         self.service.raise_on_request = ArcaUncertain("timeout")
         invoice = self._new_invoice()
         self._post_invoice(invoice)
-        with self.assertRaises(UserError):
-            self._authorize(invoice)
+        self._authorize_expecting_failure(invoice)
 
         self.env["l10n_ar.arca.attempt"]._cron_reconcile_open_attempts()
         self.assertEqual(invoice.l10n_ar_arca_attempt_ids.state, "aborted")
@@ -189,8 +182,7 @@ class TestArcaAuthorization(ArcaTestCommon):
         self.service.raise_on_request = ArcaBusinessError("[10048] wrong total", code="10048")
         invoice = self._new_invoice()
         self._post_invoice(invoice)
-        with self.assertRaisesRegex(UserError, "did not authorize"):
-            self._authorize(invoice)
+        self._authorize_expecting_failure(invoice, "did not authorize")
         self.assertEqual(invoice.l10n_ar_arca_state, "rejected")
         self.assertEqual(invoice.l10n_ar_arca_error_code, "10048")
         self.assertEqual(invoice.l10n_ar_arca_attempt_ids.state, "rejected")
@@ -199,8 +191,7 @@ class TestArcaAuthorization(ArcaTestCommon):
         self.service.raise_on_request = ArcaBusinessError("[10048] wrong total", code="10048")
         invoice = self._new_invoice()
         self._post_invoice(invoice)
-        with self.assertRaises(UserError):
-            self._authorize(invoice)
+        self._authorize_expecting_failure(invoice)
 
         self.service.raise_on_request = None
         self._authorize(invoice)
@@ -210,8 +201,7 @@ class TestArcaAuthorization(ArcaTestCommon):
         self.service.raise_on_request = ArcaAborted("connection refused")
         invoice = self._new_invoice()
         self._post_invoice(invoice)
-        with self.assertRaises(UserError):
-            self._authorize(invoice)
+        self._authorize_expecting_failure(invoice)
         self.assertEqual(invoice.l10n_ar_arca_attempt_ids.state, "aborted")
         self.assertEqual(invoice.l10n_ar_arca_state, "rejected")
 
@@ -233,8 +223,7 @@ class TestArcaAuthorization(ArcaTestCommon):
         invoice = self._new_invoice()
         self._post_invoice(invoice)
         invoice.action_l10n_ar_arca_authorize()
-        with self.assertRaises(UserError):
-            invoice.action_l10n_ar_arca_authorize()
+        self._authorize_expecting_failure(invoice, "already has CAE")
         self.assertEqual(len(self.service.requests), 1)
         self.assertEqual(len(invoice.l10n_ar_arca_attempt_ids), 1)
 
@@ -274,8 +263,7 @@ class TestArcaAuthorization(ArcaTestCommon):
         self.service.raise_on_request = ArcaUncertain("timeout")
         invoice = self._new_invoice()
         self._post_invoice(invoice)
-        with self.assertRaises(UserError):
-            self._authorize(invoice)
+        self._authorize_expecting_failure(invoice)
         with self.assertRaisesRegex(UserError, "unresolved ARCA request"):
             invoice.button_draft()
 

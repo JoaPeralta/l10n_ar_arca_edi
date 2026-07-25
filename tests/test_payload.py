@@ -169,9 +169,32 @@ class TestArcaPayload(ArcaTestCommon):
         self.assertEqual(detail["ImpIVA"], 0.0)
         self.assertEqual(detail["ImpTotal"], 100.0)
 
+    def test_other_tributes_are_reported_as_imp_trib(self):
+        """A tribute is neither VAT nor an untaxed amount: it has its own field."""
+        invoice = self._new_invoice(
+            lines=[
+                self._prepare_invoice_line(
+                    product_id=self.product_iva_21,
+                    price_unit=100.0,
+                    quantity=1,
+                    tax_ids=[(6, 0, (self.tax_21 + self.tax_other).ids)],
+                )
+            ]
+        )
+        detail = self._sent_detail(invoice)
+        self.assertEqual(detail["ImpNeto"], 100.0)
+        self.assertEqual(detail["ImpIVA"], 21.0)
+        self.assertEqual(detail["ImpTrib"], 100.0)
+        self.assertEqual(detail["ImpTotConc"], 0.0)
+        self.assertEqual(detail["ImpTotal"], 221.0)
+
     def test_perceptions_are_reported_as_imp_trib(self):
-        """A IIBB perception is a tribute: not VAT, and not "untaxed" either."""
-        self.tax_perc_iibb.active = True
+        """A IIBB perception is a tribute too.
+
+        The localization ships the perception with a zero rate for the user to
+        configure, so the rate is set here rather than assumed.
+        """
+        self.tax_perc_iibb.write({"active": True, "amount": 3.0})
         invoice = self._new_invoice(
             lines=[
                 self._prepare_invoice_line(

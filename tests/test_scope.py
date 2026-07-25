@@ -11,7 +11,7 @@ from odoo.exceptions import UserError
 from odoo.tests import tagged
 
 from ..models import constants
-from .common import ArcaTestCommon, FakeArcaService
+from .common import TEST_POS_NUMBER, ArcaTestCommon, FakeArcaService
 
 
 @tagged("post_install", "-at_install")
@@ -128,9 +128,42 @@ class TestArcaNotes(ArcaTestCommon):
             self._authorize(credit_note)
         self.assertFalse(self.service.requests)
 
-    def test_association_uses_the_origins_point_of_sale(self):
-        """Not the current journal's: they can differ."""
+    def test_an_invoice_carries_no_association(self):
         invoice = self._authorized_invoice()
-        origin_pos, _number = invoice._l10n_ar_arca_document_number_parts()
-        associated = invoice._l10n_ar_arca_associated_documents(3)
-        self.assertFalse(associated, "An invoice is not a note and needs no association")
+        self.assertFalse(invoice._l10n_ar_arca_associated_documents(1))
+
+    def test_association_uses_the_origins_point_of_sale(self):
+        """The referenced voucher's point of sale, not the note's own.
+
+        Taking it from the current journal is silently wrong whenever the note
+        is issued from a different point of sale than the invoice it adjusts.
+        """
+        other_journal = self._create_journal(
+            "WSFE",
+            data={
+                "l10n_ar_afip_pos_system": "RAW_MAW",
+                "l10n_ar_afip_pos_number": 42,
+                "code": "ARC42",
+                "name": "ARCA POS 42",
+            },
+        )
+        invoice = self._new_invoice(journal_id=other_journal.id)
+        self._post_invoice(invoice)
+        self._authorize(invoice)
+        origin_pos, origin_number = invoice._l10n_ar_arca_document_number_parts()
+        self.assertEqual(origin_pos, 42)
+
+        reversal = (
+            self.env["account.move.reversal"]
+            .with_context(active_model="account.move", active_ids=invoice.ids)
+            .create({"journal_id": self.arca_journal.id, "reason": "different POS"})
+        )
+        credit_note = self.env["account.move"].browse(reversal.reverse_moves()["res_id"])
+        self._post_invoice(credit_note)
+        self._authorize(credit_note)
+
+        request = self.service.requests[-1]
+        self.assertEqual(request["header"]["PtoVta"], TEST_POS_NUMBER)
+        associated = request["detail"]["CbtesAsoc"]["CbteAsoc"][0]
+        self.assertEqual(associated["PtoVta"], 42)
+        self.assertEqual(associated["Nro"], origin_number)

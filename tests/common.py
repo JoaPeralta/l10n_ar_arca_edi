@@ -9,6 +9,8 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
+from odoo.exceptions import UserError
+
 from odoo.addons.l10n_ar.tests.common import TestArCommon
 
 # Valid CUIT (verification digit checked): 30-71234567-1
@@ -218,6 +220,24 @@ class ArcaTestCommon(TestArCommon):
         exercised without breaking the test cursor.
         """
         return invoice._l10n_ar_arca_authorize()
+
+    def _authorize_expecting_failure(self, invoice, message=None):
+        """Authorize, expect it to fail, and keep what it recorded.
+
+        ``assertRaises`` cannot be used here: Odoo wraps it in a savepoint and
+        rolls that savepoint back as soon as the expected exception fires, which
+        would discard the very records this module writes on purpose before
+        failing. In production those writes are committed and survive; a test
+        that threw them away would be asserting the opposite of the design.
+        """
+        try:
+            invoice._l10n_ar_arca_authorize()
+        except UserError as exc:
+            if message:
+                self.assertRegex(str(exc), message)
+            invoice.invalidate_recordset()
+            return exc
+        self.fail("The authorization was expected to fail and did not")
 
     def _document_type(self, code):
         return self.env["l10n_latam.document.type"].search(
