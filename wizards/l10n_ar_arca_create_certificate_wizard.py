@@ -17,13 +17,23 @@ class L10nArArcaCreateCertificateWizard(models.TransientModel):
         required=True,
         default=lambda self: self.env.company,
     )
-    cuit = fields.Char(
-        string="CUIT",
-        compute="_compute_cuit",
+    holder_cuit = fields.Char(
+        string="Certificate Holder CUIT",
+        compute="_compute_holder_cuit",
         store=True,
         readonly=False,
         required=True,
-        help="Defaults to the company's tax number; override it if they differ.",
+        help=(
+            "CUIT of whoever will sign in to the ARCA portal with their fiscal "
+            "key and create this certificate. Often the company itself, but it "
+            "can be a person acting for it -- in which case enter the person's "
+            "CUIT here and authorize them for the company in WSASS."
+        ),
+    )
+    issuer_cuit = fields.Char(
+        string="Invoices on behalf of",
+        compute="_compute_holder_cuit",
+        help="The company's tax number, reported to ARCA as the issuer.",
     )
     environment = fields.Selection(
         [("testing", "Testing (Homologación)"), ("production", "Production")],
@@ -32,31 +42,36 @@ class L10nArArcaCreateCertificateWizard(models.TransientModel):
     )
 
     @api.depends("company_id")
-    def _compute_cuit(self):
+    def _compute_holder_cuit(self):
+        """Default the holder to the company, which is the common case.
+
+        Only a default: a person holding the certificate for the company enters
+        their own number, and the issuer shown beside it stays the company's.
+        """
         for wizard in self:
             digits = "".join(
                 ch for ch in (wizard.company_id.partner_id.vat or "") if ch.isdigit()
             )
-            if len(digits) == 11:
-                wizard.cuit = f"{digits[:2]}-{digits[2:10]}-{digits[10]}"
-            else:
-                wizard.cuit = wizard.company_id.partner_id.vat or ""
+            formatted = (
+                f"{digits[:2]}-{digits[2:10]}-{digits[10]}"
+                if len(digits) == 11
+                else (wizard.company_id.partner_id.vat or "")
+            )
+            wizard.holder_cuit = formatted
+            wizard.issuer_cuit = formatted
 
     def action_create(self):
         """Create the certificate record and select it for the company."""
         self.ensure_one()
-        if not self.cuit:
+        # The company's own number is what ends up on the invoices, so it has to
+        # be right before a certificate is worth creating.
+        self.company_id._l10n_ar_arca_issuer_cuit()
+        if not self.holder_cuit:
             raise UserError(
-                _(
-                    "Enter the CUIT that will issue the invoices. Company '%s' has "
-                    "no tax number configured to default from.",
-                    self.company_id.display_name,
-                )
+                _("Enter the CUIT of whoever will create the certificate in ARCA.")
             )
-        if not is_valid_cuit(self.cuit):
-            raise UserError(
-                _("'%s' is not a valid CUIT.", self.cuit)
-            )
+        if not is_valid_cuit(self.holder_cuit):
+            raise UserError(_("'%s' is not a valid CUIT.", self.holder_cuit))
 
         certificate = self.env["l10n_ar.arca.certificate"].create(
             {
@@ -64,7 +79,7 @@ class L10nArArcaCreateCertificateWizard(models.TransientModel):
                 "company_id": self.company_id.id,
                 # The value shown in the wizard is the one used, so an override
                 # is not silently discarded.
-                "cuit": self.cuit,
+                "holder_cuit": self.holder_cuit,
                 "environment": self.environment,
             }
         )

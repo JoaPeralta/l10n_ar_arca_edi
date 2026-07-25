@@ -30,7 +30,8 @@ class TestArcaQrCode(ArcaTestCommon):
 
         self.assertEqual(payload["ver"], 1)
         self.assertEqual(payload["fecha"], "2026-07-25")
-        self.assertEqual(payload["cuit"], int(self.certificate._get_clean_cuit()))
+        # The QR names the issuer, not whoever holds the certificate.
+        self.assertEqual(payload["cuit"], int(self.issuer_cuit))
         self.assertEqual(payload["ptoVta"], pos_number)
         self.assertEqual(payload["ptoVta"], TEST_POS_NUMBER)
         self.assertEqual(

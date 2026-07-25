@@ -71,7 +71,15 @@ class L10nArArcaAttempt(models.Model):
 
     # Identity of the fiscal document that was attempted. Stored as plain values
     # so the attempt stays meaningful even if the invoice is later modified.
-    cuit = fields.Char(readonly=True, help="Issuer CUIT, digits only.")
+    issuer_cuit = fields.Char(
+        string="Issuer CUIT",
+        readonly=True,
+        help=(
+            "CUIT the voucher was issued under -- the one reported to ARCA as "
+            "Auth.Cuit. Not the certificate holder's, which may differ when a "
+            "person invoices on behalf of a company."
+        ),
+    )
     pos_number = fields.Integer(string="Point of Sale", readonly=True)
     document_type_code = fields.Integer(string="Document Type", readonly=True)
     document_number = fields.Integer(string="Number", readonly=True)
@@ -114,7 +122,7 @@ class L10nArArcaAttempt(models.Model):
     # guarantee that a point of sale never authorizes the same number twice,
     # independent of any application logic that may be bypassed or racing.
     _authorized_document_uniq = models.UniqueIndex(
-        "(company_id, cuit, pos_number, document_type_code, document_number)"
+        "(company_id, issuer_cuit, pos_number, document_type_code, document_number)"
         " WHERE state = 'authorized'",
         "This point of sale already has an authorized voucher with that number.",
     )
@@ -218,6 +226,10 @@ class L10nArArcaAttempt(models.Model):
         wsfe = self.env["l10n_ar.arca.wsfe"]
         found = wsfe.fe_comp_consultar(
             certificate,
+            # Ask about the CUIT the voucher was issued under, which is recorded
+            # on the attempt rather than re-derived: the company's number could
+            # have been corrected since.
+            self.issuer_cuit,
             self.pos_number,
             self.document_type_code,
             self.document_number,
@@ -258,7 +270,7 @@ class L10nArArcaAttempt(models.Model):
         """
         self.ensure_one()
         lock_key = self.env["account.move"]._l10n_ar_arca_lock_key(
-            self.company_id.id, self.pos_number, self.document_type_code
+            self.issuer_cuit, self.pos_number, self.document_type_code
         )
         try:
             with fiscal_transaction(self.env, lock_key) as fiscal:

@@ -62,10 +62,27 @@ class L10nArArcaCertificate(models.Model):
         index=True,
         default=lambda self: self.env.company,
     )
-    cuit = fields.Char(
-        string="CUIT",
+    holder_cuit = fields.Char(
+        string="Certificate Holder CUIT",
         required=True,
-        help="Taxpayer number of the issuer, e.g. 20-29318820-4.",
+        help=(
+            "CUIT of whoever owns this certificate: the person or entity whose "
+            "fiscal key creates the DN in the ARCA portal, and whose number ARCA "
+            "writes into the certificate subject.\n\n"
+            "This is not necessarily the taxpayer being invoiced for. A person "
+            "can hold a certificate and be authorized in WSASS to act for a "
+            "company; the invoicing CUIT then comes from the Odoo company, not "
+            "from here."
+        ),
+    )
+    issuer_cuit = fields.Char(
+        string="Invoices on behalf of",
+        compute="_compute_issuer_cuit",
+        help=(
+            "CUIT reported to ARCA as the issuer, taken from the company's tax "
+            "number. This certificate must be authorized in WSASS to represent "
+            "it for the wsfe service."
+        ),
     )
     environment = fields.Selection(
         ARCA_ENVIRONMENTS,
@@ -131,47 +148,53 @@ class L10nArArcaCertificate(models.Model):
     # Validation
     # ------------------------------------------------------------------
 
-    @api.constrains("cuit")
-    def _check_cuit(self):
+    @api.constrains("holder_cuit")
+    def _check_holder_cuit(self):
         for record in self:
-            if not is_valid_cuit(record.cuit):
+            if not is_valid_cuit(record.holder_cuit):
                 raise ValidationError(
                     _(
                         "'%s' is not a valid CUIT: it must have 11 digits and a "
                         "correct verification digit.",
-                        record.cuit or "",
+                        record.holder_cuit or "",
                     )
                 )
 
-    @api.constrains("company_id", "environment")
-    def _check_production_company_vat(self):
-        """A production certificate must belong to the company it invoices for."""
-        for record in self.filtered(lambda r: r.environment == "production"):
-            company_vat = record.company_id.partner_id.vat or ""
-            company_digits = "".join(ch for ch in company_vat if ch.isdigit())
-            if company_digits and company_digits != record._get_clean_cuit():
-                raise ValidationError(
-                    _(
-                        "The certificate CUIT (%(cert)s) does not match the CUIT of "
-                        "company '%(company)s' (%(company_cuit)s).",
-                        cert=record._get_clean_cuit(),
-                        company=record.company_id.display_name,
-                        company_cuit=company_digits,
-                    )
-                )
+    @api.depends("company_id", "company_id.partner_id.vat")
+    def _compute_issuer_cuit(self):
+        """Show which taxpayer this certificate will invoice for.
+
+        Deliberately not stored and not editable: the issuer is the company's
+        tax number, and a second copy of it here could drift from the invoices
+        it is supposed to describe.
+        """
+        for record in self:
+            digits = "".join(
+                ch for ch in (record.company_id.partner_id.vat or "") if ch.isdigit()
+            )
+            record.issuer_cuit = (
+                f"{digits[:2]}-{digits[2:10]}-{digits[10]}" if len(digits) == 11 else digits
+            )
 
     def _compute_private_key_stored(self):
         """Report that a key exists without ever handing out its contents."""
         for record in self:
             record.private_key_stored = bool(record.sudo().private_key)
 
-    def _get_clean_cuit(self):
-        self.ensure_one()
-        return "".join(ch for ch in (self.cuit or "") if ch.isdigit())
+    def _get_holder_cuit(self):
+        """Digits of the CUIT that owns this certificate.
 
-    def _format_cuit_with_dashes(self):
+        Never the invoicing CUIT: that one comes from the company. The two names
+        are kept apart on purpose, because they coincide often enough for a
+        single ``cuit`` to look correct right up until a person invoices for a
+        company.
+        """
         self.ensure_one()
-        digits = self._get_clean_cuit()
+        return "".join(ch for ch in (self.holder_cuit or "") if ch.isdigit())
+
+    def _format_holder_cuit(self):
+        self.ensure_one()
+        digits = self._get_holder_cuit()
         return f"{digits[:2]}-{digits[2:10]}-{digits[10]}"
 
     def _check_usable(self):
@@ -299,9 +322,11 @@ class L10nArArcaCertificate(models.Model):
                             NameOID.ORGANIZATION_NAME, self.company_id.name or "Company"
                         ),
                         x509.NameAttribute(NameOID.COMMON_NAME, self.name),
+                        # ARCA issues the certificate to the fiscal key that
+                        # creates it, so the subject carries the holder's CUIT.
                         x509.NameAttribute(
                             NameOID.SERIAL_NUMBER,
-                            f"CUIT {self._format_cuit_with_dashes()}",
+                            f"CUIT {self._format_holder_cuit()}",
                         ),
                     ]
                 )
@@ -320,10 +345,10 @@ class L10nArArcaCertificate(models.Model):
             }
         )
         _logger.info(
-            "Generated an RSA-%s key and CSR for certificate %s (CUIT %s, env %s)",
+            "Generated an RSA-%s key and CSR for certificate %s (holder %s, env %s)",
             RSA_KEY_SIZE,
             self.id,
-            self._format_cuit_with_dashes(),
+            self._format_holder_cuit(),
             self.environment,
         )
         return self._notify(
@@ -367,7 +392,7 @@ class L10nArArcaCertificate(models.Model):
                 )
             )
 
-        self._check_certificate_cuit(cert)
+        self._check_certificate_holder_cuit(cert)
 
         not_before, not_after = self._certificate_validity(cert)
         now = fields.Datetime.now()
@@ -399,30 +424,40 @@ class L10nArArcaCertificate(models.Model):
         )
         return True
 
-    def _check_certificate_cuit(self, cert):
-        """The certificate must be issued for this record's CUIT."""
+    def _check_certificate_holder_cuit(self, cert):
+        """The certificate subject must name this record's holder.
+
+        Checked against the holder and not against the invoicing CUIT: ARCA puts
+        the DN owner's number in the subject, and for a person invoicing on
+        behalf of a company those differ legitimately.
+        """
         self.ensure_one()
         serial_numbers = cert.subject.get_attributes_for_oid(NameOID.SERIAL_NUMBER)
         if not serial_numbers:
             # Not every ARCA certificate carries it; do not block on absence.
             return True
         digits = "".join(ch for ch in str(serial_numbers[0].value) if ch.isdigit())
-        if digits and digits != self._get_clean_cuit():
+        if digits and digits != self._get_holder_cuit():
             raise UserError(
                 _(
-                    "That certificate was issued for CUIT %(cert_cuit)s but this "
-                    "record is configured for %(record_cuit)s.",
+                    "That certificate was issued to CUIT %(cert_cuit)s but this "
+                    "record names %(holder)s as its holder.\n\n"
+                    "If %(cert_cuit)s is the person who created the certificate in "
+                    "the ARCA portal, correct the holder here. The CUIT being "
+                    "invoiced for is taken from the company and does not have to "
+                    "match.",
                     cert_cuit=digits,
-                    record_cuit=self._get_clean_cuit(),
+                    holder=self._get_holder_cuit(),
                 )
             )
         return True
 
     def action_test_connection(self):
-        """Check that ARCA answers and that this certificate authenticates."""
+        """Check that ARCA answers, and that this DN may act for the company."""
         self.ensure_one()
         self._check_usable()
-        status = self.env["l10n_ar.arca.wsfe"].check_connection(self)
+        issuer_cuit = self.company_id._l10n_ar_arca_issuer_cuit()
+        status = self.env["l10n_ar.arca.wsfe"].check_connection(self, issuer_cuit)
         return self._notify(
             _("ARCA connection successful"),
             _(

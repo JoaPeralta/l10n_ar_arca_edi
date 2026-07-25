@@ -32,6 +32,11 @@ OPERATION_TIMEOUT = 60
 # legitimate answer to FECompConsultar, not a failure.
 ERROR_NO_DATA_FOUND = 602
 
+# "CUIT representada no incluida en token": the certificate authenticated fine,
+# but it has no WSASS authorization to act for the CUIT in Auth.Cuit. Worth
+# naming, because the message alone does not say where to fix it.
+ERROR_CUIT_NOT_REPRESENTED = 601
+
 # A zeep Client parses the WSDL on every instantiation, which is a network round
 # trip plus XML parsing. Cache per URL, per process.
 _WSDL_CLIENT_CACHE = {}
@@ -89,14 +94,21 @@ class L10nArArcaWsfe(models.AbstractModel):
             _WSDL_CLIENT_CACHE.clear()
 
     @api.model
-    def _get_auth(self, certificate, service="wsfe"):
-        """Build the Auth header. Failures here happen before any send."""
+    def _get_auth(self, certificate, issuer_cuit, service="wsfe"):
+        """Build the Auth header. Failures here happen before any send.
+
+        ``Token`` and ``Sign`` identify the certificate holder; ``Cuit`` is the
+        taxpayer being represented -- the manual calls it "Cuit contribuyente
+        (representado o Emisora)". The two are separate arguments because they
+        are separate identities: a person can hold the certificate and invoice
+        on behalf of a company that authorized them in WSASS.
+        """
         wsaa = self.env["l10n_ar.arca.wsaa"]
         credentials = wsaa._get_or_refresh_token(certificate, service=service)
         return {
             "Token": credentials["token"],
             "Sign": credentials["sign"],
-            "Cuit": int(certificate._get_clean_cuit()),
+            "Cuit": int(issuer_cuit),
         }
 
     @api.model
@@ -181,10 +193,10 @@ class L10nArArcaWsfe(models.AbstractModel):
     # ------------------------------------------------------------------
 
     @api.model
-    def fe_comp_ultimo_autorizado(self, certificate, pos_number, doc_type_code):
+    def fe_comp_ultimo_autorizado(self, certificate, issuer_cuit, pos_number, doc_type_code):
         """Return the last number authorized for a point of sale / type."""
         client = self._get_client(certificate)
-        auth = self._get_auth(certificate)
+        auth = self._get_auth(certificate, issuer_cuit)
         response = self._call(
             client,
             "FECompUltimoAutorizado",
@@ -202,15 +214,15 @@ class L10nArArcaWsfe(models.AbstractModel):
         return int(number)
 
     @api.model
-    def fe_cae_solicitar(self, certificate, header, detail):
-        """Request a CAE.
+    def fe_cae_solicitar(self, certificate, issuer_cuit, header, detail):
+        """Request a CAE for ``issuer_cuit``.
 
         ``header`` and ``detail`` are already-built dicts; this method does not
         interpret invoices. The caller is responsible for having recorded a
         durable attempt before calling in.
         """
         client = self._get_client(certificate)
-        auth = self._get_auth(certificate)
+        auth = self._get_auth(certificate, issuer_cuit)
         request_data = {
             "FeCabReq": header,
             "FeDetReq": {"FECAEDetRequest": [detail]},
@@ -229,14 +241,14 @@ class L10nArArcaWsfe(models.AbstractModel):
         return result
 
     @api.model
-    def fe_comp_consultar(self, certificate, pos_number, doc_type_code, number):
-        """Ask ARCA whether a voucher exists.
+    def fe_comp_consultar(self, certificate, issuer_cuit, pos_number, doc_type_code, number):
+        """Ask ARCA whether a voucher exists under ``issuer_cuit``.
 
         Returns a normalized dict, or ``None`` when ARCA has no such voucher.
         This is the only way to resolve an uncertain attempt.
         """
         client = self._get_client(certificate)
-        auth = self._get_auth(certificate)
+        auth = self._get_auth(certificate, issuer_cuit)
         response = self._call(
             client,
             "FECompConsultar",
@@ -253,7 +265,7 @@ class L10nArArcaWsfe(models.AbstractModel):
             if str(err["code"]).strip() == str(ERROR_NO_DATA_FOUND):
                 return None
         if errors:
-            raise ArcaBusinessError(self._format_errors(errors), code=errors[0]["code"])
+            self._raise_business_error(errors)
 
         found = getattr(response, "ResultGet", None)
         if not found:
@@ -271,10 +283,10 @@ class L10nArArcaWsfe(models.AbstractModel):
         }
 
     @api.model
-    def fe_param_get_condicion_iva_receptor(self, certificate, cmp_clase=None):
+    def fe_param_get_condicion_iva_receptor(self, certificate, issuer_cuit, cmp_clase=None):
         """Reference table for RG 5616 receptor conditions."""
         client = self._get_client(certificate)
-        auth = self._get_auth(certificate)
+        auth = self._get_auth(certificate, issuer_cuit)
         kwargs = {"Auth": auth}
         if cmp_clase:
             kwargs["ClaseCmp"] = cmp_clase
@@ -296,10 +308,10 @@ class L10nArArcaWsfe(models.AbstractModel):
         ]
 
     @api.model
-    def fe_param_get_ptos_venta(self, certificate):
-        """Points of sale enabled for this CUIT."""
+    def fe_param_get_ptos_venta(self, certificate, issuer_cuit):
+        """Points of sale ARCA has enabled for ``issuer_cuit``."""
         client = self._get_client(certificate)
-        auth = self._get_auth(certificate)
+        auth = self._get_auth(certificate, issuer_cuit)
         response = self._call(client, "FEParamGetPtosVenta", certificate, Auth=auth)
         self._raise_for_errors(response)
         result = getattr(response, "ResultGet", None)
@@ -348,7 +360,26 @@ class L10nArArcaWsfe(models.AbstractModel):
     def _raise_for_errors(self, response):
         errors = self._collect_errors(response)
         if errors:
-            raise ArcaBusinessError(self._format_errors(errors), code=errors[0]["code"])
+            self._raise_business_error(errors)
+
+    @api.model
+    def _raise_business_error(self, errors):
+        """Turn ARCA's error list into an exception, naming what we can."""
+        for error in errors:
+            if str(error["code"]).strip() == str(ERROR_CUIT_NOT_REPRESENTED):
+                raise ArcaBusinessError(
+                    _(
+                        "ARCA accepted the certificate but will not let it invoice "
+                        "for this CUIT: the holder is not authorized to represent "
+                        "it.\n\n"
+                        "In the ARCA portal, under \"Crear autorización a "
+                        "servicio\", authorize this certificate's DN for the "
+                        "service 'wsfe' representing that CUIT.\n\n%s",
+                        self._format_errors(errors),
+                    ),
+                    code=error["code"],
+                )
+        raise ArcaBusinessError(self._format_errors(errors), code=errors[0]["code"])
 
     @api.model
     def _parse_arca_date(self, value):
@@ -380,9 +411,7 @@ class L10nArArcaWsfe(models.AbstractModel):
         if not details:
             if global_errors:
                 # ARCA rejected the whole request before evaluating the voucher.
-                raise ArcaBusinessError(
-                    self._format_errors(global_errors), code=global_errors[0]["code"]
-                )
+                self._raise_business_error(global_errors)
             raise ArcaUncertain(
                 _("ARCA returned no voucher detail and no error; the outcome is unknown.")
             )
@@ -433,11 +462,16 @@ class L10nArArcaWsfe(models.AbstractModel):
     # ------------------------------------------------------------------
 
     @api.model
-    def check_connection(self, certificate):
-        """Round trip used by the "Test connection" button."""
+    def check_connection(self, certificate, issuer_cuit):
+        """Round trip used by the "Test connection" button.
+
+        Goes as far as a real authenticated call, so a certificate that works
+        but is not authorized to represent the company fails here rather than on
+        the first invoice.
+        """
         try:
             status = self.fe_dummy(certificate)
-            self._get_auth(certificate)
+            self.fe_param_get_ptos_venta(certificate, issuer_cuit)
         except (ArcaAborted, ArcaUncertain, ArcaBusinessError) as exc:
             raise UserError(_("ARCA connection test failed: %s", exc)) from exc
         return status

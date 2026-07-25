@@ -10,6 +10,7 @@ from . import (
     test_numbering,
     test_payload,
     test_qr,
+    test_representation,
     test_scope,
     test_security,
     test_transport,

@@ -78,7 +78,7 @@ class TestArcaAuthorization(ArcaTestCommon):
         self.assertEqual(len(attempt), 1)
         self.assertEqual(attempt.state, "authorized")
         self.assertEqual(attempt.pos_number, TEST_POS_NUMBER)
-        self.assertEqual(attempt.cuit, self.certificate._get_clean_cuit())
+        self.assertEqual(attempt.issuer_cuit, self.issuer_cuit)
         self.assertEqual(attempt.environment, "testing")
         self.assertEqual(attempt.company_id, self.company_ri)
         self.assertTrue(attempt.correlation_id)
@@ -248,7 +248,7 @@ class TestArcaAuthorization(ArcaTestCommon):
                     "company_id": attempt.company_id.id,
                     "certificate_id": attempt.certificate_id.id,
                     "environment": attempt.environment,
-                    "cuit": attempt.cuit,
+                    "issuer_cuit": attempt.issuer_cuit,
                     "pos_number": attempt.pos_number,
                     "document_type_code": attempt.document_type_code,
                     "document_number": attempt.document_number,

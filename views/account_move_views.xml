@@ -148,7 +148,7 @@
                             <field name="move_id"/>
                             <field name="company_id" groups="base.group_multi_company"/>
                             <field name="environment"/>
-                            <field name="cuit"/>
+                            <field name="issuer_cuit"/>
                             <field name="pos_number"/>
                             <field name="document_type_code"/>
                             <field name="document_number"/>

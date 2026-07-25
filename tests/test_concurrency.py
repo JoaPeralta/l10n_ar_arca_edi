@@ -64,12 +64,12 @@ class TestArcaLockKey(ArcaTestCommon):
     def test_key_is_stable(self):
         move = self.env["account.move"]
         self.assertEqual(
-            move._l10n_ar_arca_lock_key(1, 7, 1),
-            move._l10n_ar_arca_lock_key(1, 7, 1),
+            move._l10n_ar_arca_lock_key("30111111118", 7, 1),
+            move._l10n_ar_arca_lock_key("30111111118", 7, 1),
         )
 
     def test_key_fits_a_postgres_bigint(self):
-        key = self.env["account.move"]._l10n_ar_arca_lock_key(999, 99998, 213)
+        key = self.env["account.move"]._l10n_ar_arca_lock_key("30111111118", 99998, 213)
         self.assertGreaterEqual(key, 0)
         self.assertLess(key, 2**63)
 
@@ -77,12 +77,26 @@ class TestArcaLockKey(ArcaTestCommon):
         """Different points of sale must not block each other."""
         move = self.env["account.move"]
         keys = {
-            move._l10n_ar_arca_lock_key(1, 7, 1),
-            move._l10n_ar_arca_lock_key(1, 8, 1),
-            move._l10n_ar_arca_lock_key(1, 7, 6),
-            move._l10n_ar_arca_lock_key(2, 7, 1),
+            move._l10n_ar_arca_lock_key("30111111118", 7, 1),
+            move._l10n_ar_arca_lock_key("30111111118", 8, 1),
+            move._l10n_ar_arca_lock_key("30111111118", 7, 6),
+            move._l10n_ar_arca_lock_key("20222222223", 7, 1),
         }
         self.assertEqual(len(keys), 4)
+
+    def test_the_key_follows_the_issuer_not_the_company(self):
+        """ARCA numbers per CUIT, so two companies sharing one must share a lock."""
+        move = self.env["account.move"]
+        self.assertEqual(
+            move._l10n_ar_arca_lock_key("30111111118", 7, 1),
+            move._l10n_ar_arca_lock_key("30111111118", 7, 1),
+        )
+        self.assertNotEqual(
+            move._l10n_ar_arca_lock_key("30111111118", 7, 1),
+            move._l10n_ar_arca_lock_key(
+                self.certificate._get_holder_cuit(), 7, 1
+            ),
+        )
 
 
 @tagged("post_install", "-at_install")

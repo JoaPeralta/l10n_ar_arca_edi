@@ -9,7 +9,8 @@
             <list>
                 <field name="name"/>
                 <field name="company_id" groups="base.group_multi_company"/>
-                <field name="cuit"/>
+                <field name="holder_cuit"/>
+                <field name="issuer_cuit"/>
                 <field name="environment" widget="badge"
                     decoration-info="environment == 'testing'"
                     decoration-success="environment == 'production'"/>
@@ -66,7 +67,8 @@
                         <group string="Configuration">
                             <field name="company_id" groups="base.group_multi_company"
                                 readonly="state != 'draft'"/>
-                            <field name="cuit" readonly="state != 'draft'"/>
+                            <field name="holder_cuit" readonly="state != 'draft'"/>
+                            <field name="issuer_cuit" readonly="1"/>
                             <field name="environment" readonly="state != 'draft'"/>
                         </group>
                         <group string="Certificate Info" invisible="state not in ('active', 'expired')">

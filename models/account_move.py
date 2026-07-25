@@ -164,9 +164,14 @@ class AccountMove(models.Model):
     # ------------------------------------------------------------------
 
     @api.model
-    def _l10n_ar_arca_lock_key(self, company_id, pos_number, doc_type_code):
-        """Stable 63-bit advisory lock key for one numbering sequence."""
-        raw = f"l10n_ar_arca:{company_id}:{pos_number}:{doc_type_code}".encode()
+    def _l10n_ar_arca_lock_key(self, issuer_cuit, pos_number, doc_type_code):
+        """Stable 63-bit advisory lock key for one numbering sequence.
+
+        Keyed on the issuing CUIT rather than on the Odoo company, because that
+        is what ARCA numbers by: two companies configured with the same CUIT
+        share one sequence at ARCA and must share one lock here.
+        """
+        raw = f"l10n_ar_arca:{issuer_cuit}:{pos_number}:{doc_type_code}".encode()
         digest = hashlib.blake2b(raw, digest_size=8).digest()
         return int.from_bytes(digest, "big") & 0x7FFFFFFFFFFFFFFF
 
@@ -176,7 +181,7 @@ class AccountMove(models.Model):
         pos_number, _number = self._l10n_ar_arca_document_number_parts()
         doc_type_code = self._l10n_ar_arca_document_type_code()
         return self._l10n_ar_arca_lock_key(
-            self.company_id.id, pos_number, doc_type_code
+            self.company_id._l10n_ar_arca_issuer_cuit(), pos_number, doc_type_code
         )
 
     # ------------------------------------------------------------------
@@ -275,6 +280,9 @@ class AccountMove(models.Model):
         self._l10n_ar_arca_check_ready()
 
         certificate = self._l10n_ar_arca_get_certificate()
+        # Whose invoices these are. Not the certificate holder's CUIT: the
+        # holder may be a person authorized to invoice for this company.
+        issuer_cuit = self.company_id._l10n_ar_arca_issuer_cuit()
         doc_type_code = self._l10n_ar_arca_document_type_code()
         pos_number, number = self._l10n_ar_arca_document_number_parts()
 
@@ -290,7 +298,7 @@ class AccountMove(models.Model):
 
         wsfe = self.env["l10n_ar.arca.wsfe"]
         last_authorized = wsfe.fe_comp_ultimo_autorizado(
-            certificate, pos_number, doc_type_code
+            certificate, issuer_cuit, pos_number, doc_type_code
         )
         self._l10n_ar_arca_check_sequence(last_authorized, number, pos_number)
 
@@ -304,7 +312,9 @@ class AccountMove(models.Model):
                 "company_id": self.company_id.id,
                 "certificate_id": certificate.id,
                 "environment": certificate.environment,
-                "cuit": certificate._get_clean_cuit(),
+                # The issuer, because that is the identity the voucher belongs
+                # to and the one a later FECompConsultar has to ask about.
+                "issuer_cuit": issuer_cuit,
                 "pos_number": pos_number,
                 "document_type_code": doc_type_code,
                 "document_number": number,
@@ -319,7 +329,7 @@ class AccountMove(models.Model):
         fiscal.checkpoint()
 
         try:
-            result = wsfe.fe_cae_solicitar(certificate, header, detail)
+            result = wsfe.fe_cae_solicitar(certificate, issuer_cuit, header, detail)
         except ArcaUncertain as exc:
             attempt._mark_uncertain(str(exc))
             self.write(
@@ -377,8 +387,9 @@ class AccountMove(models.Model):
         fiscal.checkpoint()
 
         _logger.info(
-            "ARCA authorized move %s as %s-%08d (type %s), CAE %s",
+            "ARCA authorized move %s for CUIT %s as %s-%08d (type %s), CAE %s",
             self.id,
+            issuer_cuit,
             pos_number,
             number,
             doc_type_code,
@@ -948,8 +959,9 @@ class AccountMove(models.Model):
         checking only the final string would hide a wrong field inside it.
         """
         self.ensure_one()
-        certificate = self.company_id.l10n_ar_arca_certificate_id
-        cuit = certificate._get_clean_cuit() if certificate else ""
+        # The QR names the taxpayer that issued the voucher, which is the
+        # company -- not whoever holds the certificate used to send it.
+        issuer_cuit = self.company_id._l10n_ar_arca_issuer_cuit()
         pos_number, number = self._l10n_ar_arca_document_number_parts()
         doc_type_code = int(self.l10n_latam_document_type_id.code)
         currency_code, currency_rate = self._l10n_ar_arca_currency_values()
@@ -959,7 +971,7 @@ class AccountMove(models.Model):
         return {
             "ver": 1,
             "fecha": invoice_date.strftime("%Y-%m-%d"),
-            "cuit": int(cuit),
+            "cuit": int(issuer_cuit),
             "ptoVta": pos_number,
             "tipoCmp": doc_type_code,
             "nroCmp": number,

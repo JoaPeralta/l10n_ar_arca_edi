@@ -7,7 +7,7 @@ import logging
 from odoo.exceptions import UserError
 from odoo.tests import tagged
 
-from .common import TEST_CUIT, ArcaTestCommon, FakeArcaService
+from .common import ArcaTestCommon, FakeArcaService
 
 SECOND_CUIT = "20-29318820-4"
 
@@ -49,7 +49,7 @@ class TestArcaMultiCompany(ArcaTestCommon):
         self.assertEqual(self.certificate.company_id, self.company_ri)
         self.assertEqual(self.certificate_b.company_id, self.company_b)
         self.assertNotEqual(
-            self.certificate._get_clean_cuit(), self.certificate_b._get_clean_cuit()
+            self.certificate._get_holder_cuit(), self.certificate_b._get_holder_cuit()
         )
 
     def test_attempts_are_scoped_to_their_company(self):
@@ -67,15 +67,18 @@ class TestArcaMultiCompany(ArcaTestCommon):
         )
 
     def test_the_attempt_records_the_issuing_cuit(self):
-        """Which CUIT issued a voucher must be answerable from the record."""
+        """Which CUIT issued a voucher must be answerable from the record.
+
+        The issuer, not the certificate holder: those differ in this fixture,
+        as they do whenever somebody invoices on behalf of a company.
+        """
         self._patch_service(FakeArcaService())
         invoice = self._new_invoice()
         self._post_invoice(invoice)
         self._authorize(invoice)
-        self.assertEqual(
-            invoice.l10n_ar_arca_attempt_ids.cuit,
-            "".join(ch for ch in TEST_CUIT if ch.isdigit()),
-        )
+        attempt = invoice.l10n_ar_arca_attempt_ids
+        self.assertEqual(attempt.issuer_cuit, self.issuer_cuit)
+        self.assertNotEqual(attempt.issuer_cuit, self.certificate._get_holder_cuit())
 
 
 @tagged("post_install", "-at_install")

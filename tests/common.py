@@ -12,8 +12,11 @@ from cryptography.x509.oid import NameOID
 from odoo.addons.l10n_ar.tests.common import TestArCommon
 from odoo.exceptions import UserError
 
-# Valid CUIT (verification digit checked): 30-71234567-1
-TEST_CUIT = "30-71234567-1"
+# The person or entity that owns the certificate. Deliberately *not* the
+# company's own CUIT: the fixture invoices for a company the holder represents,
+# so anything that confuses the two identities fails here rather than at ARCA.
+# Valid CUIT (verification digit checked).
+TEST_HOLDER_CUIT = "30-71234567-1"
 TEST_POS_NUMBER = 7
 
 
@@ -35,11 +38,13 @@ class FakeArcaService:
         self.raise_on_request = raise_on_request
         self.requests = []
         self.consultations = []
+        self.auth_cuits = []
         self.known_vouchers = {}
         self.on_request_sent = None
 
     # -- FECompUltimoAutorizado --------------------------------------
-    def fe_comp_ultimo_autorizado(self, certificate, pos_number, doc_type_code):
+    def fe_comp_ultimo_autorizado(self, certificate, issuer_cuit, pos_number, doc_type_code):
+        self.auth_cuits.append(("fe_comp_ultimo_autorizado", issuer_cuit))
         return self.last_authorized.get(
             (pos_number, doc_type_code), self.default_last_authorized
         )
@@ -48,8 +53,11 @@ class FakeArcaService:
         self.last_authorized[(pos_number, doc_type_code)] = number
 
     # -- FECAESolicitar ----------------------------------------------
-    def fe_cae_solicitar(self, certificate, header, detail):
-        self.requests.append({"header": header, "detail": detail})
+    def fe_cae_solicitar(self, certificate, issuer_cuit, header, detail):
+        self.auth_cuits.append(("fe_cae_solicitar", issuer_cuit))
+        self.requests.append(
+            {"header": header, "detail": detail, "issuer_cuit": issuer_cuit}
+        )
         if self.on_request_sent is not None:
             # Lets a test inspect the database at the exact moment the request
             # would leave the process.
@@ -70,7 +78,8 @@ class FakeArcaService:
         }
 
     # -- FECompConsultar ---------------------------------------------
-    def fe_comp_consultar(self, certificate, pos_number, doc_type_code, number):
+    def fe_comp_consultar(self, certificate, issuer_cuit, pos_number, doc_type_code, number):
+        self.auth_cuits.append(("fe_comp_consultar", issuer_cuit))
         self.consultations.append((pos_number, doc_type_code, number))
         cae = self.known_vouchers.get((pos_number, doc_type_code, number))
         if not cae:
@@ -108,7 +117,9 @@ class ArcaTestCommon(TestArCommon):
                 "name": "ARCA Web Service",
             },
         )
-        cls.certificate = cls._create_certificate(cls.company_ri, TEST_CUIT)
+        cls.certificate = cls._create_certificate(cls.company_ri, TEST_HOLDER_CUIT)
+        # What the company invoices under, and what ARCA must be told.
+        cls.issuer_cuit = cls.company_ri._l10n_ar_arca_issuer_cuit()
         cls.company_ri.l10n_ar_arca_certificate_id = cls.certificate
         cls.company_ri.l10n_ar_arca_auto_request_cae = False
 
@@ -117,8 +128,12 @@ class ArcaTestCommon(TestArCommon):
     # ------------------------------------------------------------------
 
     @classmethod
-    def _build_key_and_certificate(cls, cuit, days_valid=365, days_ago=1):
-        """Generate a real key pair and a matching self-signed certificate."""
+    def _build_key_and_certificate(cls, holder_cuit, days_valid=365, days_ago=1):
+        """Generate a real key pair and a certificate issued to ``holder_cuit``.
+
+        The subject carries the holder's number, the way ARCA issues them.
+        """
+        cuit = holder_cuit
         key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         subject = x509.Name(
             [
@@ -147,12 +162,12 @@ class ArcaTestCommon(TestArCommon):
         return key, key_pem, cert_pem
 
     @classmethod
-    def _create_certificate(cls, company, cuit, **overrides):
-        _key, key_pem, cert_pem = cls._build_key_and_certificate(cuit)
+    def _create_certificate(cls, company, holder_cuit, **overrides):
+        _key, key_pem, cert_pem = cls._build_key_and_certificate(holder_cuit)
         values = {
-            "name": f"ARCA test {cuit}",
+            "name": f"ARCA test {holder_cuit}",
             "company_id": company.id,
-            "cuit": cuit,
+            "holder_cuit": holder_cuit,
             "environment": "testing",
         }
         values.update(overrides)

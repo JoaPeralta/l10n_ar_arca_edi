@@ -13,14 +13,14 @@ from odoo.exceptions import AccessError, UserError, ValidationError
 from odoo.tests import tagged
 
 from ..models.l10n_ar_arca_certificate import compute_cuit_check_digit, is_valid_cuit
-from .common import TEST_CUIT, ArcaTestCommon
+from .common import TEST_HOLDER_CUIT, ArcaTestCommon
 
 
 @tagged("post_install", "-at_install")
 class TestCuitValidation(ArcaTestCommon):
 
     def test_known_valid_cuits(self):
-        for cuit in ("30-71234567-1", "20-29318820-4", TEST_CUIT):
+        for cuit in ("30-71234567-1", "20-29318820-4", TEST_HOLDER_CUIT):
             self.assertTrue(is_valid_cuit(cuit), cuit)
 
     def test_wrong_check_digit_is_rejected(self):
@@ -39,13 +39,13 @@ class TestCuitValidation(ArcaTestCommon):
         self.assertEqual(compute_cuit_check_digit("2029318820"), 4)
         self.assertEqual(compute_cuit_check_digit("3071234567"), 1)
 
-    def test_certificate_rejects_an_invalid_cuit(self):
+    def test_certificate_rejects_an_invalid_holder_cuit(self):
         with self.assertRaisesRegex(ValidationError, "not a valid CUIT"):
             self.env["l10n_ar.arca.certificate"].create(
                 {
                     "name": "Bad CUIT",
                     "company_id": self.company_ri.id,
-                    "cuit": "30-71234567-9",
+                    "holder_cuit": "30-71234567-9",
                     "environment": "testing",
                 }
             )
@@ -54,12 +54,12 @@ class TestCuitValidation(ArcaTestCommon):
 @tagged("post_install", "-at_install")
 class TestCertificateUpload(ArcaTestCommon):
 
-    def _draft_certificate(self, cuit=TEST_CUIT):
+    def _draft_certificate(self, cuit=TEST_HOLDER_CUIT):
         return self.env["l10n_ar.arca.certificate"].create(
             {
                 "name": f"Draft {cuit} {self.env.cr.dbname[:4]}",
                 "company_id": self.company_ri.id,
-                "cuit": cuit,
+                "holder_cuit": cuit,
                 "environment": "testing",
             }
         )
@@ -79,13 +79,13 @@ class TestCertificateUpload(ArcaTestCommon):
         certificate.action_generate_key_and_csr()
         csr = x509.load_pem_x509_csr(certificate.csr_pem.encode())
         serial = csr.subject.get_attributes_for_oid(NameOID.SERIAL_NUMBER)[0].value
-        self.assertEqual(serial, f"CUIT {certificate._format_cuit_with_dashes()}")
+        self.assertEqual(serial, f"CUIT {certificate._format_holder_cuit()}")
 
     def test_certificate_for_a_different_key_is_refused(self):
         """The most common upload mistake, caught before it becomes a auth error."""
         certificate = self._draft_certificate()
         certificate.action_generate_key_and_csr()
-        _key, _key_pem, foreign_cert = self._build_key_and_certificate(TEST_CUIT)
+        _key, _key_pem, foreign_cert = self._build_key_and_certificate(TEST_HOLDER_CUIT)
         with self.assertRaisesRegex(UserError, "does not match the private key"):
             certificate.action_process_certificate(base64.b64encode(foreign_cert))
 
@@ -136,7 +136,7 @@ class TestCertificateUpload(ArcaTestCommon):
                 x509.NameAttribute(NameOID.COUNTRY_NAME, "AR"),
                 x509.NameAttribute(NameOID.COMMON_NAME, "expired"),
                 x509.NameAttribute(
-                    NameOID.SERIAL_NUMBER, f"CUIT {certificate._format_cuit_with_dashes()}"
+                    NameOID.SERIAL_NUMBER, f"CUIT {certificate._format_holder_cuit()}"
                 ),
             ]
         )
