@@ -1,0 +1,246 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pinned rather than floating: a build must be able to say exactly which
+  # Odoo it ran against.
+  ODOO_IMAGE: odoo:19.0-20260723
+
+jobs:
+  lint:
+    name: Lint and manifest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install tooling
+        run: pip install --quiet ruff==0.6.9
+
+      # Correctness only. Enforcing a formatter upstream does not use would
+      # bury real changes under a reformat of the whole module.
+      - name: Ruff
+        run: ruff check .
+
+      - name: Manifest is valid Python and declares what it needs
+        run: |
+          python - <<'PY'
+          import ast
+          import pathlib
+
+          manifest = ast.literal_eval(pathlib.Path("__manifest__.py").read_text())
+
+          assert manifest["license"] == "AGPL-3", manifest["license"]
+          assert manifest["version"].startswith("19.0."), manifest["version"]
+          assert "l10n_ar" in manifest["depends"], manifest["depends"]
+
+          missing = [
+              entry for entry in manifest["data"]
+              if not pathlib.Path(entry).exists()
+          ]
+          assert not missing, f"declared but absent: {missing}"
+
+          for asset in manifest.get("assets", {}).get("web.assets_backend", []):
+              path = pathlib.Path(asset.split("/", 1)[1])
+              assert path.exists(), f"missing asset: {asset}"
+
+          print("manifest OK")
+          PY
+
+      - name: XML is well formed
+        run: |
+          python - <<'PY'
+          import pathlib
+          import xml.etree.ElementTree as ET
+
+          for path in sorted(pathlib.Path(".").rglob("*.xml")):
+              if ".github" in path.parts:
+                  continue
+              ET.parse(path)
+          print("XML OK")
+          PY
+
+  secrets:
+    name: No secrets committed
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Reject private keys and certificates in the tree
+        run: |
+          set -euo pipefail
+          # Test fixtures generate their key material at runtime, so anything
+          # that looks like real key material has no business being committed.
+          if git grep -nI -E -- '-----BEGIN (RSA |EC |OPENSSH |PGP )?PRIVATE KEY-----' -- . ':!.github/workflows/ci.yml'; then
+            echo "::error::A private key is committed to the repository"
+            exit 1
+          fi
+          if git ls-files | grep -E '\.(pem|key|p12|pfx|crt|cer)$'; then
+            echo "::error::Certificate or key files are committed to the repository"
+            exit 1
+          fi
+          echo "No key material found"
+
+      - name: Reject hard-coded ARCA credentials
+        run: |
+          set -euo pipefail
+          if git grep -nI -E 'ARCA_HOMO_(CERT|PRIVATE_KEY|CUIT)[[:space:]]*=[[:space:]]*["'\''][^"'\'']+' \
+              -- . ':!.github/workflows/ci.yml' ':!tests/test_homologation.py'; then
+            echo "::error::Homologation credentials appear to be hard-coded"
+            exit 1
+          fi
+          echo "No hard-coded credentials found"
+
+      - name: Production endpoints are never the default
+        run: |
+          set -euo pipefail
+          # A default that points at production is the one mistake that cannot
+          # be undone, so it is checked mechanically.
+          if grep -rn 'default="production"\|default='\''production'\''' --include=*.py --include=*.xml .; then
+            echo "::error::Something defaults to the ARCA production environment"
+            exit 1
+          fi
+          echo "Production is not a default anywhere"
+
+  test:
+    name: Odoo 19 tests
+    runs-on: ubuntu-latest
+    container:
+      image: odoo:19.0-20260723
+      options: --user root
+    services:
+      db:
+        image: postgres:16
+        env:
+          POSTGRES_USER: odoo
+          POSTGRES_PASSWORD: odoo
+          POSTGRES_DB: postgres
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: extra-addons/l10n_ar_arca_edi
+
+      - name: Report the environment under test
+        run: |
+          odoo --version
+          python3 -c "import zeep, cryptography, lxml; print('zeep', zeep.__version__); print('cryptography', cryptography.__version__); print('lxml', lxml.__version__ if hasattr(lxml, '__version__') else 'n/a')"
+
+      - name: Install and run the test suite
+        env:
+          PGHOST: db
+          PGUSER: odoo
+          PGPASSWORD: odoo
+        run: |
+          set -o pipefail
+          odoo \
+            --db_host=db --db_user=odoo --db_password=odoo \
+            -d ci_l10n_ar_arca_edi \
+            --addons-path=/usr/lib/python3/dist-packages/odoo/addons,${GITHUB_WORKSPACE}/extra-addons \
+            -i l10n_ar_arca_edi \
+            --test-enable \
+            --test-tags '/l10n_ar_arca_edi,-arca_homologation' \
+            --without-demo=all \
+            --log-level=info \
+            --max-cron-threads=0 \
+            --stop-after-init 2>&1 | tee odoo-test.log
+
+      - name: Fail on any test failure
+        run: |
+          # odoo's exit status is checked by the step above; this catches
+          # failures that are only reported in the log.
+          if grep -E '^[0-9-]+ [0-9:,]+ [0-9]+ (ERROR|CRITICAL)' odoo-test.log \
+             | grep -viE 'werkzeug|Failed to load registry|database .* does not exist'; then
+            echo "::error::Errors were reported during the test run"
+            exit 1
+          fi
+          if ! grep -q 'tests.*failed, .* error(s) of .* tests\|0 failed, 0 error(s)' odoo-test.log; then
+            echo "Test summary line not found; relying on the exit status above."
+          fi
+          echo "Test run clean"
+
+      - name: Upload the log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: odoo-test-log
+          path: odoo-test.log
+          if-no-files-found: ignore
+
+  homologation:
+    name: ARCA homologación (real)
+    runs-on: ubuntu-latest
+    # Never automatic: this talks to ARCA, and it needs a certificate that
+    # cannot live in the repository.
+    if: github.event_name == 'workflow_dispatch'
+    container:
+      image: odoo:19.0-20260723
+      options: --user root
+    services:
+      db:
+        image: postgres:16
+        env:
+          POSTGRES_USER: odoo
+          POSTGRES_PASSWORD: odoo
+          POSTGRES_DB: postgres
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: extra-addons/l10n_ar_arca_edi
+
+      - name: Skip cleanly when no certificate is configured
+        id: creds
+        env:
+          ARCA_HOMO_CUIT: ${{ secrets.ARCA_HOMO_CUIT }}
+        run: |
+          if [ -z "${ARCA_HOMO_CUIT}" ]; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No homologación certificate configured; nothing was sent to ARCA."
+          else
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run the homologación suite
+        if: steps.creds.outputs.available == 'true'
+        env:
+          ARCA_HOMO_CUIT: ${{ secrets.ARCA_HOMO_CUIT }}
+          ARCA_HOMO_CERT: ${{ secrets.ARCA_HOMO_CERT }}
+          ARCA_HOMO_PRIVATE_KEY: ${{ secrets.ARCA_HOMO_PRIVATE_KEY }}
+          ARCA_HOMO_POS: ${{ secrets.ARCA_HOMO_POS }}
+        run: |
+          odoo \
+            --db_host=db --db_user=odoo --db_password=odoo \
+            -d homo_l10n_ar_arca_edi \
+            --addons-path=/usr/lib/python3/dist-packages/odoo/addons,${GITHUB_WORKSPACE}/extra-addons \
+            -i l10n_ar_arca_edi \
+            --test-enable \
+            --test-tags 'arca_homologation' \
+            --without-demo=all \
+            --log-level=info \
+            --max-cron-threads=0 \
+            --stop-after-init

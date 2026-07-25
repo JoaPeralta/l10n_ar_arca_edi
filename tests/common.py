@@ -4,201 +4,210 @@
 import base64
 import datetime
 
-from odoo.tests.common import TransactionCase
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import NameOID
+
+from odoo.addons.l10n_ar.tests.common import TestArCommon
+
+# Valid CUIT (verification digit checked): 30-71234567-1
+TEST_CUIT = "30-71234567-1"
+TEST_POS_NUMBER = 7
 
 
-class ArcaEdiTestCommon(TransactionCase):
-    """Shared setup for l10n_ar_arca_edi tests.
+class FakeArcaService:
+    """Stand-in for the WSFEv1 transport.
 
-    Creates a minimal environment with:
-    - A test company with Argentine chart of accounts references
-    - A mock ARCA certificate record (no real crypto keys)
-    - A test journal with ARCA EDI enabled
-    - A Consumidor Final partner
-    - A CUIT partner (Responsable Inscripto)
+    Records what it was asked to send so tests can assert on the actual fiscal
+    payload rather than on the fact that a method was called. Behaviour is set
+    per test: what the last authorized number is, and what happens when a CAE is
+    requested.
+    """
+
+    def __init__(self, last_authorized=0, cae="70123456789012", raise_on_request=None):
+        self.last_authorized = last_authorized
+        self.cae = cae
+        self.raise_on_request = raise_on_request
+        self.requests = []
+        self.consultations = []
+        self.known_vouchers = {}
+        self.on_request_sent = None
+
+    # -- FECompUltimoAutorizado --------------------------------------
+    def fe_comp_ultimo_autorizado(self, certificate, pos_number, doc_type_code):
+        return self.last_authorized
+
+    # -- FECAESolicitar ----------------------------------------------
+    def fe_cae_solicitar(self, certificate, header, detail):
+        self.requests.append({"header": header, "detail": detail})
+        if self.on_request_sent is not None:
+            # Lets a test inspect the database at the exact moment the request
+            # would leave the process.
+            self.on_request_sent()
+        if self.raise_on_request is not None:
+            raise self.raise_on_request
+        number = detail["CbteDesde"]
+        self.last_authorized = number
+        self.known_vouchers[(header["PtoVta"], header["CbteTipo"], number)] = self.cae
+        return {
+            "result": "A",
+            "cae": self.cae,
+            "cae_due_date": "2026-12-31",
+            "observations": [],
+            "errors": [],
+            "raw": "<FECAEDetResponse/>",
+            "duration_ms": 12,
+        }
+
+    # -- FECompConsultar ---------------------------------------------
+    def fe_comp_consultar(self, certificate, pos_number, doc_type_code, number):
+        self.consultations.append((pos_number, doc_type_code, number))
+        cae = self.known_vouchers.get((pos_number, doc_type_code, number))
+        if not cae:
+            return None
+        return {
+            "cae": cae,
+            "cae_due_date": "2026-12-31",
+            "result": "A",
+            "total": 121.0,
+            "date": "2026-07-25",
+            "doc_type": 80,
+            "doc_number": 30712345671,
+            "raw": "<ResultGet/>",
+        }
+
+
+class ArcaTestCommon(TestArCommon):
+    """Shared setup: a real Argentine company with a usable certificate.
+
+    The certificate is a genuine RSA key and a self-signed X.509 certificate, so
+    the crypto paths are exercised for real rather than mocked away. Only the
+    network is faked.
     """
 
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
 
-        cls.env = cls.env(context=dict(cls.env.context, tracking_disable=True))
+        cls.arca_journal = cls._create_journal(
+            "WSFE",
+            data={
+                "l10n_ar_afip_pos_system": "RAW_MAW",
+                "l10n_ar_afip_pos_number": TEST_POS_NUMBER,
+                "code": "ARCA",
+                "name": "ARCA Web Service",
+            },
+        )
+        cls.certificate = cls._create_certificate(cls.company_ri, TEST_CUIT)
+        cls.company_ri.l10n_ar_arca_certificate_id = cls.certificate
+        cls.company_ri.l10n_ar_arca_auto_request_cae = False
 
-        # -- Country --
-        cls.country_ar = cls.env.ref("base.ar")
+    # ------------------------------------------------------------------
+    # Certificate helpers
+    # ------------------------------------------------------------------
 
-        # -- Company: use existing company (has Chart of Accounts) --
-        cls.company = cls.env.company
-        cls.company.write({
-            "country_id": cls.country_ar.id,
-            "currency_id": cls.env.ref("base.ARS").id,
-        })
+    @classmethod
+    def _build_key_and_certificate(cls, cuit, days_valid=365, days_ago=1):
+        """Generate a real key pair and a matching self-signed certificate."""
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        subject = x509.Name(
+            [
+                x509.NameAttribute(NameOID.COUNTRY_NAME, "AR"),
+                x509.NameAttribute(NameOID.COMMON_NAME, "arca-test"),
+                x509.NameAttribute(NameOID.SERIAL_NUMBER, f"CUIT {cuit}"),
+            ]
+        )
+        now = datetime.datetime.now(datetime.timezone.utc)
+        certificate = (
+            x509.CertificateBuilder()
+            .subject_name(subject)
+            .issuer_name(subject)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - datetime.timedelta(days=days_ago))
+            .not_valid_after(now + datetime.timedelta(days=days_valid))
+            .sign(key, hashes.SHA256())
+        )
+        key_pem = key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        cert_pem = certificate.public_bytes(serialization.Encoding.PEM)
+        return key, key_pem, cert_pem
 
-        # -- Mock certificate (no real keys, just enough data for logic tests) --
-        # We use a dummy PEM-like base64 for private_key / certificate fields.
-        # These are NOT valid crypto keys; tests that need signing must mock
-        # the crypto calls.
-        cls.dummy_pem = base64.b64encode(b"-----BEGIN DUMMY-----\nMOCKDATA\n-----END DUMMY-----\n")
-
-        cls.certificate = cls.env["l10n_ar.arca.certificate"].create({
-            "name": "Test Certificate",
-            "company_id": cls.company.id,
-            "cuit": "20-29318820-4",
+    @classmethod
+    def _create_certificate(cls, company, cuit, **overrides):
+        _key, key_pem, cert_pem = cls._build_key_and_certificate(cuit)
+        values = {
+            "name": f"ARCA test {cuit}",
+            "company_id": company.id,
+            "cuit": cuit,
             "environment": "testing",
-            "state": "active",
-            "private_key": cls.dummy_pem,
-            "certificate": cls.dummy_pem,
-            "wsaa_token": "MOCK_TOKEN_123",
-            "wsaa_sign": "MOCK_SIGN_456",
-            "wsaa_token_expiration": datetime.datetime(2099, 12, 31, 23, 59, 59),
-        })
+        }
+        values.update(overrides)
+        certificate = cls.env["l10n_ar.arca.certificate"].create(values)
+        certificate.sudo().write({"private_key": base64.b64encode(key_pem)})
+        certificate.action_process_certificate(base64.b64encode(cert_pem))
+        return certificate
 
-        # Link certificate to company
-        cls.company.l10n_ar_arca_certificate_id = cls.certificate
+    # ------------------------------------------------------------------
+    # Invoice helpers
+    # ------------------------------------------------------------------
 
-        # -- Journal --
-        cls.journal = cls.env["account.journal"].create({
-            "name": "ARCA Sales",
-            "type": "sale",
-            "code": "ARC",
-            "company_id": cls.company.id,
-            "l10n_ar_arca_edi_enabled": True,
-            "l10n_ar_afip_pos_number": 3,
-        })
-
-        # -- Identification types (create minimal records if l10n_ar xmlids
-        #    are not loaded, which is common in unit test environments) --
-        LatamIdType = cls.env["l10n_latam.identification.type"]
-
-        cls.id_type_cuit = LatamIdType.search(
-            [("l10n_ar_afip_code", "=", "80")], limit=1
+    def _new_invoice(self, partner=None, lines=None, document_type=None, **values):
+        """Create and post an ARCA invoice without contacting ARCA."""
+        invoice = self.env["account.move"].create(
+            {
+                "move_type": values.pop("move_type", "out_invoice"),
+                "partner_id": (partner or self.res_partner_adhoc).id,
+                "journal_id": values.pop("journal_id", self.arca_journal.id),
+                "invoice_date": values.pop("invoice_date", "2026-07-25"),
+                "invoice_line_ids": lines
+                or [
+                    self._prepare_invoice_line(
+                        product_id=self.product_iva_21, price_unit=100.0, quantity=1
+                    )
+                ],
+                **values,
+            }
         )
-        if not cls.id_type_cuit:
-            cls.id_type_cuit = LatamIdType.create({
-                "name": "CUIT",
-                "l10n_ar_afip_code": "80",
-            })
+        if document_type is not None:
+            invoice.l10n_latam_document_type_id = document_type
+        return invoice
 
-        cls.id_type_dni = LatamIdType.search(
-            [("l10n_ar_afip_code", "=", "96")], limit=1
+    def _post_invoice(self, invoice):
+        invoice.action_post()
+        self.assertEqual(invoice.state, "posted")
+        return invoice
+
+    def _patch_service(self, service):
+        """Route the module's ARCA calls to a fake, for the whole test."""
+        wsfe = self.env["l10n_ar.arca.wsfe"]
+        for name in (
+            "fe_comp_ultimo_autorizado",
+            "fe_cae_solicitar",
+            "fe_comp_consultar",
+        ):
+            self.patch(type(wsfe), name, getattr(service, name))
+        # Authentication is exercised separately; here it must simply succeed.
+        self.patch(
+            type(self.env["l10n_ar.arca.wsaa"]),
+            "_get_or_refresh_token",
+            lambda self, certificate, service="wsfe": {
+                "token": "TOKEN",
+                "sign": "SIGN",
+                "expiration": None,
+            },
         )
-        if not cls.id_type_dni:
-            cls.id_type_dni = LatamIdType.create({
-                "name": "DNI",
-                "l10n_ar_afip_code": "96",
-            })
+        return service
 
-        # -- AFIP responsibility types (search or create) --
-        AfipResp = cls.env["l10n_ar.afip.responsibility.type"]
+    def _authorize(self, invoice):
+        """Run the authorization protocol inside the test transaction."""
+        return invoice._l10n_ar_arca_authorize(with_commit=False)
 
-        cls.resp_ri = AfipResp.search([("code", "=", "1")], limit=1)
-        if not cls.resp_ri:
-            cls.resp_ri = AfipResp.create({
-                "name": "IVA Responsable Inscripto",
-                "code": "1",
-            })
-
-        cls.resp_cf = AfipResp.search([("code", "=", "5")], limit=1)
-        if not cls.resp_cf:
-            cls.resp_cf = AfipResp.create({
-                "name": "Consumidor Final",
-                "code": "5",
-            })
-
-        cls.resp_mono = AfipResp.search([("code", "=", "6")], limit=1)
-        if not cls.resp_mono:
-            cls.resp_mono = AfipResp.create({
-                "name": "Responsable Monotributo",
-                "code": "6",
-            })
-
-        # -- Partners --
-        cls.partner_cf = cls.env["res.partner"].create({
-            "name": "Consumidor Final Test",
-            "company_id": cls.company.id,
-            "l10n_ar_afip_responsibility_type_id": cls.resp_cf.id,
-            # No VAT / no identification type -> should resolve to doc 99 / 0
-        })
-
-        cls.partner_ri = cls.env["res.partner"].create({
-            "name": "Empresa RI Test",
-            "company_id": cls.company.id,
-            "vat": "30-71234567-9",
-            "l10n_latam_identification_type_id": cls.id_type_cuit.id,
-            "l10n_ar_afip_responsibility_type_id": cls.resp_ri.id,
-        })
-
-        cls.partner_dni = cls.env["res.partner"].create({
-            "name": "Persona DNI Test",
-            "company_id": cls.company.id,
-            "vat": "12345678",
-            "l10n_latam_identification_type_id": cls.id_type_dni.id,
-            "l10n_ar_afip_responsibility_type_id": cls.resp_mono.id,
-        })
-
-        # -- Revenue account (needed for invoice lines) --
-        # In Odoo 19, account.account uses company_ids (M2M) instead of
-        # company_id, so we search without company filter.
-        cls.account_revenue = cls.env['account.account'].search([
-            ('account_type', '=', 'income'),
-        ], limit=1)
-        if not cls.account_revenue:
-            cls.account_revenue = cls.env['account.account'].search([
-                ('account_type', '=', 'income_other'),
-            ], limit=1)
-        if not cls.account_revenue:
-            cls.account_revenue = cls.env['account.account'].create({
-                'name': 'Test Revenue',
-                'code': '400000',
-                'account_type': 'income',
-            })
-
-        # Set income account on the default product category so that
-        # invoice lines auto-resolve the account from the product.
-        default_categ = cls.env.ref('product.product_category_all', raise_if_not_found=False)
-        if default_categ:
-            default_categ.with_company(cls.company).property_account_income_categ_id = cls.account_revenue
-
-        # -- Document types (Factura C = 11, Nota de Credito C = 13) --
-        LatamDocType = cls.env["l10n_latam.document.type"]
-
-        cls.doc_type_fc = LatamDocType.search(
-            [("code", "=", "11"), ("country_id", "=", cls.country_ar.id)], limit=1
+    def _document_type(self, code):
+        return self.env["l10n_latam.document.type"].search(
+            [("code", "=", code), ("country_id.code", "=", "AR")], limit=1
         )
-        if not cls.doc_type_fc:
-            cls.doc_type_fc = LatamDocType.create({
-                "name": "Factura C",
-                "code": "11",
-                "country_id": cls.country_ar.id,
-            })
-
-        cls.doc_type_fa = LatamDocType.search(
-            [("code", "=", "1"), ("country_id", "=", cls.country_ar.id)], limit=1
-        )
-        if not cls.doc_type_fa:
-            cls.doc_type_fa = LatamDocType.create({
-                "name": "Factura A",
-                "code": "1",
-                "country_id": cls.country_ar.id,
-            })
-
-        cls.doc_type_nc_c = LatamDocType.search(
-            [("code", "=", "13"), ("country_id", "=", cls.country_ar.id)], limit=1
-        )
-        if not cls.doc_type_nc_c:
-            cls.doc_type_nc_c = LatamDocType.create({
-                "name": "Nota de Credito C",
-                "code": "13",
-                "country_id": cls.country_ar.id,
-            })
-
-        # An unsupported doc type for negative testing
-        cls.doc_type_unsupported = LatamDocType.search(
-            [("code", "=", "999"), ("country_id", "=", cls.country_ar.id)], limit=1
-        )
-        if not cls.doc_type_unsupported:
-            cls.doc_type_unsupported = LatamDocType.create({
-                "name": "Unsupported Type",
-                "code": "999",
-                "country_id": cls.country_ar.id,
-            })

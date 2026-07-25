@@ -28,7 +28,7 @@ def compute_cuit_check_digit(first_ten_digits):
 
     Published by ARCA: weighted sum of the first ten digits modulo 11.
     """
-    total = sum(int(d) * w for d, w in zip(first_ten_digits, CUIT_CHECK_WEIGHTS))
+    total = sum(int(d) * w for d, w in zip(first_ten_digits, CUIT_CHECK_WEIGHTS, strict=False))
     remainder = total % 11
     check = 11 - remainder
     if check == 11:

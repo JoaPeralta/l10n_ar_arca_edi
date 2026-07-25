@@ -1,0 +1,138 @@
+# Copyright 2026 Leonobitech
+# License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
+"""What this module refuses to pretend it supports.
+
+Less functionality that works beats more functionality that lies, so document
+types the module cannot really authorize are refused locally with a reason
+instead of being sent to ARCA and rejected.
+"""
+
+from odoo.exceptions import UserError
+from odoo.tests import tagged
+
+from ..models import constants
+from .common import ArcaTestCommon, FakeArcaService
+
+
+@tagged("post_install", "-at_install")
+class TestArcaScope(ArcaTestCommon):
+
+    def setUp(self):
+        super().setUp()
+        self.service = self._patch_service(FakeArcaService())
+
+    def _document_type_code(self, invoice, code):
+        invoice.l10n_latam_document_type_id = self._document_type(str(code))
+        return invoice._l10n_ar_arca_document_type_code
+
+    def test_supported_types_match_the_wsfev1_table(self):
+        """Validation 700 of the manual lists what WSFEv1 accepts."""
+        self.assertEqual(
+            constants.SUPPORTED_DOCUMENT_TYPES,
+            {1, 2, 3, 4, 6, 7, 8, 9, 11, 12, 13, 15, 51, 52, 53, 54},
+        )
+
+    def test_export_documents_are_not_claimed(self):
+        """Facturas E go through WSFEX, which this module does not implement."""
+        for code in (19, 20, 21):
+            self.assertNotIn(code, constants.SUPPORTED_DOCUMENT_TYPES)
+            self.assertIn(code, constants.WSFEX_DOCUMENT_TYPES)
+
+    def test_export_document_is_refused_with_the_reason(self):
+        invoice = self._new_invoice()
+        self._post_invoice(invoice)
+        invoice.l10n_latam_document_type_id = self._document_type("19")
+        with self.assertRaisesRegex(UserError, "WSFEX"):
+            invoice._l10n_ar_arca_document_type_code()
+
+    def test_mipyme_credit_invoices_are_refused_with_the_reason(self):
+        invoice = self._new_invoice()
+        self._post_invoice(invoice)
+        invoice.l10n_latam_document_type_id = self._document_type("201")
+        with self.assertRaisesRegex(UserError, "MiPyME"):
+            invoice._l10n_ar_arca_document_type_code()
+
+    def test_unknown_document_type_is_refused(self):
+        invoice = self._new_invoice()
+        self._post_invoice(invoice)
+        invoice.l10n_latam_document_type_id = self._document_type("60")
+        with self.assertRaisesRegex(UserError, "not accepted by"):
+            invoice._l10n_ar_arca_document_type_code()
+
+    def test_invoice_a_is_supported(self):
+        invoice = self._new_invoice()
+        self._post_invoice(invoice)
+        self.assertEqual(invoice._l10n_ar_arca_document_type_code(), 1)
+
+    def test_vat_aliquot_ids_exclude_untaxed_and_exempt(self):
+        """Codes 0, 1 and 2 are not aliquots; sending them is rejected (10019)."""
+        for code in (0, 1, 2):
+            self.assertNotIn(code, constants.VAT_ALIQUOT_IDS)
+        self.assertEqual(set(constants.VAT_ALIQUOT_IDS), {3, 4, 5, 6, 8, 9})
+
+    def test_an_untaxed_code_inside_the_aliquot_list_is_rejected(self):
+        move = self.env["account.move"]
+        with self.assertRaisesRegex(UserError, "not one ARCA accepts"):
+            move._l10n_ar_arca_aggregate_vat(
+                [{"Id": "2", "BaseImp": 100.0, "Importe": 0.0}]
+            )
+
+    def test_receptor_conditions_follow_the_published_table(self):
+        """Manual page 194: which conditions each document class accepts."""
+        self.assertEqual(constants.IVA_CONDITION_BY_CLASS["A"], {1, 6, 13, 16})
+        self.assertEqual(constants.IVA_CONDITION_BY_CLASS["M"], {1, 6, 13, 16})
+        self.assertEqual(constants.IVA_CONDITION_BY_CLASS["B"], {4, 5, 7, 8, 9, 10, 15})
+        # Consumidor Final is never valid on a class A document.
+        self.assertNotIn(5, constants.IVA_CONDITION_BY_CLASS["A"])
+        # A monotributista issuing class C can invoice anyone.
+        self.assertEqual(len(constants.IVA_CONDITION_BY_CLASS["C"]), 11)
+
+
+@tagged("post_install", "-at_install")
+class TestArcaNotes(ArcaTestCommon):
+    """Credit and debit notes must reference what they adjust."""
+
+    def setUp(self):
+        super().setUp()
+        self.service = self._patch_service(FakeArcaService())
+
+    def _authorized_invoice(self):
+        invoice = self._new_invoice()
+        self._post_invoice(invoice)
+        self._authorize(invoice)
+        return invoice
+
+    def test_credit_note_references_the_original_invoice(self):
+        invoice = self._authorized_invoice()
+        reversal = (
+            self.env["account.move.reversal"]
+            .with_context(active_model="account.move", active_ids=invoice.ids)
+            .create({"journal_id": invoice.journal_id.id, "reason": "test"})
+        )
+        credit_note = self.env["account.move"].browse(
+            reversal.reverse_moves()["res_id"]
+        )
+        self._post_invoice(credit_note)
+        self._authorize(credit_note)
+
+        detail = self.service.requests[-1]["detail"]
+        associated = detail["CbtesAsoc"]["CbteAsoc"][0]
+        origin_pos, origin_number = invoice._l10n_ar_arca_document_number_parts()
+        self.assertEqual(associated["Tipo"], int(invoice.l10n_latam_document_type_id.code))
+        self.assertEqual(associated["PtoVta"], origin_pos)
+        self.assertEqual(associated["Nro"], origin_number)
+
+    def test_credit_note_without_an_origin_is_refused(self):
+        """Validation 10040: a note must say which voucher it adjusts."""
+        credit_note = self._new_invoice(move_type="out_refund")
+        self._post_invoice(credit_note)
+        with self.assertRaisesRegex(UserError, "must reference the invoice"):
+            self._authorize(credit_note)
+        self.assertFalse(self.service.requests)
+
+    def test_association_uses_the_origins_point_of_sale(self):
+        """Not the current journal's: they can differ."""
+        invoice = self._authorized_invoice()
+        origin_pos, _number = invoice._l10n_ar_arca_document_number_parts()
+        associated = invoice._l10n_ar_arca_associated_documents(3)
+        self.assertFalse(associated, "An invoice is not a note and needs no association")
