@@ -84,10 +84,12 @@ Two workers could both read the same last authorized number and both attempt
 the next one. Nothing serialized them.
 
 Fixed with a PostgreSQL advisory lock keyed on company, point of sale and
-document type, so independent sequences still run in parallel. The lock is
-session scoped, not transaction scoped, because the attempt row is committed
-mid-protocol and a transaction-scoped lock would be released by that commit
-while the request was still in flight.
+document type, so independent sequences still run in parallel.
+
+The first fix used a session scoped lock, on the reasoning that the protocol
+commits mid-protocol and a transaction scoped lock would be released by that
+commit. That reasoning was right about the commit and wrong about the remedy:
+see R2 below, where the lock moves to a transaction of its own.
 
 ### C7 - No multi-company isolation on certificates
 
