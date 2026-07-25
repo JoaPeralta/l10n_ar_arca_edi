@@ -122,6 +122,9 @@ jobs:
     container:
       image: odoo:19.0-20260723
       options: --user root
+    defaults:
+      run:
+        shell: bash
     services:
       db:
         image: postgres:16
@@ -195,6 +198,9 @@ jobs:
     container:
       image: odoo:19.0-20260723
       options: --user root
+    defaults:
+      run:
+        shell: bash
     services:
       db:
         image: postgres:16
