@@ -98,8 +98,11 @@ jobs:
       - name: Reject hard-coded ARCA credentials
         run: |
           set -euo pipefail
-          if git grep -nI -E 'ARCA_HOMO_(CERT|PRIVATE_KEY|CUIT)[[:space:]]*=[[:space:]]*["'\''][^"'\'']+' \
-              -- . ':!.github/workflows/ci.yml' ':!tests/test_homologation.py'; then
+          # A literal value assigned to one of these variables. Shell
+          # substitutions are how the documentation shows the variables being
+          # set from a file, so a value starting with $ is not a credential.
+          if git grep -nI -E 'ARCA_HOMO_(CERT|PRIVATE_KEY)[[:space:]]*=[[:space:]]*["'\''][^$"'\'']{16,}' \
+              -- . ':!.github/workflows/ci.yml'; then
             echo "::error::Homologation credentials appear to be hard-coded"
             exit 1
           fi
