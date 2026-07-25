@@ -324,6 +324,64 @@ committed invoice with ARCA status `pending` and no call to ARCA at all; the CAE
 is requested by the button, the scheduled action, or -- for companies that opt
 in -- after the posting commits.
 
+## Third round: certificate holder versus represented taxpayer
+
+Baseline for this round: `8d0301c5438cf278ecf75b1b6b2455bc0d1c86c9`. Found while
+preparing homologación, before any call to ARCA.
+
+### R6 - One CUIT was doing the work of two
+
+The module stored a single `cuit` on the certificate and used it for everything:
+the CSR subject, the check against the certificate ARCA issues, and
+`Auth.Cuit` on every WSFEv1 call.
+
+Those are two different identities, and ARCA is explicit about it. WSASS issues
+a certificate to whoever signs in with their own fiscal key, and then
+*"Crear autorización a servicio"* authorizes that DN to act for another
+taxpayer. The manual defines the field accordingly: `Auth.Cuit` is the
+**"Cuit contribuyente (representado o Emisora)"** -- the wording appears
+identically on all 21 authenticated operations. ARCA even has an error for
+getting it wrong: **601, "CUIT representada no incluida en token"**.
+
+A single `cuit` therefore only works while the certificate holder and the
+invoicing taxpayer happen to be the same. It breaks exactly where homologación
+usually starts: WSASS is reached with a natural person's fiscal key, and the
+invoices belong to a company.
+
+Fixed by naming the two identities and sourcing them separately:
+
+* `l10n_ar.arca.certificate.holder_cuit` -- who owns the DN. Goes in the CSR
+  subject, and is what an uploaded certificate's subject is validated against.
+* `res.company._l10n_ar_arca_issuer_cuit()` -- who the invoices belong to,
+  taken from the company's own tax number rather than stored a second time,
+  where it could drift from the invoices it describes.
+
+Everything fiscal now takes the issuer: `Auth.Cuit`, the attempt record, the QR
+payload, the numbering lock, `FECompUltimoAutorizado` and `FECompConsultar`.
+The WSFEv1 methods take it as an explicit argument, so every call site had to
+say which identity it meant instead of inheriting one by accident.
+
+Two things fell out of it:
+
+* **The numbering lock now keys on the issuing CUIT** rather than on the Odoo
+  company id. That is what ARCA numbers by, so two companies configured with the
+  same CUIT share one sequence at ARCA and must share one lock here.
+* **Error 601 is reported with its cause**, pointing at the WSASS authorization
+  step rather than passing the raw message through.
+
+The test fixture was changed so holder and issuer differ (`30-71234567-1` holding
+a certificate for a company whose CUIT is `30111111118`), which means the whole
+suite now runs with them apart. `tests/test_representation.py` asserts each half
+of the split explicitly.
+
+### R7 - The homologación suite could not say which CUIT it meant
+
+`ARCA_HOMO_CUIT` was ambiguous once the identities were separated. Renamed to
+`ARCA_HOMO_CERT_HOLDER_CUIT` and `ARCA_HOMO_REPRESENTED_CUIT`, and the suite
+split in two: a read-only half that consumes no voucher number, and an emission
+half that issues a real one and requires `ARCA_HOMO_ALLOW_EMISSION` on top of
+the credentials.
+
 ## Verification status
 
 Wording used deliberately, per the brief:

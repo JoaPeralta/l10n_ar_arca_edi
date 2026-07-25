@@ -100,25 +100,47 @@ There is deliberately no retry button.
 - `cryptography`, `zeep`, `lxml` — all present in the official `odoo:19.0`
   image and pinned in Odoo's own `requirements.txt`
 
+## Two CUITs
+
+ARCA works with two identities, and the module keeps them apart:
+
+| | Where it comes from | What it is used for |
+|---|---|---|
+| **Certificate holder** | `holder_cuit` on the certificate | CSR subject; validating the certificate ARCA issues |
+| **Issuer (represented)** | the Odoo company's Tax ID | `Auth.Cuit`, the QR, the attempt log, the numbering lock |
+
+WSASS issues a certificate to whoever signs in with their own fiscal key, and
+then *"Crear autorización a servicio"* authorizes that DN to act for another
+taxpayer. WSFEv1 says as much in the field itself: `Auth.Cuit` is the
+*"Cuit contribuyente (representado o Emisora)"*.
+
+They are the same number when a company uses its own certificate, and different
+when a person invoices on behalf of a company — which is the usual shape in
+homologación, since WSASS is reached with a personal fiscal key. Missing that
+authorization produces ARCA error **601**; the module reports it with a pointer
+to the step that fixes it.
+
 ## Setup
 
-See [`readme/CONFIGURE.rst`](readme/CONFIGURE.rst). In short: create a
-certificate record, generate the CSR, upload it to the ARCA portal, upload the
-certificate ARCA issues, and set the journal's ARCA POS system to
+See [`readme/CONFIGURE.rst`](readme/CONFIGURE.rst). In short: set the company's
+Tax ID, create a certificate record naming its holder, generate the CSR, create
+the certificate in WSASS, **authorize that DN for `wsfe` representing the
+company**, upload the certificate, and set the journal's ARCA POS system to
 *Electronic Invoice - Web Service*.
 
 ## Testing
 
 ```bash
 odoo -d <db> -i l10n_ar_arca_edi --test-enable \
-     --test-tags '/l10n_ar_arca_edi,-arca_homologation' --stop-after-init
+     --test-tags '/l10n_ar_arca_edi,-arca_homologation,-arca_homologation_emission' \
+     --stop-after-init
 ```
 
-Tests that talk to the real homologación environment are tagged
-`arca_homologation` and skip cleanly unless `ARCA_HOMO_CUIT`, `ARCA_HOMO_CERT`,
-`ARCA_HOMO_PRIVATE_KEY` and `ARCA_HOMO_POS` are set. They never touch
-production: the environment is pinned to `testing` and asserted before each
-test.
+Tests that talk to the real homologación environment come in two halves and skip
+cleanly without credentials. `arca_homologation` reads only and consumes no
+voucher number; `arca_homologation_emission` issues a real one and additionally
+requires `ARCA_HOMO_ALLOW_EMISSION`. Neither can touch production: the
+environment is pinned to `testing` and asserted before every test.
 
 ## Audit
 

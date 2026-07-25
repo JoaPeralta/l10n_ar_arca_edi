@@ -87,6 +87,9 @@ class ArcaHomologationCommon(ArcaTestCommon):
         # The taxpayer being invoiced for is the company's own number: that is
         # where every Auth.Cuit comes from.
         cls.company_ri.partner_id.vat = cls.homo_represented_cuit
+        # The base class read the issuer before that write; keep the two in step
+        # so nothing here can assert against a stale number.
+        cls.issuer_cuit = cls.company_ri._l10n_ar_arca_issuer_cuit()
 
         cls.homo_certificate = cls.env["l10n_ar.arca.certificate"].create(
             {
