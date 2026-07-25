@@ -5,6 +5,14 @@ on:
     branches: ["**"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      run_emission:
+        description: >-
+          Also issue a real voucher in homologación. This consumes a number at
+          the configured point of sale and cannot be undone. Leave off to run
+          only the read-only checks.
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -101,7 +109,7 @@ jobs:
           # A literal value assigned to one of these variables. Shell
           # substitutions are how the documentation shows the variables being
           # set from a file, so a value starting with $ is not a credential.
-          if git grep -nI -E 'ARCA_HOMO_(CERT|PRIVATE_KEY)[[:space:]]*=[[:space:]]*["'\''][^$"'\'']{16,}' \
+          if git grep -nI -E 'ARCA_HOMO_(CERT|PRIVATE_KEY|CERT_HOLDER_CUIT|REPRESENTED_CUIT)[[:space:]]*=[[:space:]]*["'\''][^$"'\'']{16,}' \
               -- . ':!.github/workflows/ci.yml'; then
             echo "::error::Homologation credentials appear to be hard-coded"
             exit 1
@@ -164,7 +172,7 @@ jobs:
             --addons-path=/usr/lib/python3/dist-packages/odoo/addons,${GITHUB_WORKSPACE}/extra-addons \
             -i l10n_ar_arca_edi \
             --test-enable \
-            --test-tags '/l10n_ar_arca_edi,-arca_homologation' \
+            --test-tags '/l10n_ar_arca_edi,-arca_homologation,-arca_homologation_emission' \
             --without-demo=all \
             --log-level=info \
             --max-cron-threads=0 \
@@ -239,19 +247,23 @@ jobs:
       - name: Skip cleanly when no certificate is configured
         id: creds
         env:
-          ARCA_HOMO_CUIT: ${{ secrets.ARCA_HOMO_CUIT }}
+          # Only the holder CUIT is read here, and only to test for presence:
+          # nothing is echoed, so no secret can reach the log.
+          HOLDER: ${{ secrets.ARCA_HOMO_CERT_HOLDER_CUIT }}
+          REPRESENTED: ${{ secrets.ARCA_HOMO_REPRESENTED_CUIT }}
         run: |
-          if [ -z "${ARCA_HOMO_CUIT}" ]; then
+          if [ -z "${HOLDER}" ] || [ -z "${REPRESENTED}" ]; then
             echo "available=false" >> "$GITHUB_OUTPUT"
             echo "::notice::No homologación certificate configured; nothing was sent to ARCA."
           else
             echo "available=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Run the homologación suite
+      - name: Read-only checks against ARCA homologación
         if: steps.creds.outputs.available == 'true'
         env:
-          ARCA_HOMO_CUIT: ${{ secrets.ARCA_HOMO_CUIT }}
+          ARCA_HOMO_CERT_HOLDER_CUIT: ${{ secrets.ARCA_HOMO_CERT_HOLDER_CUIT }}
+          ARCA_HOMO_REPRESENTED_CUIT: ${{ secrets.ARCA_HOMO_REPRESENTED_CUIT }}
           ARCA_HOMO_CERT: ${{ secrets.ARCA_HOMO_CERT }}
           ARCA_HOMO_PRIVATE_KEY: ${{ secrets.ARCA_HOMO_PRIVATE_KEY }}
           ARCA_HOMO_POS: ${{ secrets.ARCA_HOMO_POS }}
@@ -263,6 +275,33 @@ jobs:
             -i l10n_ar_arca_edi \
             --test-enable \
             --test-tags 'arca_homologation' \
+            --without-demo=all \
+            --log-level=info \
+            --max-cron-threads=0 \
+            --stop-after-init
+
+      - name: Issue a real voucher in homologación
+        # Two gates on purpose: the run has to ask for it, and the suite itself
+        # still requires the opt-in variable. A voucher number cannot be
+        # un-consumed, so neither gate is implied by having the credentials.
+        if: >-
+          steps.creds.outputs.available == 'true' &&
+          inputs.run_emission
+        env:
+          ARCA_HOMO_CERT_HOLDER_CUIT: ${{ secrets.ARCA_HOMO_CERT_HOLDER_CUIT }}
+          ARCA_HOMO_REPRESENTED_CUIT: ${{ secrets.ARCA_HOMO_REPRESENTED_CUIT }}
+          ARCA_HOMO_CERT: ${{ secrets.ARCA_HOMO_CERT }}
+          ARCA_HOMO_PRIVATE_KEY: ${{ secrets.ARCA_HOMO_PRIVATE_KEY }}
+          ARCA_HOMO_POS: ${{ secrets.ARCA_HOMO_POS }}
+          ARCA_HOMO_ALLOW_EMISSION: "1"
+        run: |
+          odoo \
+            --db_host=db --db_user=odoo --db_password=odoo \
+            -d homo_emission_l10n_ar_arca_edi \
+            --addons-path=/usr/lib/python3/dist-packages/odoo/addons,${GITHUB_WORKSPACE}/extra-addons \
+            -i l10n_ar_arca_edi \
+            --test-enable \
+            --test-tags 'arca_homologation_emission' \
             --without-demo=all \
             --log-level=info \
             --max-cron-threads=0 \
