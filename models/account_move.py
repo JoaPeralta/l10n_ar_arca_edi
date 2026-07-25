@@ -5,14 +5,19 @@ import base64
 import hashlib
 import json
 import logging
-from contextlib import contextmanager
 
-from odoo import _, api, fields, models, modules
+from odoo import _, api, fields, models
 from odoo.exceptions import UserError
 from odoo.tools import float_round
 
 from . import constants
-from .arca_errors import ArcaAborted, ArcaBusinessError, ArcaUncertain
+from .arca_errors import (
+    ArcaAborted,
+    ArcaBusinessError,
+    ArcaSequenceBusy,
+    ArcaUncertain,
+)
+from .fiscal_transaction import fiscal_transaction
 
 _logger = logging.getLogger(__name__)
 
@@ -101,13 +106,16 @@ class AccountMove(models.Model):
     # ------------------------------------------------------------------
 
     def _post(self, soft=True):
-        """Post the invoice, then authorize it -- never the other way round.
+        """Post the invoice. Nothing fiscal happens here.
 
-        Requesting a CAE inside this transaction would put an irreversible
-        external action inside something PostgreSQL can still roll back: ARCA
-        would hold an authorized voucher that Odoo has no record of. Instead the
-        move is only marked as pending here, and the actual request is scheduled
-        to run once this transaction has committed.
+        Registering the sale and authorizing it at ARCA are two separate acts,
+        and this method performs only the first: the invoice becomes a real,
+        committed accounting document whose ARCA status is "pending". ARCA is
+        not contacted, so nothing irreversible rides on a transaction that can
+        still be rolled back.
+
+        Asking for the CAE is a deliberate second step -- the button, the
+        scheduled action, or the after-commit hook when a company opts into it.
         """
         posted = super()._post(soft=soft)
 
@@ -131,22 +139,23 @@ class AccountMove(models.Model):
         return posted
 
     def _l10n_ar_arca_schedule_after_commit(self, move_ids):
-        """Run the authorization once the invoices are durably committed."""
+        """Request the CAE once these invoices are durably committed.
+
+        Odoo clears post-commit callbacks on rollback, so an invoice that never
+        makes it to disk never reaches ARCA either.
+        """
         move_ids = tuple(move_ids)
         env = self.env
 
         def _run():
-            with env.registry.cursor() as cr:
-                new_env = env(cr=cr)
-                moves = new_env["account.move"].browse(move_ids).exists()
-                for move in moves:
-                    try:
-                        move._l10n_ar_arca_authorize()
-                    except Exception:  # noqa: BLE001 - one invoice must not stop the batch
-                        cr.rollback()
-                        _logger.exception(
-                            "Automatic ARCA authorization failed for move %s", move.id
-                        )
+            moves = env["account.move"].browse(move_ids).exists()
+            for move in moves:
+                try:
+                    move._l10n_ar_arca_request_cae()
+                except Exception:  # noqa: BLE001 - one invoice must not stop the batch
+                    _logger.exception(
+                        "Automatic ARCA authorization failed for move %s", move.id
+                    )
 
         self.env.cr.postcommit.add(_run)
 
@@ -161,64 +170,57 @@ class AccountMove(models.Model):
         digest = hashlib.blake2b(raw, digest_size=8).digest()
         return int.from_bytes(digest, "big") & 0x7FFFFFFFFFFFFFFF
 
-    @contextmanager
-    def _l10n_ar_arca_sequence_lock(self, pos_number, doc_type_code):
-        """Serialize authorizations for one company / POS / document type.
-
-        ARCA requires each voucher number to be exactly one more than the last
-        authorized for the same point of sale and document type, so two workers
-        must not be in flight on the same sequence at once. The lock is session
-        scoped rather than transaction scoped on purpose: the attempt row is
-        committed in the middle of the protocol, and a transaction-scoped lock
-        would be released by that commit while the request is still in flight.
-
-        Independent sequences never block each other.
-        """
+    def _l10n_ar_arca_sequence_lock_key(self):
+        """The lock key for this invoice's numbering sequence."""
         self.ensure_one()
-        key = self._l10n_ar_arca_lock_key(self.company_id.id, pos_number, doc_type_code)
-        cr = self.env.cr
-        cr.execute("SELECT pg_try_advisory_lock(%s)", (key,))
-        acquired = cr.fetchone()[0]
-        if not acquired:
-            raise UserError(
-                _(
-                    "Another process is already authorizing vouchers for point of "
-                    "sale %(pos)s and document type %(doc_type)s. Try again in a "
-                    "moment.",
-                    pos=pos_number,
-                    doc_type=doc_type_code,
-                )
-            )
-        try:
-            yield
-        finally:
-            cr.execute("SELECT pg_advisory_unlock(%s)", (key,))
+        pos_number, _number = self._l10n_ar_arca_document_number_parts()
+        doc_type_code = self._l10n_ar_arca_document_type_code()
+        return self._l10n_ar_arca_lock_key(
+            self.company_id.id, pos_number, doc_type_code
+        )
 
     # ------------------------------------------------------------------
-    # Authorization protocol
+    # Requesting the CAE
     # ------------------------------------------------------------------
 
     def action_l10n_ar_arca_authorize(self):
-        """Button: request the CAE for this invoice."""
+        """Button: ask ARCA to authorize this invoice."""
         self.ensure_one()
-        self._l10n_ar_arca_authorize()
+        self._l10n_ar_arca_request_cae()
+        # The work ran on another transaction; drop the stale cache so what we
+        # report back is what was actually recorded.
+        self.invalidate_recordset()
         return self._l10n_ar_arca_notify_state()
 
-    def _l10n_ar_arca_authorize(self):
-        """Obtain a CAE for this invoice.
+    def _l10n_ar_arca_request_cae(self):
+        """Run the fiscal protocol on transactions this workflow owns.
 
-        The order of operations is the whole point:
-
-        1. refuse to start from a state where the fiscal outcome is unknown;
-        2. take the sequence lock;
-        3. check our number against ARCA's last authorized one;
-        4. write and commit the attempt -- the durable evidence;
-        5. only then send the request.
-
-        Step 4 before step 5 is what makes a lost answer recoverable.
+        The caller's cursor -- which for a button is the one Odoo created for
+        the RPC -- is only ever read here. Everything that has to be committed
+        at a precise moment happens on a connection opened for that purpose, so
+        no fiscal commit can confirm unrelated changes the user happened to have
+        pending, and no browser-side rollback can erase evidence of a request
+        that already reached ARCA.
         """
         self.ensure_one()
+        self._l10n_ar_arca_check_ready()
+        lock_key = self._l10n_ar_arca_sequence_lock_key()
 
+        try:
+            with fiscal_transaction(self.env, lock_key) as fiscal:
+                fiscal.env["account.move"].browse(self.id)._l10n_ar_arca_authorize(fiscal)
+        except ArcaSequenceBusy as exc:
+            raise UserError(
+                _(
+                    "Another invoice from the same point of sale and document type "
+                    "is being authorized right now. Try again in a moment."
+                )
+            ) from exc
+        return True
+
+    def _l10n_ar_arca_check_ready(self):
+        """Refuse to start from a state where asking again would be unsafe."""
+        self.ensure_one()
         if self.state != "posted":
             raise UserError(_("Only posted invoices can be authorized by ARCA."))
         if not self._l10n_ar_arca_is_edi():
@@ -240,7 +242,11 @@ class AccountMove(models.Model):
             )
         if self.l10n_ar_arca_state == "processing":
             raise UserError(
-                _("This invoice is already being authorized by another process.")
+                _(
+                    "A request for this invoice is already in flight. If the "
+                    "process that started it died, reconcile the invoice against "
+                    "ARCA instead of sending a second request."
+                )
             )
         if self.l10n_ar_arca_state not in AUTHORIZABLE_STATES:
             raise UserError(
@@ -249,6 +255,24 @@ class AccountMove(models.Model):
                     self.l10n_ar_arca_state,
                 )
             )
+        return True
+
+    def _l10n_ar_arca_authorize(self, fiscal):
+        """The protocol itself, running inside a transaction it may commit.
+
+        The order of operations is the whole point:
+
+        1. re-check the state, now that the sequence lock is held;
+        2. check our number against ARCA's last authorized one;
+        3. write the attempt and commit it -- the durable evidence;
+        4. only then send the request.
+
+        Step 3 before step 4 is what makes a lost answer recoverable.
+        """
+        self.ensure_one()
+        # Read again from this transaction's own snapshot: the caller checked
+        # against a different one, and another worker may have finished since.
+        self._l10n_ar_arca_check_ready()
 
         certificate = self._l10n_ar_arca_get_certificate()
         doc_type_code = self._l10n_ar_arca_document_type_code()
@@ -265,106 +289,92 @@ class AccountMove(models.Model):
             )
 
         wsfe = self.env["l10n_ar.arca.wsfe"]
+        last_authorized = wsfe.fe_comp_ultimo_autorizado(
+            certificate, pos_number, doc_type_code
+        )
+        self._l10n_ar_arca_check_sequence(last_authorized, number, pos_number)
 
-        with self._l10n_ar_arca_sequence_lock(pos_number, doc_type_code):
-            # Re-read under the lock: another worker may have finished between
-            # the checks above and the moment we acquired it.
-            self.invalidate_recordset(["l10n_ar_arca_state"])
-            if self.l10n_ar_arca_state not in AUTHORIZABLE_STATES:
-                raise UserError(
-                    _(
-                        "This invoice changed status while waiting for the "
-                        "authorization lock (now: %s).",
-                        self.l10n_ar_arca_state,
-                    )
-                )
+        header, detail = self._l10n_ar_arca_prepare_request(
+            certificate, doc_type_code, pos_number, number
+        )
 
-            last_authorized = wsfe.fe_comp_ultimo_autorizado(
-                certificate, pos_number, doc_type_code
-            )
-            self._l10n_ar_arca_check_sequence(last_authorized, number, pos_number)
+        attempt = self.env["l10n_ar.arca.attempt"].create(
+            {
+                "move_id": self.id,
+                "company_id": self.company_id.id,
+                "certificate_id": certificate.id,
+                "environment": certificate.environment,
+                "cuit": certificate._get_clean_cuit(),
+                "pos_number": pos_number,
+                "document_type_code": doc_type_code,
+                "document_number": number,
+                "state": "sent",
+                "request_payload": json.dumps(detail, indent=2, default=str),
+            }
+        )
+        self.l10n_ar_arca_state = "processing"
 
-            header, detail = self._l10n_ar_arca_prepare_request(
-                certificate, doc_type_code, pos_number, number
-            )
+        # Durable evidence must exist before the request leaves. Everything
+        # after this point can fail without losing track of the voucher.
+        fiscal.checkpoint()
 
-            attempt = self.env["l10n_ar.arca.attempt"].create(
-                {
-                    "move_id": self.id,
-                    "company_id": self.company_id.id,
-                    "certificate_id": certificate.id,
-                    "environment": certificate.environment,
-                    "cuit": certificate._get_clean_cuit(),
-                    "pos_number": pos_number,
-                    "document_type_code": doc_type_code,
-                    "document_number": number,
-                    "state": "sent",
-                    "request_payload": json.dumps(detail, indent=2, default=str),
-                }
-            )
-            self.l10n_ar_arca_state = "processing"
-
-            # Durable evidence must exist before the request leaves. Everything
-            # after this point can fail without losing track of the voucher.
-            self._l10n_ar_arca_checkpoint()
-
-            try:
-                result = wsfe.fe_cae_solicitar(certificate, header, detail)
-            except ArcaUncertain as exc:
-                attempt._mark_uncertain(str(exc))
-                self.write(
-                    {
-                        "l10n_ar_arca_state": "uncertain",
-                        "l10n_ar_arca_error_message": str(exc),
-                    }
-                )
-                self._l10n_ar_arca_checkpoint()
-                raise UserError(
-                    _(
-                        "The request was sent to ARCA but the answer was lost, so "
-                        "it is unknown whether the voucher was authorized. The "
-                        "invoice is marked as uncertain and must be reconciled "
-                        "against ARCA. Do not issue it again.\n\n%s",
-                        exc,
-                    )
-                ) from exc
-            except (ArcaAborted, ArcaBusinessError) as exc:
-                # Neither of these creates a fiscal document, so the number
-                # stays available and the invoice can be corrected and retried.
-                if isinstance(exc, ArcaAborted):
-                    attempt._mark_aborted(str(exc))
-                else:
-                    attempt._mark_rejected(getattr(exc, "code", None), str(exc))
-                self.write(
-                    {
-                        "l10n_ar_arca_state": "rejected",
-                        "l10n_ar_arca_error_code": getattr(exc, "code", None),
-                        "l10n_ar_arca_error_message": str(exc),
-                    }
-                )
-                self._l10n_ar_arca_checkpoint()
-                raise UserError(_("ARCA did not authorize the invoice:\n\n%s", exc)) from exc
-
-            attempt._mark_authorized(
-                cae=result["cae"],
-                cae_due_date=result["cae_due_date"],
-                response_payload=result.get("raw"),
-                duration_ms=result.get("duration_ms", 0),
-            )
-            observations = "\n".join(
-                f"[{obs['code']}] {obs['message']}" for obs in result.get("observations", [])
-            )
+        try:
+            result = wsfe.fe_cae_solicitar(certificate, header, detail)
+        except ArcaUncertain as exc:
+            attempt._mark_uncertain(str(exc))
             self.write(
                 {
-                    "l10n_ar_arca_state": "authorized",
-                    "l10n_ar_arca_cae": result["cae"],
-                    "l10n_ar_arca_cae_due_date": result["cae_due_date"],
-                    "l10n_ar_arca_observations": observations or False,
-                    "l10n_ar_arca_error_code": False,
-                    "l10n_ar_arca_error_message": False,
+                    "l10n_ar_arca_state": "uncertain",
+                    "l10n_ar_arca_error_message": str(exc),
                 }
             )
-            self._l10n_ar_arca_checkpoint()
+            fiscal.checkpoint()
+            raise UserError(
+                _(
+                    "The request was sent to ARCA but the answer was lost, so "
+                    "it is unknown whether the voucher was authorized. The "
+                    "invoice is marked as uncertain and must be reconciled "
+                    "against ARCA. Do not issue it again.\n\n%s",
+                    exc,
+                )
+            ) from exc
+        except (ArcaAborted, ArcaBusinessError) as exc:
+            # Neither of these creates a fiscal document, so the number
+            # stays available and the invoice can be corrected and retried.
+            if isinstance(exc, ArcaAborted):
+                attempt._mark_aborted(str(exc))
+            else:
+                attempt._mark_rejected(getattr(exc, "code", None), str(exc))
+            self.write(
+                {
+                    "l10n_ar_arca_state": "rejected",
+                    "l10n_ar_arca_error_code": getattr(exc, "code", None),
+                    "l10n_ar_arca_error_message": str(exc),
+                }
+            )
+            fiscal.checkpoint()
+            raise UserError(_("ARCA did not authorize the invoice:\n\n%s", exc)) from exc
+
+        attempt._mark_authorized(
+            cae=result["cae"],
+            cae_due_date=result["cae_due_date"],
+            response_payload=result.get("raw"),
+            duration_ms=result.get("duration_ms", 0),
+        )
+        observations = "\n".join(
+            f"[{obs['code']}] {obs['message']}" for obs in result.get("observations", [])
+        )
+        self.write(
+            {
+                "l10n_ar_arca_state": "authorized",
+                "l10n_ar_arca_cae": result["cae"],
+                "l10n_ar_arca_cae_due_date": result["cae_due_date"],
+                "l10n_ar_arca_observations": observations or False,
+                "l10n_ar_arca_error_code": False,
+                "l10n_ar_arca_error_message": False,
+            }
+        )
+        fiscal.checkpoint()
 
         _logger.info(
             "ARCA authorized move %s as %s-%08d (type %s), CAE %s",
@@ -375,24 +385,6 @@ class AccountMove(models.Model):
             result["cae"],
         )
         return True
-
-    def _l10n_ar_arca_checkpoint(self):
-        """Persist progress so far.
-
-        ARCA is not transactional. Committing between the steps of the protocol
-        is what keeps the local record in step with an external system that
-        cannot roll back: whatever happens next, the attempt row is already on
-        disk.
-
-        A test transaction is never committed, and committing from inside one
-        breaks the cursor the test will roll back, so under tests this degrades
-        to a flush. The ordering being asserted -- attempt written before the
-        request is sent -- still holds.
-        """
-        if modules.module.current_test:
-            self.env.cr.flush()
-            return
-        self.env.cr.commit()
 
     def _l10n_ar_arca_check_sequence(self, last_authorized, number, pos_number):
         """Refuse to send a number that is not the one ARCA expects.
@@ -498,11 +490,13 @@ class AccountMove(models.Model):
             if not move._l10n_ar_arca_is_edi():
                 continue
             try:
-                move._l10n_ar_arca_authorize()
+                move._l10n_ar_arca_request_cae()
             except Exception as exc:  # noqa: BLE001 - one invoice must not stop the batch
-                if not modules.module.current_test:
-                    self.env.cr.rollback()
-                _logger.warning("Scheduled ARCA authorization failed for %s: %s", move.id, exc)
+                # Nothing to roll back: each request owns its own transactions,
+                # and whatever it decided about this invoice is already committed.
+                _logger.warning(
+                    "Scheduled ARCA authorization failed for %s: %s", move.id, exc
+                )
         return True
 
     # ------------------------------------------------------------------

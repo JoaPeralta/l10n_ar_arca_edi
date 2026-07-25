@@ -39,6 +39,14 @@ class ArcaBusinessError(ArcaError):
     """
 
 
+class ArcaSequenceBusy(ArcaError):
+    """Another process holds the numbering lock for this sequence.
+
+    Not a failure: nothing was attempted, and the caller may try again once the
+    other authorization finishes.
+    """
+
+
 class ArcaUncertain(ArcaError):
     """The request was transmitted and the answer was lost.
 

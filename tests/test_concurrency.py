@@ -1,17 +1,61 @@
 # Copyright 2026 Leonobitech
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
-"""Two workers must not authorize the same number.
+"""The numbering lock, tested against PostgreSQL rather than against a mock.
 
-These tests use real PostgreSQL sessions rather than calling two methods in a
-row: a lock that is never contended is not evidence of anything.
+Two workers must not authorize the same number, and -- just as important -- a
+connection must never go back to the pool still holding a fiscal lock. That
+second property is why the lock is transaction scoped: PostgreSQL releases it
+when the transaction ends, and Odoo always ends the transaction before handing
+the connection back. These tests exercise that with real connections and real
+SQL errors.
 """
 
 import threading
 
+import psycopg2
+
+import odoo
 from odoo.exceptions import UserError
 from odoo.tests import tagged
 
-from .common import TEST_POS_NUMBER, ArcaTestCommon, FakeArcaService
+from ..models.arca_errors import ArcaSequenceBusy
+from ..models.fiscal_transaction import fiscal_transaction
+from .common import ArcaTestCommon, FakeArcaService
+
+# Keys used only by these tests, well away from anything an invoice would pick.
+PROBE_KEY_A = 0x5AFE_0000_0000_0001
+PROBE_KEY_B = 0x5AFE_0000_0000_0002
+
+
+class AdvisoryLockProbe:
+    """Asks PostgreSQL directly who holds an advisory lock."""
+
+    def __init__(self, registry):
+        self.registry = registry
+
+    def is_held(self, key):
+        classid = (key >> 32) & 0xFFFFFFFF
+        objid = key & 0xFFFFFFFF
+        with self.registry.cursor() as cr:
+            cr.execute(
+                """
+                SELECT count(*)
+                  FROM pg_locks
+                 WHERE locktype = 'advisory'
+                   AND classid = %s
+                   AND objid = %s
+                   AND objsubid = 1
+                   AND granted
+                """,
+                (classid, objid),
+            )
+            return cr.fetchone()[0] > 0
+
+    def can_acquire(self, key):
+        """Can a fresh session take it right now."""
+        with self.registry.cursor() as cr:
+            cr.execute("SELECT pg_try_advisory_xact_lock(%s)", (key,))
+            return cr.fetchone()[0]
 
 
 @tagged("post_install", "-at_install")
@@ -19,13 +63,13 @@ class TestArcaLockKey(ArcaTestCommon):
 
     def test_key_is_stable(self):
         move = self.env["account.move"]
-        first = move._l10n_ar_arca_lock_key(1, 7, 1)
-        second = move._l10n_ar_arca_lock_key(1, 7, 1)
-        self.assertEqual(first, second)
+        self.assertEqual(
+            move._l10n_ar_arca_lock_key(1, 7, 1),
+            move._l10n_ar_arca_lock_key(1, 7, 1),
+        )
 
     def test_key_fits_a_postgres_bigint(self):
-        move = self.env["account.move"]
-        key = move._l10n_ar_arca_lock_key(999, 99998, 213)
+        key = self.env["account.move"]._l10n_ar_arca_lock_key(999, 99998, 213)
         self.assertGreaterEqual(key, 0)
         self.assertLess(key, 2**63)
 
@@ -42,139 +86,194 @@ class TestArcaLockKey(ArcaTestCommon):
 
 
 @tagged("post_install", "-at_install")
-class TestArcaAdvisoryLock(ArcaTestCommon):
-    """The lock is exercised across genuinely separate database sessions."""
+class TestArcaLockPrimitive(ArcaTestCommon):
+    """The lock, on real connections, with no ORM data involved.
 
-    def test_a_second_session_cannot_take_a_held_lock(self):
-        key = self.env["account.move"]._l10n_ar_arca_lock_key(
-            self.company_ri.id, TEST_POS_NUMBER, 1
+    Every test here forces the production path, so what is being measured is the
+    behaviour that ships -- not a test-mode shortcut.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.probe = AdvisoryLockProbe(self.registry)
+        # Force the dedicated-connection path. The block bodies below touch only
+        # those connections, so the test transaction is never at risk.
+        self.patch(odoo.modules.module, "current_test", False)
+
+    def test_the_lock_is_held_while_the_block_runs(self):
+        with fiscal_transaction(self.env, PROBE_KEY_A):
+            self.assertTrue(self.probe.is_held(PROBE_KEY_A))
+        self.assertFalse(self.probe.is_held(PROBE_KEY_A))
+
+    def test_a_second_worker_is_turned_away(self):
+        with fiscal_transaction(self.env, PROBE_KEY_A):
+            with self.assertRaises(ArcaSequenceBusy):
+                with fiscal_transaction(self.env, PROBE_KEY_A):
+                    self.fail("Two workers held the same numbering lock")
+
+    def test_an_unrelated_sequence_is_not_blocked(self):
+        with fiscal_transaction(self.env, PROBE_KEY_A):
+            with fiscal_transaction(self.env, PROBE_KEY_B):
+                self.assertTrue(self.probe.is_held(PROBE_KEY_B))
+
+    def test_a_python_exception_releases_the_lock(self):
+        with self.assertRaises(RuntimeError):
+            with fiscal_transaction(self.env, PROBE_KEY_A):
+                raise RuntimeError("boom")
+        self.assertFalse(self.probe.is_held(PROBE_KEY_A))
+        self.assertTrue(self.probe.can_acquire(PROBE_KEY_A))
+
+    def test_a_sql_error_that_aborts_the_transaction_releases_the_lock(self):
+        """The case a session scoped lock cannot survive.
+
+        A failed statement leaves the work transaction aborted, and PostgreSQL
+        then refuses every command on it except ROLLBACK. With a session scoped
+        lock the release would have to be an explicit pg_advisory_unlock, which
+        is exactly the command PostgreSQL will not run -- leaving a live
+        connection in the pool holding a fiscal lock nobody can clear.
+
+        Because the lock is transaction scoped and lives on its own connection,
+        it is released by the transaction ending, which needs no cooperation
+        from the aborted one.
+        """
+        with self.assertRaises(psycopg2.Error):
+            with fiscal_transaction(self.env, PROBE_KEY_A) as fiscal:
+                self.assertTrue(self.probe.is_held(PROBE_KEY_A))
+                fiscal.env.cr.execute("SELECT 1 FROM a_table_that_does_not_exist")
+
+        self.assertFalse(
+            self.probe.is_held(PROBE_KEY_A),
+            "The lock survived a transaction aborted by a SQL error",
         )
-        with self.registry.cursor() as first:
-            first.execute("SELECT pg_try_advisory_lock(%s)", (key,))
-            self.assertTrue(first.fetchone()[0], "The first session did not get the lock")
+        self.assertTrue(
+            self.probe.can_acquire(PROBE_KEY_A),
+            "A second worker could not take the lock after a SQL error",
+        )
+
+    def test_an_error_inside_the_work_transaction_does_not_abort_the_lock_one(self):
+        """The two connections are independent, which is the point of using two."""
+        with self.assertRaises(psycopg2.Error):
+            with fiscal_transaction(self.env, PROBE_KEY_A) as fiscal:
+                fiscal.env.cr.execute("SELECT 1 FROM a_table_that_does_not_exist")
+        # Nothing needed cleaning up by hand, and the sequence is usable again.
+        with fiscal_transaction(self.env, PROBE_KEY_A):
+            self.assertTrue(self.probe.is_held(PROBE_KEY_A))
+
+    def test_no_connection_returns_to_the_pool_holding_the_lock(self):
+        """Odoo hands a connection back after a rollback and nothing more.
+
+        So whatever the lock's fate is, it has to be decided by the rollback.
+        """
+        for _attempt in range(3):
             try:
-                with self.registry.cursor() as second:
-                    second.execute("SELECT pg_try_advisory_lock(%s)", (key,))
-                    self.assertFalse(
-                        second.fetchone()[0],
-                        "A second session took a lock that was already held",
-                    )
-            finally:
-                first.execute("SELECT pg_advisory_unlock(%s)", (key,))
+                with fiscal_transaction(self.env, PROBE_KEY_A) as fiscal:
+                    fiscal.env.cr.execute("SELECT 1 FROM nope_not_a_table")
+            except psycopg2.Error:
+                pass
+        self.assertFalse(self.probe.is_held(PROBE_KEY_A))
 
-    def test_a_different_sequence_is_not_blocked(self):
-        move = self.env["account.move"]
-        held = move._l10n_ar_arca_lock_key(self.company_ri.id, TEST_POS_NUMBER, 1)
-        other = move._l10n_ar_arca_lock_key(self.company_ri.id, TEST_POS_NUMBER + 1, 1)
-        with self.registry.cursor() as first:
-            first.execute("SELECT pg_try_advisory_lock(%s)", (held,))
-            self.assertTrue(first.fetchone()[0])
+        # And a completely fresh session still gets it.
+        self.assertTrue(self.probe.can_acquire(PROBE_KEY_A))
+
+    def test_a_committed_checkpoint_does_not_drop_the_lock(self):
+        """The work transaction commits mid-protocol; the lock must not go with it.
+
+        This is why the lock lives on a second connection: a transaction scoped
+        lock taken on the working transaction would be released by the very
+        commit that makes the attempt durable, leaving the request in flight
+        unprotected.
+        """
+        with fiscal_transaction(self.env, PROBE_KEY_A) as fiscal:
+            fiscal.checkpoint()
+            self.assertTrue(
+                self.probe.is_held(PROBE_KEY_A),
+                "The checkpoint commit released the numbering lock",
+            )
+            fiscal.checkpoint()
+            self.assertTrue(self.probe.is_held(PROBE_KEY_A))
+        self.assertFalse(self.probe.is_held(PROBE_KEY_A))
+
+    def test_a_session_lock_would_have_survived_rollback(self):
+        """Characterisation of the design that was replaced.
+
+        Kept as a test because it is the reason for the current shape: this is
+        what PostgreSQL does with the alternative, and a rollback is all Odoo
+        does before returning a connection to the pool.
+        """
+        with self.registry.cursor() as cr:
+            cr.execute("SELECT pg_advisory_lock(%s)", (PROBE_KEY_B,))
+            cr.rollback()
             try:
-                with self.registry.cursor() as second:
-                    second.execute("SELECT pg_try_advisory_lock(%s)", (other,))
-                    self.assertTrue(
-                        second.fetchone()[0],
-                        "An unrelated point of sale was blocked",
-                    )
-                    second.execute("SELECT pg_advisory_unlock(%s)", (other,))
+                self.assertTrue(
+                    self.probe.is_held(PROBE_KEY_B),
+                    "PostgreSQL released a session lock on rollback",
+                )
             finally:
-                first.execute("SELECT pg_advisory_unlock(%s)", (held,))
-
-    def test_the_lock_is_released_after_the_protocol(self):
-        service = self._patch_service(FakeArcaService())
-        invoice = self._new_invoice()
-        self._post_invoice(invoice)
-        self._authorize(invoice)
-
-        key = self.env["account.move"]._l10n_ar_arca_lock_key(
-            self.company_ri.id, TEST_POS_NUMBER, int(invoice.l10n_latam_document_type_id.code)
-        )
-        with self.registry.cursor() as other:
-            other.execute("SELECT pg_try_advisory_lock(%s)", (key,))
-            acquired = other.fetchone()[0]
-            if acquired:
-                other.execute("SELECT pg_advisory_unlock(%s)", (key,))
-        self.assertTrue(acquired, "The sequence lock was not released")
-        self.assertTrue(service.requests)
-
-    def test_the_lock_is_released_even_when_arca_fails(self):
-        from ..models.arca_errors import ArcaBusinessError
-
-        self._patch_service(FakeArcaService(raise_on_request=ArcaBusinessError("nope")))
-        invoice = self._new_invoice()
-        self._post_invoice(invoice)
-        with self.assertRaises(UserError):
-            self._authorize(invoice)
-
-        key = self.env["account.move"]._l10n_ar_arca_lock_key(
-            self.company_ri.id, TEST_POS_NUMBER, int(invoice.l10n_latam_document_type_id.code)
-        )
-        with self.registry.cursor() as other:
-            other.execute("SELECT pg_try_advisory_lock(%s)", (key,))
-            acquired = other.fetchone()[0]
-            if acquired:
-                other.execute("SELECT pg_advisory_unlock(%s)", (key,))
-        self.assertTrue(acquired, "The lock leaked after a failed authorization")
-
-    def test_a_worker_holding_the_lock_turns_the_second_one_away(self):
-        """The second worker is told to wait, not allowed to race."""
-        service = self._patch_service(FakeArcaService())
-        invoice = self._new_invoice()
-        self._post_invoice(invoice)
-        doc_type = int(invoice.l10n_latam_document_type_id.code)
-        key = self.env["account.move"]._l10n_ar_arca_lock_key(
-            self.company_ri.id, TEST_POS_NUMBER, doc_type
-        )
-
-        with self.registry.cursor() as holder:
-            holder.execute("SELECT pg_advisory_lock(%s)", (key,))
-            try:
-                with self.assertRaisesRegex(UserError, "Another process"):
-                    self._authorize(invoice)
-            finally:
-                holder.execute("SELECT pg_advisory_unlock(%s)", (key,))
-
-        self.assertFalse(service.requests, "A request was sent while the lock was held")
-        self.assertEqual(invoice.l10n_ar_arca_state, "pending")
+                cr.execute("SELECT pg_advisory_unlock(%s)", (PROBE_KEY_B,))
+        self.assertFalse(self.probe.is_held(PROBE_KEY_B))
 
 
 @tagged("post_install", "-at_install")
 class TestArcaConcurrentWorkers(ArcaTestCommon):
-    """Two real threads, two connections, one sequence."""
+    """Two real threads on two real connections, one sequence."""
 
-    def test_only_one_thread_holds_the_sequence_lock_at_a_time(self):
-        key = self.env["account.move"]._l10n_ar_arca_lock_key(
-            self.company_ri.id, TEST_POS_NUMBER, 1
-        )
-        overlapping = []
+    def setUp(self):
+        super().setUp()
+        self.patch(odoo.modules.module, "current_test", False)
+
+    def test_only_one_thread_is_inside_the_critical_section(self):
         inside = threading.Semaphore(0)
         release = threading.Event()
+        order = []
         results = {}
 
         def first_worker():
-            with self.registry.cursor() as cr:
-                cr.execute("SELECT pg_advisory_lock(%s)", (key,))
-                overlapping.append("first-in")
+            with fiscal_transaction(self.env, PROBE_KEY_A):
+                order.append("first-in")
                 inside.release()
-                release.wait(timeout=10)
-                overlapping.append("first-out")
-                cr.execute("SELECT pg_advisory_unlock(%s)", (key,))
+                release.wait(timeout=15)
+                order.append("first-out")
 
         def second_worker():
-            inside.acquire(timeout=10)
-            with self.registry.cursor() as cr:
-                cr.execute("SELECT pg_try_advisory_lock(%s)", (key,))
-                results["acquired_while_held"] = cr.fetchone()[0]
+            inside.acquire(timeout=15)
+            try:
+                with fiscal_transaction(self.env, PROBE_KEY_A):
+                    results["entered_while_held"] = True
+            except ArcaSequenceBusy:
+                results["entered_while_held"] = False
+            finally:
                 release.set()
 
-        threads = [threading.Thread(target=first_worker), threading.Thread(target=second_worker)]
+        threads = [
+            threading.Thread(target=first_worker),
+            threading.Thread(target=second_worker),
+        ]
         for thread in threads:
             thread.start()
         for thread in threads:
-            thread.join(timeout=20)
+            thread.join(timeout=30)
 
-        self.assertEqual(overlapping, ["first-in", "first-out"])
+        self.assertEqual(order, ["first-in", "first-out"])
         self.assertFalse(
-            results.get("acquired_while_held", True),
-            "Two workers held the same numbering lock at once",
+            results.get("entered_while_held", True),
+            "Two workers were inside the same numbering sequence at once",
         )
+
+
+@tagged("post_install", "-at_install")
+class TestArcaSequenceBusyIsReported(ArcaTestCommon):
+    """A busy sequence is a message, not a race."""
+
+    def test_a_held_sequence_turns_the_request_away(self):
+        service = self._patch_service(FakeArcaService())
+        invoice = self._new_invoice()
+        self._post_invoice(invoice)
+        key = invoice._l10n_ar_arca_sequence_lock_key()
+
+        with self.registry.cursor() as holder:
+            holder.execute("SELECT pg_advisory_xact_lock(%s)", (key,))
+            with self.assertRaisesRegex(UserError, "being authorized right now"):
+                invoice._l10n_ar_arca_request_cae()
+
+        self.assertFalse(service.requests, "A request was sent while the lock was held")
+        self.assertEqual(invoice.l10n_ar_arca_state, "pending")

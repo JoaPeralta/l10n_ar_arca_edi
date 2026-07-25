@@ -16,12 +16,15 @@ class ResCompany(models.Model):
     )
     l10n_ar_arca_auto_request_cae = fields.Boolean(
         string="Request CAE automatically",
-        default=True,
+        default=False,
         help=(
-            "Request the CAE right after an invoice is posted. The request runs "
-            "once the invoice is committed, so a failure at ARCA never undoes the "
-            "posting. Turn this off to authorize invoices manually or from the "
-            "scheduled action."
+            "Ask ARCA for the CAE as soon as an invoice is posted, instead of "
+            "waiting for someone to press Request CAE. "
+            "Off by default: posting an invoice and authorizing it fiscally are "
+            "separate decisions, and while a point of sale is being brought up "
+            "the second one is worth making on purpose. The request still runs "
+            "after the invoice is committed, so enabling this never lets an ARCA "
+            "failure undo a posting."
         ),
     )
 

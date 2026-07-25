@@ -7,10 +7,14 @@ merely broken: a request whose answer never arrives, an invoice authorized
 twice, and a number that drifts away from what ARCA recorded.
 """
 
+import datetime
+
+from odoo import fields
 from odoo.exceptions import UserError
 from odoo.tests import tagged
 
 from ..models.arca_errors import ArcaAborted, ArcaBusinessError, ArcaUncertain
+from ..models.l10n_ar_arca_attempt import STALE_ATTEMPT_MINUTES
 from .common import TEST_POS_NUMBER, ArcaTestCommon, FakeArcaService
 
 
@@ -164,6 +168,7 @@ class TestArcaAuthorization(ArcaTestCommon):
         )
 
     def test_cron_reconciles_open_attempts(self):
+        """An uncertain attempt is taken immediately: its request already ended."""
         self.service.raise_on_request = ArcaUncertain("timeout")
         invoice = self._new_invoice()
         self._post_invoice(invoice)
@@ -320,3 +325,142 @@ class TestArcaAuthorization(ArcaTestCommon):
         self.company_ri.l10n_ar_arca_certificate_id = False
         with self.assertRaisesRegex(UserError, "No ARCA certificate"):
             self._authorize(invoice)
+
+
+@tagged("post_install", "-at_install")
+class TestArcaManualFlow(ArcaTestCommon):
+    """Registering the sale and authorizing it are two separate acts."""
+
+    def setUp(self):
+        super().setUp()
+        self.service = self._patch_service(FakeArcaService())
+
+    def test_requesting_the_cae_is_off_by_default(self):
+        """A fresh company does not talk to ARCA behind the user's back."""
+        company = self.env["res.company"].create({"name": "Fresh AR company"})
+        self.assertFalse(company.l10n_ar_arca_auto_request_cae)
+
+    def test_posting_leaves_a_complete_invoice_that_arca_knows_nothing_about(self):
+        invoice = self._new_invoice()
+        self._post_invoice(invoice)
+
+        self.assertEqual(invoice.state, "posted")
+        self.assertTrue(invoice.l10n_latam_document_number)
+        self.assertEqual(invoice.l10n_ar_arca_state, "pending")
+        self.assertFalse(invoice.l10n_ar_arca_cae)
+        self.assertFalse(invoice.l10n_ar_arca_attempt_ids)
+        self.assertFalse(self.service.requests, "Posting contacted ARCA")
+
+    def test_the_button_is_what_starts_the_fiscal_process(self):
+        invoice = self._new_invoice()
+        self._post_invoice(invoice)
+        self.assertFalse(self.service.requests)
+
+        invoice.action_l10n_ar_arca_authorize()
+
+        self.assertEqual(len(self.service.requests), 1)
+        self.assertEqual(invoice.l10n_ar_arca_state, "authorized")
+        self.assertTrue(invoice.l10n_ar_arca_cae)
+
+    def test_enabling_the_automatic_request_does_not_move_it_into_posting(self):
+        """Even opted in, the request is scheduled for after the commit."""
+        self.company_ri.l10n_ar_arca_auto_request_cae = True
+        invoice = self._new_invoice()
+        self._post_invoice(invoice)
+        self.assertFalse(
+            self.service.requests,
+            "The CAE was requested from inside the posting transaction",
+        )
+        self.assertEqual(invoice.l10n_ar_arca_state, "pending")
+
+
+@tagged("post_install", "-at_install")
+class TestArcaCrashRecovery(ArcaTestCommon):
+    """A process that dies mid-request must not strand an invoice."""
+
+    def setUp(self):
+        super().setUp()
+        self.service = self._patch_service(FakeArcaService())
+
+    def _crashed_invoice(self):
+        """Leave behind exactly what a killed process leaves behind.
+
+        The attempt is committed and the invoice is `processing`, because the
+        failure happened after the checkpoint and before any handler could run.
+        """
+        self.service.raise_on_request = RuntimeError("process killed mid-request")
+        invoice = self._new_invoice()
+        self._post_invoice(invoice)
+        # Not assertRaises: Odoo rolls its savepoint back when the expected
+        # exception fires, which would erase the very evidence a crash leaves.
+        try:
+            self._authorize(invoice)
+        except RuntimeError:
+            pass
+        else:
+            self.fail("The simulated crash did not propagate")
+        self.service.raise_on_request = None
+        invoice.invalidate_recordset()
+        return invoice
+
+    def test_a_crash_leaves_the_evidence_behind(self):
+        invoice = self._crashed_invoice()
+        self.assertEqual(invoice.l10n_ar_arca_state, "processing")
+        attempt = invoice.l10n_ar_arca_attempt_ids
+        self.assertEqual(len(attempt), 1)
+        self.assertEqual(attempt.state, "sent")
+        self.assertTrue(attempt.document_number)
+
+    def test_a_processing_invoice_refuses_a_second_request(self):
+        """Whatever happened, sending it again could duplicate the voucher."""
+        invoice = self._crashed_invoice()
+        sent_before = len(self.service.requests)
+        with self.assertRaisesRegex(UserError, "already in flight"):
+            self._authorize(invoice)
+        self.assertEqual(len(self.service.requests), sent_before)
+
+    def test_the_reconciler_recovers_an_invoice_left_processing(self):
+        """Nothing stays `processing` forever."""
+        invoice = self._crashed_invoice()
+        self._make_stale(invoice.l10n_ar_arca_attempt_ids)
+
+        self.env["l10n_ar.arca.attempt"]._cron_reconcile_open_attempts()
+
+        self.assertEqual(invoice.l10n_ar_arca_state, "pending")
+        self.assertEqual(invoice.l10n_ar_arca_attempt_ids.state, "aborted")
+        self._authorize(invoice)
+        self.assertEqual(invoice.l10n_ar_arca_state, "authorized")
+
+    def test_the_reconciler_recovers_a_voucher_arca_did_authorize(self):
+        """The crash happened after ARCA recorded it."""
+        invoice = self._crashed_invoice()
+        attempt = invoice.l10n_ar_arca_attempt_ids
+        self.service.known_vouchers[
+            (attempt.pos_number, attempt.document_type_code, attempt.document_number)
+        ] = "70888888888888"
+        self._make_stale(attempt)
+
+        self.env["l10n_ar.arca.attempt"]._cron_reconcile_open_attempts()
+
+        self.assertEqual(invoice.l10n_ar_arca_state, "authorized")
+        self.assertEqual(invoice.l10n_ar_arca_cae, "70888888888888")
+
+    def test_the_reconciler_leaves_a_request_that_may_still_be_running(self):
+        """A fresh attempt could be on the wire; asking ARCA now would race it."""
+        invoice = self._crashed_invoice()
+        attempt = invoice.l10n_ar_arca_attempt_ids
+
+        self.env["l10n_ar.arca.attempt"]._cron_reconcile_open_attempts()
+
+        self.assertEqual(attempt.state, "sent")
+        self.assertEqual(invoice.l10n_ar_arca_state, "processing")
+        self.assertFalse(self.service.consultations)
+
+    def _make_stale(self, attempt):
+        """Age the attempt past the point where it could still be in flight."""
+        attempt.sudo().write(
+            {
+                "sent_at": fields.Datetime.now()
+                - datetime.timedelta(minutes=STALE_ATTEMPT_MINUTES + 1)
+            }
+        )

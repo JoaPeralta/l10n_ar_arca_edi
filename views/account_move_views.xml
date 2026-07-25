@@ -22,7 +22,7 @@
                     type="object"
                     string="Reconcile with ARCA"
                     class="btn-warning"
-                    invisible="l10n_ar_arca_state != 'uncertain'"
+                    invisible="l10n_ar_arca_state not in ('uncertain', 'processing')"
                     groups="account.group_account_invoice"/>
                 <field name="l10n_ar_arca_state"
                     widget="statusbar"
@@ -49,6 +49,12 @@
                         A request was sent to ARCA and the answer was lost, so it is
                         unknown whether this invoice was authorized. Use
                         "Reconcile with ARCA" to find out. Do not issue it again.
+                    </div>
+                    <div class="alert alert-info" role="alert"
+                        invisible="l10n_ar_arca_state != 'processing'">
+                        A request for this invoice is in flight. If the process that
+                        started it stopped, the scheduled reconciliation will settle
+                        it against ARCA; "Reconcile with ARCA" does the same now.
                     </div>
                     <group>
                         <group string="Authorization">

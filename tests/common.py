@@ -215,10 +215,13 @@ class ArcaTestCommon(TestArCommon):
     def _authorize(self, invoice):
         """Run the authorization protocol.
 
-        The checkpoint commits are no-ops under tests, so the ordering is still
-        exercised without breaking the test cursor.
+        Enters through the same method the button uses, so the transaction
+        handling is exercised rather than bypassed. Under tests the fiscal
+        transaction shares the test cursor and its commits become flushes; the
+        transaction machinery itself is covered in test_concurrency.py, which
+        uses real connections and no ORM data.
         """
-        return invoice._l10n_ar_arca_authorize()
+        return invoice._l10n_ar_arca_request_cae()
 
     def _authorize_expecting_failure(self, invoice, message=None):
         """Authorize, expect it to fail, and keep what it recorded.
@@ -230,7 +233,7 @@ class ArcaTestCommon(TestArCommon):
         that threw them away would be asserting the opposite of the design.
         """
         try:
-            invoice._l10n_ar_arca_authorize()
+            invoice._l10n_ar_arca_request_cae()
         except UserError as exc:
             if message:
                 self.assertRegex(str(exc), message)

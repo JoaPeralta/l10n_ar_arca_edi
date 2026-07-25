@@ -1,12 +1,24 @@
 # Copyright 2026 Leonobitech
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
 
+import datetime
 import logging
 import uuid
 
-from odoo import _, api, fields, models, modules
+from odoo import _, api, fields, models
+
+from .arca_errors import ArcaSequenceBusy
+from .fiscal_transaction import fiscal_transaction
 
 _logger = logging.getLogger(__name__)
+
+# How long a request may still be on the wire before we consider it dead.
+# Comfortably above the transport timeouts, so a live request is never
+# mistaken for an abandoned one. The sequence lock already keeps the
+# reconciler out of a running protocol; this is the second line of defence,
+# for the case where the process holding the lock died and PostgreSQL
+# released it.
+STALE_ATTEMPT_MINUTES = 5
 
 
 class L10nArArcaAttempt(models.Model):
@@ -236,30 +248,62 @@ class L10nArArcaAttempt(models.Model):
         )
         return True
 
+    def _reconcile_isolated(self):
+        """Reconcile on a transaction of our own, holding the sequence lock.
+
+        Taking the lock is what keeps the reconciler from racing a live
+        protocol: an authorization in flight holds it for its whole duration, so
+        a locked sequence means somebody is working and there is nothing to
+        recover.
+        """
+        self.ensure_one()
+        lock_key = self.env["account.move"]._l10n_ar_arca_lock_key(
+            self.company_id.id, self.pos_number, self.document_type_code
+        )
+        try:
+            with fiscal_transaction(self.env, lock_key) as fiscal:
+                attempt = fiscal.env["l10n_ar.arca.attempt"].browse(self.id)
+                attempt._reconcile()
+                fiscal.checkpoint()
+        except ArcaSequenceBusy:
+            _logger.debug(
+                "ARCA attempt %s left for later: its sequence is in use.",
+                self.correlation_id,
+            )
+            return False
+        except Exception as exc:  # noqa: BLE001 - one attempt must not stop the rest
+            _logger.warning(
+                "Could not reconcile ARCA attempt %s: %s", self.correlation_id, exc
+            )
+            return False
+        return True
+
     @api.model
     def _cron_reconcile_open_attempts(self, limit=50):
-        """Close attempts whose answer was lost.
+        """Close attempts whose answer never arrived.
 
         Runs unattended: an invoice must never sit in an unknown fiscal state
-        just because nobody pressed a button.
+        just because nobody pressed a button. This is also what recovers an
+        invoice left in `processing` by a process that died mid-request -- the
+        attempt row survived the crash, and asking ARCA settles it.
+
+        An attempt still in `sent` state is only touched once it is too old to
+        be in flight. `uncertain` attempts are taken immediately: their request
+        has already finished, badly.
         """
+        stale_before = fields.Datetime.now() - datetime.timedelta(
+            minutes=STALE_ATTEMPT_MINUTES
+        )
         open_attempts = self.search(
-            [("state", "in", ("sent", "uncertain"))],
+            [
+                ("state", "in", ("sent", "uncertain")),
+                "|",
+                ("state", "=", "uncertain"),
+                ("sent_at", "<", stale_before),
+            ],
             order="id asc",
             limit=limit,
         )
-        in_test = modules.module.current_test
         for attempt in open_attempts:
-            try:
-                attempt._reconcile()
-                if not in_test:
-                    self.env.cr.commit()
-            except Exception as exc:  # noqa: BLE001 - one bad attempt must not stop the rest
-                if not in_test:
-                    self.env.cr.rollback()
-                _logger.warning(
-                    "Could not reconcile ARCA attempt %s: %s",
-                    attempt.correlation_id,
-                    exc,
-                )
+            attempt._reconcile_isolated()
         return True
