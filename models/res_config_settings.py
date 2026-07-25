@@ -13,6 +13,10 @@ class ResConfigSettings(models.TransientModel):
         related="company_id.l10n_ar_arca_certificate_id",
         readonly=False,
     )
+    l10n_ar_arca_auto_request_cae = fields.Boolean(
+        related="company_id.l10n_ar_arca_auto_request_cae",
+        readonly=False,
+    )
 
     # --- Inline certificate setup fields ---
 

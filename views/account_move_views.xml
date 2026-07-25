@@ -6,57 +6,184 @@
         <field name="model">account.move</field>
         <field name="inherit_id" ref="account.view_move_form"/>
         <field name="arch" type="xml">
-            <!-- Add CAE button in the header -->
             <xpath expr="//header" position="inside">
-                <button name="action_request_cae"
+                <!--
+                    Deliberately not a "Retry" button: retrying blindly is what
+                    duplicates fiscal documents. An invoice whose outcome is
+                    unknown offers reconciliation instead, and nothing else.
+                -->
+                <button name="action_l10n_ar_arca_authorize"
                     type="object"
                     string="Request CAE"
-                    class="btn-secondary"
-                    invisible="l10n_ar_arca_cae or state != 'posted' or country_code != 'AR'"
+                    class="btn-primary"
+                    invisible="l10n_ar_arca_state not in ('pending', 'rejected') or state != 'posted'"
                     groups="account.group_account_invoice"/>
-                <button name="action_verify_arca"
+                <button name="action_l10n_ar_arca_reconcile"
                     type="object"
-                    string="Verify CAE"
-                    class="btn-secondary"
-                    invisible="not l10n_ar_arca_cae or state != 'posted' or country_code != 'AR'"
+                    string="Reconcile with ARCA"
+                    class="btn-warning"
+                    invisible="l10n_ar_arca_state != 'uncertain'"
                     groups="account.group_account_invoice"/>
+                <field name="l10n_ar_arca_state"
+                    widget="statusbar"
+                    invisible="l10n_ar_arca_state == 'not_required'"
+                    statusbar_visible="pending,authorized"/>
             </xpath>
-            <!-- Add ARCA fields in a new page -->
+
+            <xpath expr="//div[hasclass('oe_button_box')]" position="inside">
+                <button name="action_l10n_ar_arca_view_attempts"
+                    type="object"
+                    class="oe_stat_button"
+                    icon="fa-paper-plane"
+                    invisible="l10n_ar_arca_attempt_count == 0"
+                    groups="account.group_account_invoice">
+                    <field name="l10n_ar_arca_attempt_count" widget="statinfo" string="ARCA Requests"/>
+                </button>
+            </xpath>
+
             <xpath expr="//page[@id='other_tab']" position="after">
                 <page string="ARCA" name="arca_tab"
-                    invisible="country_code != 'AR' or not l10n_ar_arca_cae">
+                    invisible="l10n_ar_arca_state == 'not_required'">
+                    <div class="alert alert-warning" role="alert"
+                        invisible="l10n_ar_arca_state != 'uncertain'">
+                        A request was sent to ARCA and the answer was lost, so it is
+                        unknown whether this invoice was authorized. Use
+                        "Reconcile with ARCA" to find out. Do not issue it again.
+                    </div>
                     <group>
-                        <group string="Electronic Invoice">
-                            <field name="l10n_ar_arca_cae"/>
-                            <field name="l10n_ar_arca_cae_due_date"/>
-                            <field name="l10n_ar_arca_result" widget="badge"
-                                decoration-success="l10n_ar_arca_result == 'A'"
-                                decoration-danger="l10n_ar_arca_result == 'R'"
-                                decoration-warning="l10n_ar_arca_result == 'O'"/>
+                        <group string="Authorization">
+                            <field name="l10n_ar_arca_cae"
+                                invisible="l10n_ar_arca_state != 'authorized'"/>
+                            <field name="l10n_ar_arca_cae_due_date"
+                                invisible="l10n_ar_arca_state != 'authorized'"/>
+                            <field name="l10n_latam_document_number" readonly="1"/>
                         </group>
-                        <group string="Barcode">
-                            <field name="l10n_ar_arca_barcode"/>
+                        <group string="Problem" invisible="not l10n_ar_arca_error_message">
+                            <field name="l10n_ar_arca_error_code"/>
+                            <field name="l10n_ar_arca_error_message"/>
                         </group>
                     </group>
-                    <group string="Observations"
+                    <group string="Remarks from ARCA"
                         invisible="not l10n_ar_arca_observations">
                         <field name="l10n_ar_arca_observations" nolabel="1"/>
                     </group>
+                    <field name="l10n_ar_arca_attempt_ids" nolabel="1" readonly="1">
+                        <list string="Requests" create="false" delete="false">
+                            <field name="sent_at"/>
+                            <field name="document_type_code"/>
+                            <field name="pos_number"/>
+                            <field name="document_number"/>
+                            <field name="state"
+                                decoration-success="state == 'authorized'"
+                                decoration-danger="state == 'rejected'"
+                                decoration-warning="state in ('sent', 'uncertain')"
+                                widget="badge"/>
+                            <field name="cae"/>
+                            <field name="duration_ms" optional="hide"/>
+                            <field name="error_message" optional="hide"/>
+                        </list>
+                    </field>
                 </page>
             </xpath>
         </field>
     </record>
 
-    <!-- Show CAE in list view -->
     <record id="account_move_view_list_arca" model="ir.ui.view">
         <field name="name">account.move.list.arca</field>
         <field name="model">account.move</field>
         <field name="inherit_id" ref="account.view_move_tree"/>
         <field name="arch" type="xml">
             <xpath expr="//field[@name='state']" position="before">
+                <field name="l10n_ar_arca_state" optional="hide" string="ARCA"
+                    decoration-success="l10n_ar_arca_state == 'authorized'"
+                    decoration-danger="l10n_ar_arca_state == 'rejected'"
+                    decoration-warning="l10n_ar_arca_state == 'uncertain'"
+                    widget="badge"/>
                 <field name="l10n_ar_arca_cae" optional="hide" string="CAE"/>
             </xpath>
         </field>
     </record>
+
+    <record id="l10n_ar_arca_attempt_view_list" model="ir.ui.view">
+        <field name="name">l10n_ar.arca.attempt.list</field>
+        <field name="model">l10n_ar.arca.attempt</field>
+        <field name="arch" type="xml">
+            <list string="ARCA Attempts" create="false" delete="false">
+                <field name="sent_at"/>
+                <field name="move_id"/>
+                <field name="company_id" groups="base.group_multi_company"/>
+                <field name="environment"/>
+                <field name="pos_number"/>
+                <field name="document_type_code"/>
+                <field name="document_number"/>
+                <field name="state" widget="badge"
+                    decoration-success="state == 'authorized'"
+                    decoration-danger="state == 'rejected'"
+                    decoration-warning="state in ('sent', 'uncertain')"/>
+                <field name="cae"/>
+            </list>
+        </field>
+    </record>
+
+    <record id="l10n_ar_arca_attempt_view_form" model="ir.ui.view">
+        <field name="name">l10n_ar.arca.attempt.form</field>
+        <field name="model">l10n_ar.arca.attempt</field>
+        <field name="arch" type="xml">
+            <form string="ARCA Attempt" create="false" edit="false">
+                <header>
+                    <button name="action_reconcile" type="object"
+                        string="Reconcile with ARCA" class="btn-primary"
+                        invisible="state not in ('sent', 'uncertain')"/>
+                    <field name="state" widget="statusbar"/>
+                </header>
+                <sheet>
+                    <group>
+                        <group string="Document">
+                            <field name="move_id"/>
+                            <field name="company_id" groups="base.group_multi_company"/>
+                            <field name="environment"/>
+                            <field name="cuit"/>
+                            <field name="pos_number"/>
+                            <field name="document_type_code"/>
+                            <field name="document_number"/>
+                        </group>
+                        <group string="Outcome">
+                            <field name="sent_at"/>
+                            <field name="resolved_at"/>
+                            <field name="duration_ms"/>
+                            <field name="cae"/>
+                            <field name="cae_due_date"/>
+                            <field name="error_code"/>
+                            <field name="correlation_id"/>
+                        </group>
+                    </group>
+                    <group string="Problem" invisible="not error_message">
+                        <field name="error_message" nolabel="1"/>
+                    </group>
+                    <notebook>
+                        <page string="Request Sent" name="request">
+                            <field name="request_payload" widget="ace" options="{'mode': 'json'}"/>
+                        </page>
+                        <page string="Response" name="response">
+                            <field name="response_payload"/>
+                        </page>
+                    </notebook>
+                </sheet>
+            </form>
+        </field>
+    </record>
+
+    <record id="l10n_ar_arca_attempt_action" model="ir.actions.act_window">
+        <field name="name">ARCA Authorization Attempts</field>
+        <field name="res_model">l10n_ar.arca.attempt</field>
+        <field name="view_mode">list,form</field>
+    </record>
+
+    <menuitem id="l10n_ar_arca_attempt_menu"
+        name="ARCA Authorizations"
+        parent="account.menu_finance_entries_management"
+        action="l10n_ar_arca_attempt_action"
+        groups="account.group_account_manager"
+        sequence="90"/>
 
 </odoo>

@@ -114,6 +114,11 @@
                             icon="fa-plug"/>
                     </setting>
 
+                    <setting string="Request CAE automatically"
+                        help="Request the CAE as soon as an invoice is posted. The request runs after the invoice is committed, so an ARCA failure never undoes the posting."
+                        invisible="l10n_ar_arca_cert_state != 'active'">
+                        <field name="l10n_ar_arca_auto_request_cae"/>
+                    </setting>
 
                 </block>
             </xpath>
