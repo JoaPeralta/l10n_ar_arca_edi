@@ -132,15 +132,20 @@ company**, upload the certificate, and set the journal's ARCA POS system to
 
 ```bash
 odoo -d <db> -i l10n_ar_arca_edi --test-enable \
-     --test-tags '/l10n_ar_arca_edi,-arca_homologation,-arca_homologation_emission' \
+     --test-tags '/l10n_ar_arca_edi,-arca_homologation' \
      --stop-after-init
 ```
 
-Tests that talk to the real homologación environment come in two halves and skip
-cleanly without credentials. `arca_homologation` reads only and consumes no
-voucher number; `arca_homologation_emission` issues a real one and additionally
-requires `ARCA_HOMO_ALLOW_EMISSION`. Neither can touch production: the
-environment is pinned to `testing` and asserted before every test.
+Everything that talks to the real homologación environment lives in one test
+method, tagged `arca_homologation`, and skips cleanly without credentials. It
+reads only, unless `ARCA_HOMO_ALLOW_EMISSION` is set — then it continues in that
+same method and issues one real voucher.
+
+One method, on purpose: ARCA issues a single access ticket per certificate and
+service and refuses a second while the first is alive, so a session split across
+several tests loses its cached ticket to Odoo's rollback and is then refused.
+Nothing here can touch production: the environment is pinned to `testing` and
+asserted before the first call.
 
 ## Audit
 

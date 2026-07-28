@@ -8,15 +8,26 @@ on:
     inputs:
       run_emission:
         description: >-
-          Also issue a real voucher in homologación. This consumes a number at
-          the configured point of sale and cannot be undone. Leave off to run
-          only the read-only checks.
+          Continue the same session with a real voucher in homologación. This
+          consumes a number at the configured point of sale and cannot be
+          undone. Leave off to run the read-only half and stop there. Either
+          way the run costs exactly one ARCA access ticket.
         type: boolean
         default: false
 
+# Ordinary CI is disposable and superseded by the next push, so it still
+# cancels. A manual run is not: by the time it is a few seconds old it may
+# already hold an ARCA access ticket, and cancelling it destroys the only copy
+# of a ticket ARCA keeps for twelve more hours. The next run is then refused
+# with "El CEE ya posee un TA valido para el acceso al WSN solicitado".
+#
+# The event name is part of the group, so a push and a workflow_dispatch can
+# never land in the same group and a push can never cancel a manual run.
+# Serialisation of the ARCA session itself is a separate, repository-wide group
+# on the homologation job below.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 env:
   # Pinned rather than floating: a build must be able to say exactly which
@@ -35,12 +46,23 @@ jobs:
           python-version: "3.12"
 
       - name: Install tooling
-        run: pip install --quiet ruff==0.6.9
+        run: pip install --quiet ruff==0.6.9 PyYAML==6.0.2
 
       # Correctness only. Enforcing a formatter upstream does not use would
       # bury real changes under a reformat of the whole module.
       - name: Ruff
         run: ruff check .
+
+      # The cooldown decides whether a run may talk to ARCA at all, and the
+      # design tests assert the properties that keep one run to one ticket.
+      # Both are offline: no token, no network, no ARCA.
+      - name: Workflow and cooldown tests
+        run: |
+          python -m unittest discover \
+            --start-directory .github/scripts \
+            --top-level-directory .github/scripts \
+            --pattern 'test_*.py' \
+            --verbose
 
       - name: Manifest is valid Python and declares what it needs
         run: |
@@ -172,7 +194,7 @@ jobs:
             --addons-path=/usr/lib/python3/dist-packages/odoo/addons,${GITHUB_WORKSPACE}/extra-addons \
             -i l10n_ar_arca_edi \
             --test-enable \
-            --test-tags '/l10n_ar_arca_edi,-arca_homologation,-arca_homologation_emission' \
+            --test-tags '/l10n_ar_arca_edi,-arca_homologation' \
             --without-demo=all \
             --log-level=info \
             --max-cron-threads=0 \
@@ -220,6 +242,23 @@ jobs:
     # Never automatic: this talks to ARCA, and it needs a certificate that
     # cannot live in the repository.
     if: github.event_name == 'workflow_dispatch'
+    # Repository-wide and branch-independent, because ARCA's limit is: one
+    # access ticket per certificate and service, whichever branch asked for it.
+    # Two sessions must queue, never overlap.
+    #
+    # cancel-in-progress is false for the same reason the workflow-level group
+    # spares manual runs: after loginCms has returned, the ticket exists at ARCA
+    # for twelve hours and the only copy lives in a database this run is about
+    # to throw away. Cancelling here does not stop that ticket from existing --
+    # it just guarantees the next run is refused.
+    concurrency:
+      group: arca-homologation-${{ github.repository }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      # Read-only, and only so the cooldown can ask when the previous manual run
+      # last reached ARCA.
+      actions: read
     container:
       image: odoo:19.0-20260723
       options: --user root
@@ -259,7 +298,29 @@ jobs:
             echo "available=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Read-only checks against ARCA homologación
+      # Runs before anything that could reach ARCA. A ticket obtained by an
+      # earlier run outlives that run by twelve hours, and no database here has
+      # a copy of it, so starting too soon is not a risk -- it is a guaranteed
+      # refusal that costs a real ARCA call to discover.
+      #
+      # Being blocked leaves the session step below as `skipped`, which the
+      # cooldown reads as "never reached ARCA": a refused attempt does not
+      # restart the clock it was refused by.
+      - name: Refuse to start while a previous ticket may still be alive
+        if: steps.creds.outputs.available == 'true'
+        env:
+          # The job token, nothing else. No PAT, no new secret, and no fiscal
+          # value is read by this script.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 "${GITHUB_WORKSPACE}/extra-addons/l10n_ar_arca_edi/.github/scripts/arca_cooldown.py"
+
+      # One invocation, one database, one process, one access ticket. Reads
+      # first; when the run asked for it, the emission continues inside the very
+      # same test method, so it reuses the ticket the reads obtained instead of
+      # authenticating again.
+      - name: ARCA network session
+        id: session
         if: steps.creds.outputs.available == 'true'
         env:
           ARCA_HOMO_CERT_HOLDER_CUIT: ${{ secrets.ARCA_HOMO_CERT_HOLDER_CUIT }}
@@ -267,7 +328,12 @@ jobs:
           ARCA_HOMO_CERT: ${{ secrets.ARCA_HOMO_CERT }}
           ARCA_HOMO_PRIVATE_KEY: ${{ secrets.ARCA_HOMO_PRIVATE_KEY }}
           ARCA_HOMO_POS: ${{ secrets.ARCA_HOMO_POS }}
+          # Two gates on purpose: the run has to ask for it, and the session
+          # itself still requires this variable. A voucher number cannot be
+          # un-consumed, so neither gate is implied by having the credentials.
+          ARCA_HOMO_ALLOW_EMISSION: ${{ inputs.run_emission && '1' || '' }}
         run: |
+          set -o pipefail
           odoo \
             --db_host=db --db_user=odoo --db_password=odoo \
             -d homo_l10n_ar_arca_edi \
@@ -278,31 +344,35 @@ jobs:
             --without-demo=all \
             --log-level=info \
             --max-cron-threads=0 \
-            --stop-after-init
+            --stop-after-init 2>&1 | tee arca-homologation.log
 
-      - name: Issue a real voucher in homologación
-        # Two gates on purpose: the run has to ask for it, and the suite itself
-        # still requires the opt-in variable. A voucher number cannot be
-        # un-consumed, so neither gate is implied by having the credentials.
-        if: >-
-          steps.creds.outputs.available == 'true' &&
-          inputs.run_emission
-        env:
-          ARCA_HOMO_CERT_HOLDER_CUIT: ${{ secrets.ARCA_HOMO_CERT_HOLDER_CUIT }}
-          ARCA_HOMO_REPRESENTED_CUIT: ${{ secrets.ARCA_HOMO_REPRESENTED_CUIT }}
-          ARCA_HOMO_CERT: ${{ secrets.ARCA_HOMO_CERT }}
-          ARCA_HOMO_PRIVATE_KEY: ${{ secrets.ARCA_HOMO_PRIVATE_KEY }}
-          ARCA_HOMO_POS: ${{ secrets.ARCA_HOMO_POS }}
-          ARCA_HOMO_ALLOW_EMISSION: "1"
+      # The regression this whole design exists to prevent, caught mechanically.
+      # Counts the module's own log line; the token and the sign are never
+      # logged, and nothing here searches for them.
+      - name: Exactly one WSAA ticket was requested
+        if: always() && steps.session.outcome != 'skipped'
         run: |
-          odoo \
-            --db_host=db --db_user=odoo --db_password=odoo \
-            -d homo_emission_l10n_ar_arca_edi \
-            --addons-path=/usr/lib/python3/dist-packages/odoo/addons,${GITHUB_WORKSPACE}/extra-addons \
-            -i l10n_ar_arca_edi \
-            --test-enable \
-            --test-tags 'arca_homologation_emission' \
-            --without-demo=all \
-            --log-level=info \
-            --max-cron-threads=0 \
-            --stop-after-init
+          set -euo pipefail
+          if [ ! -f arca-homologation.log ]; then
+            echo "::error::The session produced no log, so the number of ARCA tickets it took cannot be established."
+            exit 1
+          fi
+          requests=$(grep -c 'WSAA: requesting a ticket for service' arca-homologation.log || true)
+          if [ "$requests" -eq 1 ]; then
+            echo "One access ticket was requested, as designed."
+            exit 0
+          fi
+          if [ "$requests" -eq 0 ]; then
+            echo "::error::The session never authenticated; no WSAA ticket was requested."
+          else
+            echo "::error::$requests WSAA tickets were requested in one session. ARCA issues one per certificate and service; the second is refused and the first is orphaned."
+          fi
+          exit 1
+
+      - name: Upload the session log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: arca-homologation-log
+          path: arca-homologation.log
+          if-no-files-found: ignore

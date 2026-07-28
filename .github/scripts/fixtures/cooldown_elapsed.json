@@ -1,0 +1,37 @@
+{
+  "_comment": "The step started 12 h 16 min before now. One minute earlier and it would still be blocked; the boundary is asserted from both sides.",
+  "now": "2026-07-28T12:00:00Z",
+  "current_run_id": 1000,
+  "runs": [
+    {
+      "id": 600,
+      "status": "completed",
+      "conclusion": "success",
+      "event": "workflow_dispatch",
+      "created_at": "2026-07-27T23:40:00Z",
+      "run_started_at": "2026-07-27T23:40:00Z",
+      "updated_at": "2026-07-27T23:55:00Z",
+      "html_url": "https://github.test/run/600"
+    }
+  ],
+  "jobs": {
+    "600": [
+      {
+        "name": "ARCA homologación (real)",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-07-27T23:41:00Z",
+        "steps": [
+          {
+            "name": "ARCA network session",
+            "status": "completed",
+            "conclusion": "success",
+            "number": 4,
+            "started_at": "2026-07-27T23:44:00Z",
+            "completed_at": "2026-07-27T23:54:00Z"
+          }
+        ]
+      }
+    ]
+  }
+}

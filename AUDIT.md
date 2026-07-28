@@ -382,12 +382,72 @@ split in two: a read-only half that consumes no voucher number, and an emission
 half that issues a real one and requires `ARCA_HOMO_ALLOW_EMISSION` on top of
 the credentials.
 
+## Fourth round: one run, one access ticket
+
+Baseline for this round: `879e2d115420af71c3fe59bab464d25396dece65`. Found by
+running the homologación workflow for real.
+
+Authentication worked. ARCA accepted the homologación certificate, WSAA returned
+a token and a sign for `wsfe`, the ticket was valid for roughly twelve hours, and
+`FEDummy` answered. The run still failed, and ARCA was right:
+
+    El CEE ya posee un TA valido para el acceso al WSN solicitado
+
+### R8 - The session was split across seven test methods
+
+The read-only checks were seven separate `test_*` methods. Odoo rolls the test
+transaction back at the end of each one, and the WSAA ticket cache lives in the
+database, so the second method started with no copy of the ticket the first had
+obtained -- while ARCA still held it for another twelve hours. Every method after
+the first asked for a ticket that already existed.
+
+Retrying was never the answer, and neither was suppressing the error: ARCA
+reports the truth, and R3's persistence mechanism is what production depends on.
+The defect was in the shape of the external test. It is now a single
+`test_homologation_session`, and the optional emission continues inside that same
+method rather than in a class of its own. One certificate, one database, one
+transaction, one cache, one process, one ticket. After the reuse check the
+session leaves a stand-in over `_authenticate`, so a second request fails
+in-process instead of reaching ARCA.
+
+### R9 - The workflow started a second Odoo on a second database
+
+Emission ran as its own step, with its own `-d`, which by construction could not
+see the ticket the read-only step had obtained. The two steps are now one, `ARCA
+network session`, and `ARCA_HOMO_ALLOW_EMISSION` is set from the `run_emission`
+input on that single invocation. The step's output is captured and the number of
+`WSAA: requesting a ticket for service` lines is asserted to be exactly one, so a
+regression fails the build rather than ARCA.
+
+### R10 - A cancelled run left a ticket nobody held
+
+The workflow cancelled in-progress runs on any new one, including manual ones.
+A run cancelled after `loginCms` returned does not cancel the ticket: ARCA keeps
+it for twelve hours while the database holding the only copy is discarded.
+
+Manual runs are now never cancelled automatically -- the event name is part of
+the workflow concurrency group, so a push can never share a group with a
+`workflow_dispatch` -- and the ARCA job carries a repository-wide,
+branch-independent group with `cancel-in-progress: false`, so two sessions queue
+instead of overlapping.
+
+On top of that, `.github/scripts/arca_cooldown.py` runs before any step that can
+reach the network. It reads the previous manual runs through the Actions API with
+the job's own `GITHUB_TOKEN` and refuses to start until 12 h 15 min after the last
+run whose network step actually began. It ignores the current run, runs it
+blocked itself, and steps recorded as `skipped`; it recognises the historic step
+names; and anything it cannot classify counts as risky. A blocked attempt never
+reaches the network step, so it does not extend its own cooldown.
+
 ## Verification status
 
 Wording used deliberately, per the brief:
 
 - **Static review**: all findings above.
 - **Unit tests**: see `tests/`, run in CI against Odoo 19 + PostgreSQL.
-- **Real homologación**: infrastructure ready, not executed - no certificate
-  available. See `tests/test_homologation.py` and `readme/CONFIGURE.rst`.
+- **Real homologación**: authentication executed and confirmed - ARCA accepted
+  the certificate, WSAA issued a ticket for `wsfe`, and `FEDummy` answered. The
+  rest of the session was not completed: the run failed on R8 and the session was
+  rebuilt around one ticket. No voucher has been issued. See
+  `tests/test_homologation.py` and `readme/CONFIGURE.rst`.
 - **Production**: not enabled, not configured, nothing sent.

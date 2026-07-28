@@ -1,0 +1,45 @@
+{
+  "_comment": "A run from the two-step workflow, which authenticated twice. Renaming the step must not lose the cooldown it earned: the later of the two starts is the one that counts.",
+  "now": "2026-07-28T12:00:00Z",
+  "current_run_id": 1000,
+  "runs": [
+    {
+      "id": 800,
+      "status": "completed",
+      "conclusion": "success",
+      "event": "workflow_dispatch",
+      "created_at": "2026-07-28T10:25:00Z",
+      "run_started_at": "2026-07-28T10:25:00Z",
+      "updated_at": "2026-07-28T11:00:00Z",
+      "html_url": "https://github.test/run/800"
+    }
+  ],
+  "jobs": {
+    "800": [
+      {
+        "name": "ARCA homologación (real)",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-07-28T10:26:00Z",
+        "steps": [
+          {
+            "name": "Read-only checks against ARCA homologación",
+            "status": "completed",
+            "conclusion": "success",
+            "number": 3,
+            "started_at": "2026-07-28T10:30:00Z",
+            "completed_at": "2026-07-28T10:40:00Z"
+          },
+          {
+            "name": "Issue a real voucher in homologación",
+            "status": "completed",
+            "conclusion": "success",
+            "number": 4,
+            "started_at": "2026-07-28T10:45:00Z",
+            "completed_at": "2026-07-28T10:55:00Z"
+          }
+        ]
+      }
+    ]
+  }
+}

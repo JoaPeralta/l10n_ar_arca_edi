@@ -157,15 +157,27 @@ authorized.
 Requesting the CAE automatically on post is available under
 **Request CAE automatically** and is off by default.
 
-Running the homologacion tests
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Running the homologacion session
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The suite in ``tests/test_homologation.py`` talks to the real homologacion
-environment. It comes in two halves, because they cost different things.
+``tests/test_homologation.py`` talks to the real homologacion environment. It
+holds exactly one test method, and that is the point.
 
-Both skip cleanly unless all five variables are set, and neither can touch
+WSAA issues one access ticket per certificate and service, valid for about
+twelve hours, and refuses to issue a second while the first is alive::
+
+   El CEE ya posee un TA valido para el acceso al WSN solicitado
+
+The ticket cache lives in the database, and Odoo rolls the test transaction back
+between test methods. A session split across several methods therefore throws
+away its copy of a ticket ARCA still holds, and every method after the first is
+refused. So the reads and the optional emission all happen inside one method:
+one certificate, one database, one transaction, one cache, one process, one
+ticket.
+
+It skips cleanly unless all five variables are set, and it cannot touch
 production: the certificate environment is pinned to ``testing`` and asserted
-before every test.
+before the first call.
 
 .. code-block:: bash
 
@@ -177,7 +189,7 @@ before every test.
    export ARCA_HOMO_PRIVATE_KEY="$(base64 -w0 homologacion.key)"
    export ARCA_HOMO_POS=1
 
-**Read-only.** Consumes no voucher number, so run it as often as you like:
+**Read-only.** Consumes no voucher number:
 
 .. code-block:: bash
 
@@ -185,20 +197,21 @@ before every test.
         --test-tags 'arca_homologation' --stop-after-init
 
 It checks that ``FEDummy`` answers, that WSAA issues a ticket for the holder,
-that the holder may act for the represented CUIT, that the point of sale is
-enabled for it, that the receptor VAT condition table still matches what ARCA
-reports, that the last authorized number is readable, and that querying a
-voucher that does not exist returns nothing -- the behaviour reconciliation
-depends on.
+that a second request for the same ticket is served from the cache, that the
+holder may act for the represented CUIT, that the point of sale is enabled for
+it, that the receptor VAT condition table still matches what ARCA reports, that
+the last authorized number is readable, and that querying a voucher that does
+not exist returns nothing -- the behaviour reconciliation depends on.
 
-**Emission.** Issues a real voucher and consumes a number, so it needs an
-explicit opt-in on top of the credentials:
+**Emission.** The same command, the same session, one extra variable. It
+continues after the reads and issues one real voucher, reusing the ticket the
+reads obtained:
 
 .. code-block:: bash
 
    export ARCA_HOMO_ALLOW_EMISSION=1
    odoo -d <db> -i l10n_ar_arca_edi --test-enable \
-        --test-tags 'arca_homologation_emission' --stop-after-init
+        --test-tags 'arca_homologation' --stop-after-init
 
 It authorizes an invoice end to end and reads it back with ``FECompConsultar``,
 checking that ARCA filed it under the represented CUIT.
@@ -208,9 +221,33 @@ checking that ARCA filed it under the represented CUIT.
    Use a point of sale reserved for testing. A consumed number cannot be
    returned.
 
-In CI both live in a manually triggered job. The read-only half runs whenever
-the secrets are configured; the emission half additionally requires the
-``run_emission`` input to be turned on for that run.
+.. note::
+
+   Odoo's numbering has to be aligned with ARCA's before an emission run: the
+   invoice number must be exactly one more than ``FECompUltimoAutorizado``.
+   The session says so and sends nothing when it is not.
+
+In CI
+~~~~~
+
+One manually triggered job, one Odoo invocation, one database. The
+``run_emission`` input decides whether ``ARCA_HOMO_ALLOW_EMISSION`` is set for
+that run; there is no second process and no second job.
+
+Three things protect the ticket:
+
+* **Cooldown.** ``.github/scripts/arca_cooldown.py`` runs before any step that
+  can reach the network and refuses to start until 12 h 15 min after the last
+  manual run whose ARCA step actually began. It uses only the job's
+  ``GITHUB_TOKEN`` and reads no fiscal value. Being blocked leaves the network
+  step ``skipped``, so a refused attempt does not extend its own cooldown.
+* **Exclusion.** The ARCA job takes a repository-wide, branch-independent
+  concurrency group with ``cancel-in-progress: false``. Two runs queue; they
+  never overlap, and a push can never cancel a manual run -- a cancellation
+  after ``loginCms`` would leave ARCA holding a ticket nobody has a copy of.
+* **Counting.** The step's output is captured and the number of
+  ``WSAA: requesting a ticket for service`` lines must be exactly one. Neither
+  the token nor the sign is ever logged, and nothing searches for them.
 
 The certificate and key are read from the environment and never written to the
 repository. The ``secrets`` job fails the build if key material is ever

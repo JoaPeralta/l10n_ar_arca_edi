@@ -1,0 +1,35 @@
+{
+  "_comment": "The only manual run listed is the one asking permission. Counting itself would make the cooldown permanent.",
+  "now": "2026-07-28T12:00:00Z",
+  "current_run_id": 1000,
+  "runs": [
+    {
+      "id": 1000,
+      "status": "in_progress",
+      "event": "workflow_dispatch",
+      "created_at": "2026-07-28T11:55:00Z",
+      "run_started_at": "2026-07-28T11:55:00Z",
+      "updated_at": "2026-07-28T11:56:00Z",
+      "html_url": "https://github.test/run/1000"
+    }
+  ],
+  "jobs": {
+    "1000": [
+      {
+        "name": "ARCA homologación (real)",
+        "status": "in_progress",
+        "started_at": "2026-07-28T11:55:30Z",
+        "steps": [
+          {
+            "name": "ARCA network session",
+            "status": "in_progress",
+            "conclusion": null,
+            "number": 4,
+            "started_at": "2026-07-28T11:57:00Z",
+            "completed_at": null
+          }
+        ]
+      }
+    ]
+  }
+}

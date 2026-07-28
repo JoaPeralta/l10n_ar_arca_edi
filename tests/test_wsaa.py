@@ -89,6 +89,26 @@ class TestWsaaTicketCache(ArcaTestCommon):
         self.assertEqual(first["token"], second["token"])
         self.assertEqual(self.authentications, ["wsfe"])
 
+    def test_a_second_call_cannot_reach_wsaa_at_all(self):
+        """What the homologación session relies on, asserted offline.
+
+        ARCA issues one ticket per certificate and service and refuses a second
+        while the first lives, so the session obtains one and reuses it for
+        everything. Here the second call is made against an ``_authenticate``
+        that fails on sight: reaching it at all is the bug.
+        """
+        first = self.wsaa._get_or_refresh_token(self.certificate, service="wsfe")
+
+        def refuse_to_authenticate(model, certificate, service):
+            raise AssertionError(f"A second ticket was requested for '{service}'")
+
+        self.patch(type(self.wsaa), "_authenticate", refuse_to_authenticate)
+        second = self.wsaa._get_or_refresh_token(self.certificate, service="wsfe")
+
+        self.assertEqual(second["token"], first["token"])
+        self.assertEqual(second["sign"], first["sign"])
+        self.assertEqual(self.authentications, ["wsfe"])
+
     def test_each_service_gets_its_own_ticket(self):
         """ARCA issues tickets per service; one cache entry per service."""
         wsfe = self.wsaa._get_or_refresh_token(self.certificate, service="wsfe")

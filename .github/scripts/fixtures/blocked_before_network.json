@@ -1,0 +1,53 @@
+{
+  "_comment": "A run this very preflight blocked. Its network step never ran, so it must not extend the cooldown it was refused by.",
+  "now": "2026-07-28T12:00:00Z",
+  "current_run_id": 1000,
+  "runs": [
+    {
+      "id": 900,
+      "status": "completed",
+      "conclusion": "failure",
+      "event": "workflow_dispatch",
+      "created_at": "2026-07-28T11:00:00Z",
+      "run_started_at": "2026-07-28T11:00:00Z",
+      "updated_at": "2026-07-28T11:02:00Z",
+      "html_url": "https://github.test/run/900"
+    }
+  ],
+  "jobs": {
+    "900": [
+      {
+        "name": "ARCA homologación (real)",
+        "status": "completed",
+        "conclusion": "failure",
+        "started_at": "2026-07-28T11:00:30Z",
+        "steps": [
+          {
+            "name": "Skip cleanly when no certificate is configured",
+            "status": "completed",
+            "conclusion": "success",
+            "number": 2,
+            "started_at": "2026-07-28T11:00:40Z",
+            "completed_at": "2026-07-28T11:00:41Z"
+          },
+          {
+            "name": "Refuse to start while a previous ticket may still be alive",
+            "status": "completed",
+            "conclusion": "failure",
+            "number": 3,
+            "started_at": "2026-07-28T11:00:42Z",
+            "completed_at": "2026-07-28T11:00:50Z"
+          },
+          {
+            "name": "ARCA network session",
+            "status": "completed",
+            "conclusion": "skipped",
+            "number": 4,
+            "started_at": null,
+            "completed_at": null
+          }
+        ]
+      }
+    ]
+  }
+}
