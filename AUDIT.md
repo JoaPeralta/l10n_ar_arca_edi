@@ -477,9 +477,9 @@ reaching it.
 The horizon is now stated from the three things that actually bound it:
 
     RELEVANCE_HORIZON = RERUN_ELIGIBILITY (30 days)
-                      + MAX_RUN_DURATION  (24 h)
+                      + MAX_RUN_DURATION  (35 days)
                       + COOLDOWN          (12 h 15 min)
-                      = 31 days, 12 h 15 min
+                      = 65 days, 12 h 15 min
 
 An attempt of a run created at `T` cannot have started its network step later
 than `T + RERUN_ELIGIBILITY + MAX_RUN_DURATION`, and only matters while that is
@@ -491,6 +491,21 @@ added to the listing when absent, so a re-run can always inspect its own earlier
 attempts even if the original run is old or falls past the defensive limit.
 Failing to read it blocks from attempt 2 on; on a first attempt there are no
 earlier attempts of its own to miss.
+
+### R14 - The run-duration bound was a job limit wearing the wrong name
+
+`MAX_RUN_DURATION` was first set to 24 h, justified by GitHub killing a job at
+six hours. That is the wrong limit: six hours caps how long a *job* may execute
+on a GitHub-hosted runner and says nothing about how long the run it belongs to
+can stay alive. GitHub caps a workflow run's total time -- execution, waiting and
+approval together -- at **35 days**.
+
+With the 24 h figure the horizon came to 31 days 12 h 15 min, so a page of
+forty-day-old runs looked like the end of the search and anything below it was
+never read, including a run created two months ago and re-run this morning.
+`MAX_RUN_DURATION` is now 35 days and the horizon is 65 days 12 h 15 min. The
+constant carries a comment saying which limit it is, because the two are easy to
+confuse and the cheaper one is the wrong one.
 
 ## Verification status
 

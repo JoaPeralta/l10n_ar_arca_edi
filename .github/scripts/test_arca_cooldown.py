@@ -13,6 +13,7 @@ import pathlib
 import sys
 import unittest
 import urllib.error
+from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
@@ -411,7 +412,7 @@ class TestPaging(unittest.TestCase):
         ]
         # Past the whole horizon: too old even to be re-run into relevance.
         ancient = [
-            build_run(8000 + index, "2026-06-01T11:00:00Z", "2026-06-01T11:01:00Z")
+            build_run(8000 + index, "2026-05-01T11:00:00Z", "2026-05-01T11:01:00Z")
             for index in range(10)
         ]
         asked = []
@@ -485,10 +486,14 @@ class TestTheRelevanceHorizon(unittest.TestCase):
     def test_the_rerun_window_is_thirty_days(self):
         self.assertEqual(arca_cooldown.RERUN_ELIGIBILITY, datetime.timedelta(days=30))
 
+    def test_the_run_bound_is_the_whole_run_limit_not_the_job_one(self):
+        """Six hours caps a job's execution. A run may live thirty-five days."""
+        self.assertEqual(arca_cooldown.MAX_RUN_DURATION, datetime.timedelta(days=35))
+
     def test_the_horizon_covers_rerun_plus_duration_plus_cooldown(self):
         self.assertEqual(
             arca_cooldown.RELEVANCE_HORIZON,
-            datetime.timedelta(days=31, hours=12, minutes=15),
+            datetime.timedelta(days=65, hours=12, minutes=15),
         )
         self.assertEqual(
             arca_cooldown.RELEVANCE_HORIZON,
@@ -546,31 +551,28 @@ class TestOldRunsWithRecentAttempts(unittest.TestCase):
             decision.next_allowed_at, datetime.datetime(2026, 7, 28, 21, 15, tzinfo=UTC)
         )
 
-    def test_paging_does_not_stop_inside_the_rerun_window(self):
-        """Twenty days old is still re-runnable, so it is still in scope."""
+    def test_a_forty_day_old_page_does_not_end_the_search(self):
+        """Forty days is inside the horizon: such a run can still be re-run."""
         within = [
-            build_run(9000 + index, "2026-07-08T11:00:00Z", "2026-07-08T11:01:00Z")
+            build_run(9000 + index, "2026-06-18T11:00:00Z", "2026-06-18T11:01:00Z")
             for index in range(10)
         ]
-        beyond = [
-            build_run(8000 + index, "2026-06-18T11:00:00Z", "2026-06-18T11:01:00Z")
-            for index in range(10)
-        ]
+        below = [build_run(200, "2026-06-17T11:00:00Z", "2026-07-28T09:30:00Z")]
         asked = []
 
         def fetch_page(page):
             asked.append(page)
-            return self.paged([*within, *beyond], 10)(page)
+            return self.paged([*within, *below], 10)(page)
 
         listing = arca_cooldown.paginate_runs(fetch_page, self.NOW, page_size=10)
         self.assertTrue(listing.complete, listing.detail)
-        # Page 1 is twenty days old: inside the window, so paging went on.
         self.assertEqual(asked, [1, 2])
+        self.assertIn(below[0], listing.runs)
 
     def test_paging_stops_past_the_whole_horizon(self):
-        """More than 31 days 12 h 15 min old: nothing below it can matter."""
+        """More than 65 days 12 h 15 min old: nothing below it can matter."""
         beyond = [
-            build_run(8000 + index, "2026-06-01T11:00:00Z", "2026-06-01T11:01:00Z")
+            build_run(8000 + index, "2026-05-01T11:00:00Z", "2026-05-01T11:01:00Z")
             for index in range(30)
         ]
         asked = []
@@ -583,6 +585,59 @@ class TestOldRunsWithRecentAttempts(unittest.TestCase):
         self.assertTrue(listing.complete, listing.detail)
         self.assertEqual(asked, [1])
         self.assertIn("older than", listing.detail)
+
+    def test_the_superseded_bound_would_have_stopped_too_soon(self):
+        """The 24 h bound was a job's execution limit, not a run's lifetime.
+
+        Under it, a page of forty-day-old runs looked like the end of the
+        search, and anything below it -- including a run re-run this morning --
+        was never read.
+        """
+        superseded = (
+            arca_cooldown.RERUN_ELIGIBILITY
+            + datetime.timedelta(hours=24)
+            + arca_cooldown.COOLDOWN
+        )
+        self.assertEqual(superseded, datetime.timedelta(days=31, hours=12, minutes=15))
+
+        within = [
+            build_run(9000 + index, "2026-06-18T11:00:00Z", "2026-06-18T11:01:00Z")
+            for index in range(10)
+        ]
+        # Created forty-one days ago, re-run this morning, and it reached ARCA.
+        risky = build_run(
+            200,
+            "2026-06-17T11:00:00Z",
+            updated_at="2026-07-28T09:30:00Z",
+            run_attempt=2,
+        )
+        pages = [*within, risky]
+
+        with mock.patch.object(arca_cooldown, "RELEVANCE_HORIZON", superseded):
+            stopped_early = arca_cooldown.paginate_runs(
+                self.paged(pages, 10), self.NOW, page_size=10
+            )
+        self.assertNotIn(risky, stopped_early.runs)
+
+        listing = arca_cooldown.paginate_runs(
+            self.paged(pages, 10), self.NOW, page_size=10
+        )
+        self.assertIn(risky, listing.runs)
+
+        jobs = {(run["id"], 1): skipped_job("2026-06-18T11:00:30Z") for run in within}
+        jobs[(200, 1)] = skipped_job("2026-06-17T11:00:30Z")
+        jobs[(200, 2)] = reaching_job("2026-07-28T09:00:00Z")
+
+        self.assertFalse(
+            arca_cooldown.evaluate(
+                stopped_early.runs, jobs, 1, self.NOW, listing=stopped_early
+            ).blocked
+        )
+        self.assertTrue(
+            arca_cooldown.evaluate(
+                listing.runs, jobs, 1, self.NOW, listing=listing
+            ).blocked
+        )
 
 
 class TestTheCurrentRunIsNeverMissed(unittest.TestCase):

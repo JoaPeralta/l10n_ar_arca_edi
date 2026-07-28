@@ -30,10 +30,11 @@ Paging
 ------
 Blocked and skipped attempts are cheap and can pile up, so a fixed page of the
 most recent runs can easily hide the one attempt that actually took a ticket.
-Worse, runs are listed by *creation*: GitHub allows a re-run for thirty days,
-so an attempt that talked to ARCA an hour ago can belong to a run created weeks
-back and sit that far down the list. The listing therefore pages across the
-whole re-run window before it can conclude anything, and blocks if it cannot.
+Worse, runs are listed by *creation*: GitHub allows a re-run for thirty days
+and lets a run live for thirty-five, so an attempt that talked to ARCA an hour
+ago can belong to a run created two months back and sit that far down the list.
+The listing therefore pages across that whole window before it can conclude
+anything, and blocks if it cannot.
 
 The current run is never left to paging luck: it is fetched by id and added to
 the listing, so a re-run can always inspect its own earlier attempts even when
@@ -76,20 +77,25 @@ USER_AGENT = "l10n-ar-arca-edi-cooldown/1.0"
 
 # Runs are listed newest first -- by creation, not by activity -- so paging can
 # stop once a page is old enough that nothing below it can matter. Working out
-# "old enough" takes two bounds:
+# "old enough" takes two of GitHub's documented limits, and neither is the six
+# hours people usually reach for: that one caps how long a *job* may execute on
+# a GitHub-hosted runner, which says nothing about how long the run it belongs
+# to can stay alive.
 #
-# * GitHub lets a run be re-run for thirty days after it was created, so a run
-#   created a fortnight ago can have an attempt that talked to ARCA this
-#   morning while sitting a fortnight down the list;
-# * a run created early can still finish late, and a step starts before its run
-#   ends. GitHub kills a job at six hours, so a day is generous past any doubt.
+# * A run may be re-run for thirty days after it was created, so a run created
+#   weeks ago can have an attempt that talked to ARCA this morning while
+#   sitting weeks down the list.
+# * A run's total time -- execution, waiting and approval together -- is capped
+#   at thirty-five days. That is the real bound on how late an attempt of a
+#   given run can still be starting steps.
 #
 # An attempt of a run created at T therefore cannot have started its network
 # step later than T + RERUN_ELIGIBILITY + MAX_RUN_DURATION, and only matters
 # while that is within one cooldown of now.
 PAGE_SIZE = 100
 RERUN_ELIGIBILITY = datetime.timedelta(days=30)
-MAX_RUN_DURATION = datetime.timedelta(hours=24)
+# The whole-run limit, not the per-job execution limit.
+MAX_RUN_DURATION = datetime.timedelta(days=35)
 RELEVANCE_HORIZON = RERUN_ELIGIBILITY + MAX_RUN_DURATION + COOLDOWN
 # Last resort only. Reaching it means the horizon was never proved, which is a
 # reason to block, not a reason to stop worrying.

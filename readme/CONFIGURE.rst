@@ -250,10 +250,12 @@ Three things protect the ticket:
 
   The listing pages until it can show that everything left is older than the
   window that matters. A fixed page would let a pile of blocked or skipped
-  attempts hide the one that took a ticket. That window spans 31 days 12 h
-  15 min, because runs are listed by *creation* and GitHub allows a re-run for
-  thirty days: an attempt that talked to ARCA this morning can belong to a run
-  created weeks ago. The current run is additionally fetched by id, so a re-run
+  attempts hide the one that took a ticket. That window spans 65 days 12 h
+  15 min, because runs are listed by *creation*, GitHub allows a re-run for
+  thirty days, and a run may live for thirty-five: an attempt that talked to
+  ARCA this morning can belong to a run created two months ago. (Six hours is
+  the limit on a *job's* execution, and is not the bound that applies here.)
+  The current run is additionally fetched by id, so a re-run
   can always inspect its own earlier attempts. If paging fails, if the current
   run cannot be read during a re-run, or if the defensive limit is reached, the
   run is blocked rather than waved through.
