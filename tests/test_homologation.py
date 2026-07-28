@@ -38,6 +38,7 @@ import os
 import unittest
 
 from odoo.tests import tagged
+from odoo.tests.common import TransactionCase
 
 from .common import ArcaTestCommon
 
@@ -69,12 +70,11 @@ def emission_allowed():
     return os.environ.get(EMISSION_OPT_IN, "").strip().lower() in ("1", "true", "yes")
 
 
-class ArcaHomologationCommon(ArcaTestCommon):
-    """A company invoicing through a real homologación certificate."""
+class HomologationCredentialMixin:
+    """Load the real testing certificate without choosing an accounting fixture."""
 
     @classmethod
-    def setUpClass(cls):
-        super().setUpClass()
+    def _configure_homologation_credentials(cls, company):
         credentials = homologation_credentials()
         if credentials is None:
             return
@@ -84,19 +84,16 @@ class ArcaHomologationCommon(ArcaTestCommon):
             ch for ch in credentials["ARCA_HOMO_REPRESENTED_CUIT"] if ch.isdigit()
         )
 
-        # The taxpayer being invoiced for is the company's own number: that is
-        # where every Auth.Cuit comes from.
-        cls.company_ri.partner_id.vat = cls.homo_represented_cuit
-        # The base class read the issuer before that write; keep the two in step
-        # so nothing here can assert against a stale number.
-        cls.issuer_cuit = cls.company_ri._l10n_ar_arca_issuer_cuit()
+        # Every WSFE Auth.Cuit comes from the company, not from the certificate
+        # holder. The two numbers deliberately differ in our real setup.
+        company.partner_id.vat = cls.homo_represented_cuit
 
         cls.homo_certificate = cls.env["l10n_ar.arca.certificate"].create(
             {
                 "name": "ARCA homologación",
-                "company_id": cls.company_ri.id,
+                "company_id": company.id,
                 "holder_cuit": credentials["ARCA_HOMO_CERT_HOLDER_CUIT"],
-                # Hard-coded: this suite must never touch production.
+                # Hard-coded: these tests must never touch production.
                 "environment": "testing",
             }
         )
@@ -106,24 +103,63 @@ class ArcaHomologationCommon(ArcaTestCommon):
         cls.homo_certificate.action_process_certificate(
             credentials["ARCA_HOMO_CERT"].encode()
         )
-        cls.company_ri.l10n_ar_arca_certificate_id = cls.homo_certificate
-        cls.arca_journal.l10n_ar_afip_pos_number = cls.homo_pos
+        company.l10n_ar_arca_certificate_id = cls.homo_certificate
 
-    def setUp(self):
-        super().setUp()
+    def _assert_homologation_identity(self, company):
         self.assertEqual(
             self.homo_certificate.environment,
             "testing",
             "This suite must never run against production",
         )
         self.assertEqual(
-            self.company_ri._l10n_ar_arca_issuer_cuit(), self.homo_represented_cuit
+            company._l10n_ar_arca_issuer_cuit(), self.homo_represented_cuit
         )
+
+
+class ArcaHomologationSmokeCommon(HomologationCredentialMixin, TransactionCase):
+    """Minimal fixture for read-only calls.
+
+    It intentionally does not inherit Odoo's large Argentine invoicing fixture:
+    authentication and parameter queries need no chart of accounts, taxes,
+    products, journals or invoice sequence. Keeping those out makes this class
+    runnable by itself on a fresh database, which is exactly how the workflow
+    invokes it.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        if homologation_credentials() is None:
+            return
+        cls.homo_company = cls.env.company
+        cls._configure_homologation_credentials(cls.homo_company)
+
+    def setUp(self):
+        super().setUp()
+        self._assert_homologation_identity(self.homo_company)
+
+
+class ArcaHomologationEmissionCommon(HomologationCredentialMixin, ArcaTestCommon):
+    """Full Argentine accounting fixture used only by the opt-in emission tests."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        if homologation_credentials() is None:
+            return
+        cls._configure_homologation_credentials(cls.company_ri)
+        # ArcaTestCommon read this before the represented CUIT was applied.
+        cls.issuer_cuit = cls.company_ri._l10n_ar_arca_issuer_cuit()
+        cls.arca_journal.l10n_ar_afip_pos_number = cls.homo_pos
+
+    def setUp(self):
+        super().setUp()
+        self._assert_homologation_identity(self.company_ri)
 
 
 @tagged("-standard", "external", "arca_homologation")
 @unittest.skipIf(homologation_credentials() is None, missing_credentials_reason())
-class TestArcaHomologationSmoke(ArcaHomologationCommon):
+class TestArcaHomologationSmoke(ArcaHomologationSmokeCommon):
     """Read-only round trips. No voucher number is consumed."""
 
     def test_service_is_reachable(self):
@@ -197,7 +233,7 @@ class TestArcaHomologationSmoke(ArcaHomologationCommon):
     emission_allowed(),
     f"Issuing a real voucher requires {EMISSION_OPT_IN} to be set explicitly",
 )
-class TestArcaHomologationEmission(ArcaHomologationCommon):
+class TestArcaHomologationEmission(ArcaHomologationEmissionCommon):
     """Issues a real voucher in homologación. Consumes a number."""
 
     def test_authorize_a_real_invoice(self):
