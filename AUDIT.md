@@ -432,12 +432,39 @@ branch-independent group with `cancel-in-progress: false`, so two sessions queue
 instead of overlapping.
 
 On top of that, `.github/scripts/arca_cooldown.py` runs before any step that can
-reach the network. It reads the previous manual runs through the Actions API with
-the job's own `GITHUB_TOKEN` and refuses to start until 12 h 15 min after the last
-run whose network step actually began. It ignores the current run, runs it
-blocked itself, and steps recorded as `skipped`; it recognises the historic step
-names; and anything it cannot classify counts as risky. A blocked attempt never
-reaches the network step, so it does not extend its own cooldown.
+reach the network. It reads the previous manual attempts through the Actions API
+with the job's own `GITHUB_TOKEN` and refuses to start until 12 h 15 min after
+the last attempt whose network step actually began. It ignores the current
+attempt, attempts it blocked itself, and steps recorded as `skipped`; it
+recognises the historic step names; and anything it cannot classify counts as
+risky. A blocked attempt never reaches the network step, so it does not extend
+its own cooldown.
+
+### R11 - The cooldown was blind to re-runs
+
+`GITHUB_RUN_ID` does not change when a run is re-run; only `GITHUB_RUN_ATTEMPT`
+does. The first version excluded the whole current run id, so attempt 2 of a run
+whose attempt 1 had obtained a ticket sailed straight past the cooldown and into
+the refusal it exists to prevent -- the original defect, one level down.
+
+The unit of work is now `(run_id, attempt)`. Only the current attempt is
+excluded, every earlier attempt of the same run is examined, and each is read
+from `/repos/{owner}/{repo}/actions/runs/{id}/attempts/{n}/jobs` rather than from
+the `filter=latest` view, which reports the newest attempt and therefore says
+nothing about the earlier ones.
+
+### R12 - The run listing stopped at a fixed 30
+
+Blocked and skipped attempts cost nothing and accumulate, so thirty recent runs
+could easily sit between the preflight and the one attempt that actually took a
+ticket. The listing now pages until it can show that everything left was created
+before the cooldown plus the longest a run could plausibly last. A paging failure,
+or reaching the defensive limit of 1000 runs, blocks: a listing that stopped early
+is not evidence that ARCA is free.
+
+The calls also identify themselves with a `User-Agent` of
+`l10n-ar-arca-edi-cooldown/1.0`, so a throttled or refused request can be traced
+back to its cause.
 
 ## Verification status
 

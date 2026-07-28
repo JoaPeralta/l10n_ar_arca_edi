@@ -1,0 +1,55 @@
+{
+  "_comment": "A re-run. GITHUB_RUN_ID is the same as attempt 1's, so excluding the run id would hide the ticket attempt 1 took. Only attempt 2 is the current one.",
+  "now": "2026-07-28T12:00:00Z",
+  "current_run_id": 400,
+  "current_attempt": 2,
+  "runs": [
+    {
+      "id": 400,
+      "run_attempt": 2,
+      "status": "in_progress",
+      "event": "workflow_dispatch",
+      "created_at": "2026-07-28T07:55:00Z",
+      "run_started_at": "2026-07-28T11:50:00Z",
+      "updated_at": "2026-07-28T11:52:00Z",
+      "html_url": "https://github.test/run/400"
+    }
+  ],
+  "jobs": {
+    "400#1": [
+      {
+        "name": "ARCA homologación (real)",
+        "status": "completed",
+        "conclusion": "failure",
+        "started_at": "2026-07-28T07:57:00Z",
+        "steps": [
+          {
+            "name": "ARCA network session",
+            "status": "completed",
+            "conclusion": "failure",
+            "number": 4,
+            "started_at": "2026-07-28T08:00:00Z",
+            "completed_at": "2026-07-28T08:12:00Z"
+          }
+        ]
+      }
+    ],
+    "400#2": [
+      {
+        "name": "ARCA homologación (real)",
+        "status": "in_progress",
+        "started_at": "2026-07-28T11:51:00Z",
+        "steps": [
+          {
+            "name": "Refuse to start while a previous ticket may still be alive",
+            "status": "in_progress",
+            "conclusion": null,
+            "number": 3,
+            "started_at": "2026-07-28T11:52:00Z",
+            "completed_at": null
+          }
+        ]
+      }
+    ]
+  }
+}

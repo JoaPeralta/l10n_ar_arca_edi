@@ -5,6 +5,7 @@
   "runs": [
     {
       "id": 1000,
+      "run_attempt": 1,
       "status": "in_progress",
       "event": "workflow_dispatch",
       "created_at": "2026-07-28T11:55:00Z",
@@ -14,7 +15,7 @@
     }
   ],
   "jobs": {
-    "1000": [
+    "1000#1": [
       {
         "name": "ARCA homologación (real)",
         "status": "in_progress",
@@ -31,5 +32,6 @@
         ]
       }
     ]
-  }
+  },
+  "current_attempt": 1
 }

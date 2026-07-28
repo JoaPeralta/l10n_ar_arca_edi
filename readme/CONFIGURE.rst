@@ -238,9 +238,20 @@ Three things protect the ticket:
 
 * **Cooldown.** ``.github/scripts/arca_cooldown.py`` runs before any step that
   can reach the network and refuses to start until 12 h 15 min after the last
-  manual run whose ARCA step actually began. It uses only the job's
+  manual *attempt* whose ARCA step actually began. It uses only the job's
   ``GITHUB_TOKEN`` and reads no fiscal value. Being blocked leaves the network
   step ``skipped``, so a refused attempt does not extend its own cooldown.
+
+  Attempts, not runs: a re-run keeps its ``GITHUB_RUN_ID`` and only advances
+  ``GITHUB_RUN_ATTEMPT``, so every earlier attempt of the same run is read from
+  its own ``/attempts/{n}/jobs`` endpoint and only the current attempt is
+  excluded. Re-running a session that already reached ARCA is refused; re-running
+  one that was blocked before the network is not.
+
+  The listing pages until it can show that everything left is older than the
+  window that matters. A fixed page would let a pile of blocked or skipped
+  attempts hide the one that took a ticket. If paging fails or hits its
+  defensive limit, the run is blocked rather than waved through.
 * **Exclusion.** The ARCA job takes a repository-wide, branch-independent
   concurrency group with ``cancel-in-progress: false``. Two runs queue; they
   never overlap, and a push can never cancel a manual run -- a cancellation

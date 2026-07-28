@@ -13,17 +13,32 @@ ticket is thrown away -- ARCA's copy is not. So a second run started too soon is
 not flaky: it is guaranteed to be refused, and it spends a real ARCA call to
 find that out. This preflight blocks it before any network call happens.
 
-It looks at the previous *manual* runs of this workflow through the GitHub
+It looks at the previous *manual* attempts of this workflow through the GitHub
 Actions API and finds the most recent one whose ARCA network step actually
 started. The cooldown ends 12 h 15 min after that step began -- the ticket's
 twelve hours plus a margin for clock skew and for ARCA releasing it.
+
+Attempts, not runs
+------------------
+``GITHUB_RUN_ID`` does not change when a run is re-run; ``GITHUB_RUN_ATTEMPT``
+does. So the unit of work here is ``(run_id, attempt)``, and only the *current*
+attempt is excluded. Attempt 1 of this very run may have taken a ticket that
+attempt 2 is about to be refused, and each attempt is read from its own
+endpoint (``/attempts/{n}/jobs``) rather than from the latest-attempt view.
+
+Paging
+------
+Blocked and skipped attempts are cheap and can pile up, so a fixed page of the
+most recent runs can easily hide the one attempt that actually took a ticket.
+The listing pages until it can show that everything left is older than the
+window that matters, and blocks if it cannot.
 
 Deliberately conservative: anything it cannot classify counts as risky. A false
 block costs a wait. A false pass costs a refused authentication and a live
 ticket nobody holds a copy of.
 
-A run that this preflight blocked never reaches the network step, so its own
-step is recorded as ``skipped`` and it does not extend anybody's cooldown.
+An attempt that this preflight blocked never reaches the network step, so its
+own step is recorded as ``skipped`` and it does not extend anybody's cooldown.
 
 The only credential used is the job's ``GITHUB_TOKEN``, and the only data read
 is run, job and step metadata. No fiscal secret is read, printed or stored.
@@ -49,6 +64,21 @@ TICKET_LIFETIME = datetime.timedelta(hours=12)
 COOLDOWN_MARGIN = datetime.timedelta(minutes=15)
 COOLDOWN = TICKET_LIFETIME + COOLDOWN_MARGIN
 
+# Identifies this preflight to GitHub. Nothing is inferred from it; it is there
+# so a rate-limited or blocked request can be traced back to its cause.
+USER_AGENT = "l10n-ar-arca-edi-cooldown/1.0"
+
+# Runs are listed newest first, so paging can stop once a page is old enough
+# that nothing below it can matter. "Old enough" needs a bound on how long a run
+# can last, because a run created early can still finish late: GitHub kills a
+# job at six hours, so a day is generous well past the point of doubt.
+PAGE_SIZE = 100
+MAX_RUN_DURATION = datetime.timedelta(hours=24)
+RELEVANCE_HORIZON = COOLDOWN + MAX_RUN_DURATION
+# Last resort only. Reaching it means the horizon was never proved, which is a
+# reason to block, not a reason to stop worrying.
+MAX_RUNS_EXAMINED = 1000
+
 # What the operator reads, so the answer is not only in UTC.
 try:
     LOCAL_TZ = ZoneInfo("America/Argentina/Cordoba")
@@ -62,8 +92,9 @@ def normalise(name):
 
 
 # The single network step, plus the names it used to have. A rename must never
-# silently forget that a previous run already spent a ticket, so the historic
-# names stay recognised for as long as runs bearing them can still be listed.
+# silently forget that a previous attempt already spent a ticket, so the
+# historic names stay recognised for as long as runs bearing them can still be
+# listed.
 NETWORK_STEP_NAME = "ARCA network session"
 HISTORIC_NETWORK_STEP_NAMES = (
     "Read-only checks against ARCA homologación",
@@ -85,7 +116,7 @@ UNKNOWN = "unknown"
 # A step that ended in one of these definitely ran, so loginCms may have run
 # with it. ``skipped`` is the one conclusion that proves the opposite: the step
 # was never entered, which is what happens both when no certificate is
-# configured and when this very preflight blocked the run.
+# configured and when this very preflight blocked the attempt.
 STEP_CONCLUSIONS = {
     "success": REACHED,
     "failure": REACHED,
@@ -96,9 +127,10 @@ STEP_CONCLUSIONS = {
 
 @dataclass(frozen=True)
 class Assessment:
-    """What one previous run tells us about the ticket it may have taken."""
+    """What one previous attempt tells us about the ticket it may have taken."""
 
     run_id: int
+    attempt: int
     verdict: str
     detail: str
     started_at: datetime.datetime | None = None
@@ -108,6 +140,19 @@ class Assessment:
     @property
     def is_risky(self):
         return self.verdict in (REACHED, UNKNOWN)
+
+    @property
+    def label(self):
+        return f"run {self.run_id} attempt {self.attempt}"
+
+
+@dataclass(frozen=True)
+class RunListing:
+    """The runs that were read, and whether the reading finished the job."""
+
+    runs: list
+    complete: bool
+    detail: str
 
 
 @dataclass(frozen=True)
@@ -160,7 +205,12 @@ def classify_step(step):
 
 
 def resolve_started_at(step, job, run):
-    """When the network step began, with progressively coarser fallbacks."""
+    """When the network step began, with progressively coarser fallbacks.
+
+    The run-level values describe the latest attempt, so for an earlier attempt
+    they are only a last resort. In practice the jobs endpoint reports both step
+    and job start times, and those are attempt-specific.
+    """
     candidates = (
         ((step or {}).get("started_at"), "step"),
         ((job or {}).get("started_at"), "job"),
@@ -174,20 +224,20 @@ def resolve_started_at(step, job, run):
     return None, "none"
 
 
-def classify_run(run, jobs):
-    """Turn one run and its jobs into an :class:`Assessment`."""
+def classify_attempt(run, jobs, attempt=1):
+    """Turn one attempt of one run into an :class:`Assessment`."""
     run_id = int(run.get("id"))
     url = run.get("html_url") or ""
+    common = {"run_id": run_id, "attempt": attempt, "url": url}
 
     if jobs is None:
         started_at, source = resolve_started_at(None, None, run)
         return Assessment(
-            run_id=run_id,
             verdict=UNKNOWN,
             detail="its jobs could not be listed",
             started_at=started_at,
             started_at_source=source,
-            url=url,
+            **common,
         )
 
     homologation_jobs = [
@@ -195,10 +245,7 @@ def classify_run(run, jobs):
     ]
     if not homologation_jobs:
         return Assessment(
-            run_id=run_id,
-            verdict=DID_NOT_REACH,
-            detail="no homologación job ran",
-            url=url,
+            verdict=DID_NOT_REACH, detail="no homologación job ran", **common
         )
 
     found = []
@@ -210,7 +257,6 @@ def classify_run(run, jobs):
     if not found:
         started_at, source = resolve_started_at(None, homologation_jobs[0], run)
         return Assessment(
-            run_id=run_id,
             verdict=UNKNOWN,
             detail=(
                 "a homologación job ran but none of its steps carries a known "
@@ -218,14 +264,14 @@ def classify_run(run, jobs):
             ),
             started_at=started_at,
             started_at_source=source,
-            url=url,
+            **common,
         )
 
     reached = [entry for entry in found if entry[0] == REACHED]
     if reached:
-        # More than one only happens on runs from the old two-step workflow,
-        # which authenticated twice. The later start is both the more recent
-        # ticket and the more conservative deadline.
+        # More than one only happens on attempts from the old two-step
+        # workflow, which authenticated twice. The later start is both the more
+        # recent ticket and the more conservative deadline.
         oldest = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
         _verdict, job, step = max(
             reached,
@@ -233,12 +279,11 @@ def classify_run(run, jobs):
         )
         started_at, source = resolve_started_at(step, job, run)
         return Assessment(
-            run_id=run_id,
             verdict=REACHED,
             detail=f"its step {step.get('name')!r} ran",
             started_at=started_at,
             started_at_source=source,
-            url=url,
+            **common,
         )
 
     unknown = [entry for entry in found if entry[0] == UNKNOWN]
@@ -246,7 +291,6 @@ def classify_run(run, jobs):
         _verdict, job, step = unknown[0]
         started_at, source = resolve_started_at(step, job, run)
         return Assessment(
-            run_id=run_id,
             verdict=UNKNOWN,
             detail=(
                 f"its step {step.get('name')!r} is "
@@ -255,31 +299,38 @@ def classify_run(run, jobs):
             ),
             started_at=started_at,
             started_at_source=source,
-            url=url,
+            **common,
         )
 
     return Assessment(
-        run_id=run_id,
-        verdict=DID_NOT_REACH,
-        detail="its ARCA network step was skipped",
-        url=url,
+        verdict=DID_NOT_REACH, detail="its ARCA network step was skipped", **common
     )
 
 
-def assess_runs(runs, jobs_by_run_id, current_run_id):
-    """Assess every previous run, ignoring the one asking the question.
+def attempts_to_examine(run, current_run_id, current_attempt):
+    """Every attempt of this run whose ticket could still be alive.
 
-    The current run is excluded unconditionally: it has not reached the network
-    yet -- that is precisely what it is asking permission to do -- and counting
-    itself would make the cooldown permanent.
+    A re-run keeps its ``GITHUB_RUN_ID`` and only advances
+    ``GITHUB_RUN_ATTEMPT``, so excluding the whole run id would let attempt 1
+    hide the ticket attempt 2 is about to be refused. Only the attempt asking
+    the question is excluded -- it has not reached the network yet, which is
+    precisely what it is asking permission to do.
     """
-    current = int(current_run_id) if current_run_id is not None else None
+    run_id = int(run.get("id"))
+    latest = int(run.get("run_attempt") or 1)
+    if current_run_id is not None and run_id == int(current_run_id):
+        return list(range(1, int(current_attempt or 1)))
+    return list(range(1, latest + 1))
+
+
+def assess_attempts(runs, jobs_by_attempt, current_run_id, current_attempt=1):
+    """Assess every previous attempt, keyed by ``(run_id, attempt)``."""
     assessments = []
     for run in runs:
         run_id = int(run.get("id"))
-        if current is not None and run_id == current:
-            continue
-        assessments.append(classify_run(run, jobs_by_run_id.get(run_id)))
+        for number in attempts_to_examine(run, current_run_id, current_attempt):
+            jobs = jobs_by_attempt.get((run_id, number))
+            assessments.append(classify_attempt(run, jobs, attempt=number))
     return assessments
 
 
@@ -287,9 +338,12 @@ def next_allowed_at(started_at):
     return started_at + COOLDOWN
 
 
-def evaluate(runs, jobs_by_run_id, current_run_id, now):
-    """Decide whether this run may talk to ARCA."""
-    risky = [entry for entry in assess_runs(runs, jobs_by_run_id, current_run_id) if entry.is_risky]
+def evaluate(
+    runs, jobs_by_attempt, current_run_id, now, current_attempt=1, listing=None
+):
+    """Decide whether this attempt may talk to ARCA."""
+    assessments = assess_attempts(runs, jobs_by_attempt, current_run_id, current_attempt)
+    risky = [entry for entry in assessments if entry.is_risky]
 
     undated = [entry for entry in risky if entry.started_at is None]
     if undated:
@@ -297,45 +351,62 @@ def evaluate(runs, jobs_by_run_id, current_run_id, now):
         return Decision(
             blocked=True,
             reason=(
-                f"Run {entry.run_id} may have obtained an ARCA ticket "
+                f"{entry.label.capitalize()} may have obtained an ARCA ticket "
                 f"({entry.detail}) and its start time could not be determined."
             ),
             assessment=entry,
         )
 
-    if not risky:
-        return Decision(
-            blocked=False,
-            reason="No previous manual run reached the ARCA network step.",
-        )
+    latest = max(risky, key=lambda entry: entry.started_at) if risky else None
+    if latest is not None:
+        allowed = next_allowed_at(latest.started_at)
+        if now < allowed:
+            return Decision(
+                blocked=True,
+                reason=(
+                    f"{latest.label.capitalize()} reached ARCA at "
+                    f"{latest.started_at.isoformat()} ({latest.detail}); "
+                    f"its access ticket may still be valid."
+                ),
+                assessment=latest,
+                next_allowed_at=allowed,
+            )
 
-    latest = max(risky, key=lambda entry: entry.started_at)
-    allowed = next_allowed_at(latest.started_at)
-    if now < allowed:
+    # Only now, with nothing conclusive against us: an incomplete listing means
+    # an attempt that took a ticket may simply not have been read.
+    if listing is not None and not listing.complete:
         return Decision(
             blocked=True,
             reason=(
-                f"Run {latest.run_id} reached ARCA at "
-                f"{latest.started_at.isoformat()} ({latest.detail}); "
-                f"its access ticket may still be valid."
+                "The list of previous manual runs could not be read to the end "
+                f"({listing.detail}), so an attempt that reached ARCA may not "
+                "have been seen."
             ),
-            assessment=latest,
-            next_allowed_at=allowed,
+        )
+
+    if latest is None:
+        return Decision(
+            blocked=False,
+            reason="No previous manual attempt reached the ARCA network step.",
         )
     return Decision(
         blocked=False,
         reason=(
-            f"The last run that reached ARCA ({latest.run_id}) started "
+            f"The last attempt that reached ARCA ({latest.label}) started "
             f"{latest.started_at.isoformat()}, more than {COOLDOWN} ago."
         ),
         assessment=latest,
-        next_allowed_at=allowed,
+        next_allowed_at=next_allowed_at(latest.started_at),
     )
 
 
 # ----------------------------------------------------------------------
 # GitHub API
 # ----------------------------------------------------------------------
+
+# Anything that can go wrong reading the API and must not be mistaken for
+# "there is nothing there".
+API_ERRORS = (urllib.error.URLError, OSError, ValueError, KeyError, TimeoutError)
 
 
 class GitHubApi:
@@ -346,57 +417,116 @@ class GitHubApi:
         self.repository = repository
         self.api_url = api_url.rstrip("/")
 
-    def _get(self, path, params=None):
+    def build_request(self, path, params=None):
         url = f"{self.api_url}{path}"
         if params:
             url = f"{url}?{urllib.parse.urlencode(params)}"
         request = urllib.request.Request(url)  # noqa: S310 - fixed https API host
         request.add_header("Accept", "application/vnd.github+json")
         request.add_header("X-GitHub-Api-Version", "2022-11-28")
+        request.add_header("User-Agent", USER_AGENT)
         if self.token:
             request.add_header("Authorization", f"Bearer {self.token}")
+        return request
+
+    def _get(self, path, params=None):
+        request = self.build_request(path, params)
         with urllib.request.urlopen(request, timeout=30) as response:  # noqa: S310
             return json.loads(response.read().decode("utf-8"))
 
-    def manual_runs(self, workflow_file, limit=30):
+    def manual_runs_page(self, workflow_file, page, page_size=PAGE_SIZE):
         payload = self._get(
             f"/repos/{self.repository}/actions/workflows/{workflow_file}/runs",
-            {"event": "workflow_dispatch", "per_page": limit},
+            {"event": "workflow_dispatch", "per_page": page_size, "page": page},
         )
         return payload.get("workflow_runs") or []
 
-    def jobs(self, run_id):
+    def attempt_jobs(self, run_id, attempt):
+        """The jobs of one specific attempt.
+
+        Deliberately not the ``filter=latest`` view of the run: that reports the
+        newest attempt, which says nothing about whether an earlier one reached
+        ARCA.
+        """
         payload = self._get(
-            f"/repos/{self.repository}/actions/runs/{run_id}/jobs",
-            {"per_page": 100, "filter": "latest"},
+            f"/repos/{self.repository}/actions/runs/{run_id}/attempts/{attempt}/jobs",
+            {"per_page": 100},
         )
         return payload.get("jobs") or []
 
 
-def collect_jobs(api, runs, current_run_id, now):
-    """Fetch the jobs of every run that could still be holding a ticket.
+def paginate_runs(
+    fetch_page, now, page_size=PAGE_SIZE, max_runs=MAX_RUNS_EXAMINED
+):
+    """Read manual runs, newest first, until nothing left can matter.
 
-    A run that *finished* more than one cooldown ago cannot block anything: its
-    network step started before it finished. Those are skipped without an API
-    call. Everything else is fetched, and a fetch that fails is recorded as
-    ``None`` so it is classified as unknown rather than as harmless.
+    ``fetch_page(page)`` returns one page of runs. Paging stops when a page is
+    short (the history ended) or when its oldest run predates the window in
+    which any attempt could still hold a ticket. Stopping for any other reason
+    -- an error, or the defensive cap -- is reported as incomplete, because a
+    listing that stopped early is not evidence of anything.
     """
-    current = int(current_run_id) if current_run_id is not None else None
-    jobs_by_run_id = {}
+    runs = []
+    page = 1
+    while True:
+        try:
+            batch = fetch_page(page)
+        except API_ERRORS as exc:
+            return RunListing(runs, False, f"page {page} could not be read: {exc}")
+
+        runs.extend(batch)
+
+        if len(batch) < page_size:
+            return RunListing(runs, True, "the whole manual history was read")
+
+        oldest = parse_timestamp(batch[-1].get("created_at"))
+        if oldest is not None and oldest <= now - RELEVANCE_HORIZON:
+            return RunListing(
+                runs, True, f"reached runs older than {RELEVANCE_HORIZON}"
+            )
+
+        if len(runs) >= max_runs:
+            return RunListing(
+                runs,
+                False,
+                f"stopped at the defensive limit of {max_runs} runs without "
+                f"reaching the {RELEVANCE_HORIZON} horizon",
+            )
+        page += 1
+
+
+def collect_attempt_jobs(api, runs, current_run_id, current_attempt, now):
+    """Fetch the jobs of every attempt that could still be holding a ticket.
+
+    A run that *finished* more than one cooldown ago cannot block anything, and
+    neither can any of its attempts: they all ended before it did. Those are
+    skipped without an API call. Everything else is fetched, and a fetch that
+    fails is recorded as ``None`` so it is classified as unknown rather than as
+    harmless.
+    """
+    jobs_by_attempt = {}
     for run in runs:
         run_id = int(run.get("id"))
-        if current is not None and run_id == current:
+        attempts = attempts_to_examine(run, current_run_id, current_attempt)
+        if not attempts:
             continue
+
         finished = parse_timestamp(run.get("updated_at"))
         if (run.get("status") == "completed") and finished and finished + COOLDOWN <= now:
-            jobs_by_run_id[run_id] = []
+            for attempt in attempts:
+                jobs_by_attempt[(run_id, attempt)] = []
             continue
-        try:
-            jobs_by_run_id[run_id] = api.jobs(run_id)
-        except (urllib.error.URLError, ValueError, KeyError) as exc:
-            print(f"::warning::Could not list the jobs of run {run_id}: {exc}")
-            jobs_by_run_id[run_id] = None
-    return jobs_by_run_id
+
+        for attempt in attempts:
+            try:
+                jobs_by_attempt[(run_id, attempt)] = api.attempt_jobs(run_id, attempt)
+            except API_ERRORS as exc:
+                print(
+                    f"::warning::Could not list the jobs of run {run_id} "
+                    f"attempt {attempt}: {exc}"
+                )
+                jobs_by_attempt[(run_id, attempt)] = None
+    return jobs_by_attempt
 
 
 # ----------------------------------------------------------------------
@@ -430,9 +560,14 @@ def build_parser():
     )
     parser.add_argument("--run-id", default=os.environ.get("GITHUB_RUN_ID"))
     parser.add_argument(
+        "--run-attempt",
+        default=os.environ.get("GITHUB_RUN_ATTEMPT", "1"),
+        help="A re-run keeps its run id and advances only this.",
+    )
+    parser.add_argument(
         "--api-url", default=os.environ.get("GITHUB_API_URL", "https://api.github.com")
     )
-    parser.add_argument("--limit", type=int, default=30)
+    parser.add_argument("--max-runs", type=int, default=MAX_RUNS_EXAMINED)
     parser.add_argument(
         "--now",
         default=None,
@@ -453,30 +588,46 @@ def main(argv=None):
         print("::error::No GITHUB_TOKEN available; the ARCA cooldown cannot be checked.")
         return 1
 
-    api = GitHubApi(token, args.repository, args.api_url)
     try:
-        runs = api.manual_runs(args.workflow, limit=args.limit)
-    except (urllib.error.URLError, ValueError, KeyError) as exc:
-        print(f"::error::Could not list previous runs ({exc}); refusing to call ARCA blind.")
+        attempt = int(args.run_attempt or 1)
+    except (TypeError, ValueError):
+        print(f"::error::Unreadable run attempt {args.run_attempt!r}; refusing to start.")
         return 1
 
-    jobs_by_run_id = collect_jobs(api, runs, args.run_id, now)
-    decision = evaluate(runs, jobs_by_run_id, args.run_id, now)
+    api = GitHubApi(token, args.repository, args.api_url)
+    listing = paginate_runs(
+        lambda page: api.manual_runs_page(args.workflow, page),
+        now,
+        max_runs=args.max_runs,
+    )
+
+    jobs_by_attempt = collect_attempt_jobs(
+        api, listing.runs, args.run_id, attempt, now
+    )
+    decision = evaluate(
+        listing.runs,
+        jobs_by_attempt,
+        args.run_id,
+        now,
+        current_attempt=attempt,
+        listing=listing,
+    )
 
     if not decision.blocked:
         print(f"ARCA cooldown clear: {decision.reason}")
+        print(f"Runs examined: {len(listing.runs)} ({listing.detail}).")
         return 0
 
     print(f"::error::ARCA homologación is on cooldown. {decision.reason}")
     if decision.next_allowed_at is not None:
-        print(f"Next run allowed at {format_deadline(decision.next_allowed_at)}")
+        print(f"Next attempt allowed at {format_deadline(decision.next_allowed_at)}")
         remaining = decision.next_allowed_at - now
         print(f"Remaining: {remaining}")
     else:
         print(
-            "The previous run could not be classified, so the safe assumption is "
-            "that it holds a ticket. Wait out the full "
-            f"{COOLDOWN} from that run, or check it by hand."
+            "No deadline could be computed, so the safe assumption is that a "
+            f"ticket is still out there. Wait out the full {COOLDOWN} from the "
+            "last attempt that ran, or check it by hand."
         )
     if decision.assessment is not None and decision.assessment.url:
         print(f"Previous run: {decision.assessment.url}")
