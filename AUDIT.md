@@ -507,6 +507,43 @@ never read, including a run created two months ago and re-run this morning.
 constant carries a comment saying which limit it is, because the two are easy to
 confuse and the cheaper one is the wrong one.
 
+### Accepted technical debt - persistent WSAA lease
+
+The homologation cooldown currently reconstructs whether a WSAA access ticket
+may still be alive by inspecting GitHub Actions history. The implementation is
+deliberately conservative and is acceptable for the current manual and
+occasional homologation runs, but GitHub history is not the desired long-term
+source of truth.
+
+A workflow run uses an ephemeral database. When the run ends, the local copy of
+the WSAA token and sign disappears while ARCA may continue to consider the
+ticket valid for roughly twelve hours. The current preflight compensates by
+examining runs, re-runs, attempts, pagination and the full relevant retention
+window.
+
+Before homologation becomes frequent or automated, replace this inferred state
+with an external persistent and atomic lease, keyed at least by:
+
+- ARCA environment;
+- certificate fingerprint;
+- service name.
+
+The lease should record:
+
+- holder run id and attempt;
+- acquired_at;
+- expires_at.
+
+A run must acquire the lease atomically before calling WSAA. A live lease must
+stop the run without contacting ARCA. Keep GitHub Actions concurrency to prevent
+simultaneous sessions; keep Actions history only as secondary audit evidence.
+
+The first implementation should persist only the lease, not Token or Sign.
+Persisting and reusing those credentials would require encryption, access
+control and explicit protection against logging.
+
+The current history-based cooldown remains the accepted interim mechanism.
+
 ## Verification status
 
 Wording used deliberately, per the brief:
