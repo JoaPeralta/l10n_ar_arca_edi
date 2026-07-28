@@ -30,8 +30,14 @@ Paging
 ------
 Blocked and skipped attempts are cheap and can pile up, so a fixed page of the
 most recent runs can easily hide the one attempt that actually took a ticket.
-The listing pages until it can show that everything left is older than the
-window that matters, and blocks if it cannot.
+Worse, runs are listed by *creation*: GitHub allows a re-run for thirty days,
+so an attempt that talked to ARCA an hour ago can belong to a run created weeks
+back and sit that far down the list. The listing therefore pages across the
+whole re-run window before it can conclude anything, and blocks if it cannot.
+
+The current run is never left to paging luck: it is fetched by id and added to
+the listing, so a re-run can always inspect its own earlier attempts even when
+the original run is old or falls past the defensive limit.
 
 Deliberately conservative: anything it cannot classify counts as risky. A false
 block costs a wait. A false pass costs a refused authentication and a live
@@ -68,13 +74,23 @@ COOLDOWN = TICKET_LIFETIME + COOLDOWN_MARGIN
 # so a rate-limited or blocked request can be traced back to its cause.
 USER_AGENT = "l10n-ar-arca-edi-cooldown/1.0"
 
-# Runs are listed newest first, so paging can stop once a page is old enough
-# that nothing below it can matter. "Old enough" needs a bound on how long a run
-# can last, because a run created early can still finish late: GitHub kills a
-# job at six hours, so a day is generous well past the point of doubt.
+# Runs are listed newest first -- by creation, not by activity -- so paging can
+# stop once a page is old enough that nothing below it can matter. Working out
+# "old enough" takes two bounds:
+#
+# * GitHub lets a run be re-run for thirty days after it was created, so a run
+#   created a fortnight ago can have an attempt that talked to ARCA this
+#   morning while sitting a fortnight down the list;
+# * a run created early can still finish late, and a step starts before its run
+#   ends. GitHub kills a job at six hours, so a day is generous past any doubt.
+#
+# An attempt of a run created at T therefore cannot have started its network
+# step later than T + RERUN_ELIGIBILITY + MAX_RUN_DURATION, and only matters
+# while that is within one cooldown of now.
 PAGE_SIZE = 100
+RERUN_ELIGIBILITY = datetime.timedelta(days=30)
 MAX_RUN_DURATION = datetime.timedelta(hours=24)
-RELEVANCE_HORIZON = COOLDOWN + MAX_RUN_DURATION
+RELEVANCE_HORIZON = RERUN_ELIGIBILITY + MAX_RUN_DURATION + COOLDOWN
 # Last resort only. Reaching it means the horizon was never proved, which is a
 # reason to block, not a reason to stop worrying.
 MAX_RUNS_EXAMINED = 1000
@@ -378,9 +394,9 @@ def evaluate(
         return Decision(
             blocked=True,
             reason=(
-                "The list of previous manual runs could not be read to the end "
-                f"({listing.detail}), so an attempt that reached ARCA may not "
-                "have been seen."
+                "The history of previous manual attempts could not be "
+                f"established ({listing.detail}), so an attempt that reached "
+                "ARCA may not have been seen."
             ),
         )
 
@@ -441,6 +457,10 @@ class GitHubApi:
         )
         return payload.get("workflow_runs") or []
 
+    def get_run(self, run_id):
+        """One run by id, so the current one never depends on paging luck."""
+        return self._get(f"/repos/{self.repository}/actions/runs/{run_id}")
+
     def attempt_jobs(self, run_id, attempt):
         """The jobs of one specific attempt.
 
@@ -493,6 +513,40 @@ def paginate_runs(
                 f"reaching the {RELEVANCE_HORIZON} horizon",
             )
         page += 1
+
+
+def ensure_current_run(api, listing, current_run_id, current_attempt):
+    """Put this run in the listing whether or not paging happened to find it.
+
+    A re-run keeps the creation date of the run it re-runs, and the listing is
+    ordered by creation. So the run whose earlier attempts are the most likely
+    to be holding a ticket -- this one -- can sit thirty days down the list, or
+    past the defensive limit entirely. Fetching it by id removes the question.
+
+    Failing to read it matters only from attempt 2 on: a first attempt has no
+    earlier attempts of its own to miss.
+    """
+    if current_run_id is None:
+        return listing
+
+    current = int(current_run_id)
+    if any(int(run.get("id")) == current for run in listing.runs):
+        return listing
+
+    try:
+        run = api.get_run(current)
+    except API_ERRORS as exc:
+        if int(current_attempt or 1) > 1:
+            return RunListing(
+                listing.runs,
+                False,
+                f"run {current} could not be read and this is attempt "
+                f"{current_attempt}, so its earlier attempts are unknown: {exc}",
+            )
+        print(f"::warning::Could not read run {current}: {exc}")
+        return listing
+
+    return RunListing([*listing.runs, run], listing.complete, listing.detail)
 
 
 def collect_attempt_jobs(api, runs, current_run_id, current_attempt, now):
@@ -600,6 +654,7 @@ def main(argv=None):
         now,
         max_runs=args.max_runs,
     )
+    listing = ensure_current_run(api, listing, args.run_id, attempt)
 
     jobs_by_attempt = collect_attempt_jobs(
         api, listing.runs, args.run_id, attempt, now

@@ -314,10 +314,10 @@ class TestFetchingIsAvoidedWhenItCannotMatter(unittest.TestCase):
         self.assertEqual(collected, {})
 
 
-def build_run(run_id, created_at, updated_at=None):
+def build_run(run_id, created_at, updated_at=None, run_attempt=1):
     return {
         "id": run_id,
-        "run_attempt": 1,
+        "run_attempt": run_attempt,
         "status": "completed",
         "conclusion": "success",
         "event": "workflow_dispatch",
@@ -409,9 +409,9 @@ class TestPaging(unittest.TestCase):
             build_run(9000 + index, "2026-07-28T11:00:00Z", "2026-07-28T11:01:00Z")
             for index in range(10)
         ]
-        # Older than the cooldown plus the longest a run could possibly last.
+        # Past the whole horizon: too old even to be re-run into relevance.
         ancient = [
-            build_run(8000 + index, "2026-07-20T11:00:00Z", "2026-07-20T11:01:00Z")
+            build_run(8000 + index, "2026-06-01T11:00:00Z", "2026-06-01T11:01:00Z")
             for index in range(10)
         ]
         asked = []
@@ -462,7 +462,7 @@ class TestPaging(unittest.TestCase):
             listing.runs, jobs, 1, self.NOW, listing=listing
         )
         self.assertTrue(decision.blocked, decision.reason)
-        self.assertIn("could not be read to the end", decision.reason)
+        self.assertIn("could not be established", decision.reason)
 
     def test_the_defensive_limit_blocks_rather_than_reassures(self):
         runs = [
@@ -477,6 +477,201 @@ class TestPaging(unittest.TestCase):
 
         decision = arca_cooldown.evaluate(listing.runs, {}, 1, self.NOW, listing=listing)
         self.assertTrue(decision.blocked, decision.reason)
+
+
+class TestTheRelevanceHorizon(unittest.TestCase):
+    """Runs are listed by creation, but a re-run happens whenever it happens."""
+
+    def test_the_rerun_window_is_thirty_days(self):
+        self.assertEqual(arca_cooldown.RERUN_ELIGIBILITY, datetime.timedelta(days=30))
+
+    def test_the_horizon_covers_rerun_plus_duration_plus_cooldown(self):
+        self.assertEqual(
+            arca_cooldown.RELEVANCE_HORIZON,
+            datetime.timedelta(days=31, hours=12, minutes=15),
+        )
+        self.assertEqual(
+            arca_cooldown.RELEVANCE_HORIZON,
+            arca_cooldown.RERUN_ELIGIBILITY
+            + arca_cooldown.MAX_RUN_DURATION
+            + arca_cooldown.COOLDOWN,
+        )
+
+
+class TestOldRunsWithRecentAttempts(unittest.TestCase):
+    """A run created a fortnight ago can have talked to ARCA this morning."""
+
+    NOW = datetime.datetime(2026, 7, 28, 12, 0, tzinfo=UTC)
+
+    def paged(self, runs, page_size):
+        def fetch_page(page):
+            start = (page - 1) * page_size
+            return runs[start : start + page_size]
+
+        return fetch_page
+
+    def test_a_fortnight_old_run_rerun_today_is_found_and_blocks(self):
+        # Two days old: past any horizon built only from a run's own duration,
+        # so a paginator that stopped there would never see run 200 below.
+        recent = [
+            build_run(9000 + index, "2026-07-26T11:00:00Z", "2026-07-26T11:01:00Z")
+            for index in range(20)
+        ]
+        # Created fifteen days ago, re-run this morning.
+        old = build_run(
+            200,
+            "2026-07-13T09:00:00Z",
+            updated_at="2026-07-28T09:30:00Z",
+            run_attempt=2,
+        )
+
+        listing = arca_cooldown.paginate_runs(
+            self.paged([*recent, old], 10), self.NOW, page_size=10
+        )
+        self.assertTrue(listing.complete, listing.detail)
+        self.assertIn(old, listing.runs)
+
+        jobs = {(run["id"], 1): skipped_job("2026-07-26T11:00:30Z") for run in recent}
+        # Attempt 1 ran a fortnight ago and is long expired.
+        jobs[(200, 1)] = reaching_job("2026-07-13T09:05:00Z")
+        jobs[(200, 2)] = reaching_job("2026-07-28T09:00:00Z")
+
+        decision = arca_cooldown.evaluate(
+            listing.runs, jobs, 1, self.NOW, listing=listing
+        )
+        self.assertTrue(decision.blocked, decision.reason)
+        self.assertEqual(decision.assessment.run_id, 200)
+        self.assertEqual(decision.assessment.attempt, 2)
+        self.assertEqual(
+            decision.next_allowed_at, datetime.datetime(2026, 7, 28, 21, 15, tzinfo=UTC)
+        )
+
+    def test_paging_does_not_stop_inside_the_rerun_window(self):
+        """Twenty days old is still re-runnable, so it is still in scope."""
+        within = [
+            build_run(9000 + index, "2026-07-08T11:00:00Z", "2026-07-08T11:01:00Z")
+            for index in range(10)
+        ]
+        beyond = [
+            build_run(8000 + index, "2026-06-18T11:00:00Z", "2026-06-18T11:01:00Z")
+            for index in range(10)
+        ]
+        asked = []
+
+        def fetch_page(page):
+            asked.append(page)
+            return self.paged([*within, *beyond], 10)(page)
+
+        listing = arca_cooldown.paginate_runs(fetch_page, self.NOW, page_size=10)
+        self.assertTrue(listing.complete, listing.detail)
+        # Page 1 is twenty days old: inside the window, so paging went on.
+        self.assertEqual(asked, [1, 2])
+
+    def test_paging_stops_past_the_whole_horizon(self):
+        """More than 31 days 12 h 15 min old: nothing below it can matter."""
+        beyond = [
+            build_run(8000 + index, "2026-06-01T11:00:00Z", "2026-06-01T11:01:00Z")
+            for index in range(30)
+        ]
+        asked = []
+
+        def fetch_page(page):
+            asked.append(page)
+            return self.paged(beyond, 10)(page)
+
+        listing = arca_cooldown.paginate_runs(fetch_page, self.NOW, page_size=10)
+        self.assertTrue(listing.complete, listing.detail)
+        self.assertEqual(asked, [1])
+        self.assertIn("older than", listing.detail)
+
+
+class TestTheCurrentRunIsNeverMissed(unittest.TestCase):
+    """Paging must not decide whether a re-run can see its own first attempt."""
+
+    NOW = datetime.datetime(2026, 7, 28, 12, 0, tzinfo=UTC)
+
+    class Api:
+        def __init__(self, run=None, error=None):
+            self.run = run
+            self.error = error
+            self.asked = []
+
+        def get_run(self, run_id):
+            self.asked.append(run_id)
+            if self.error is not None:
+                raise self.error
+            return self.run
+
+    def listing_without_the_current_run(self):
+        runs = [build_run(9000, "2026-07-28T11:00:00Z", "2026-07-28T11:01:00Z")]
+        return arca_cooldown.RunListing(runs, True, "the whole manual history was read")
+
+    def test_a_missing_current_run_is_fetched_and_its_first_attempt_blocks(self):
+        current = build_run(
+            400, "2026-07-08T09:00:00Z", updated_at="2026-07-28T11:52:00Z", run_attempt=2
+        )
+        api = self.Api(run=current)
+
+        listing = arca_cooldown.ensure_current_run(
+            api, self.listing_without_the_current_run(), 400, 2
+        )
+        self.assertEqual(api.asked, [400])
+        self.assertIn(current, listing.runs)
+        self.assertTrue(listing.complete)
+
+        jobs = {
+            (9000, 1): skipped_job("2026-07-28T11:00:30Z"),
+            (400, 1): reaching_job("2026-07-28T08:00:00Z"),
+        }
+        decision = arca_cooldown.evaluate(
+            listing.runs, jobs, 400, self.NOW, current_attempt=2, listing=listing
+        )
+        self.assertTrue(decision.blocked, decision.reason)
+        self.assertEqual(decision.assessment.run_id, 400)
+        self.assertEqual(decision.assessment.attempt, 1)
+        self.assertEqual(
+            decision.next_allowed_at, datetime.datetime(2026, 7, 28, 20, 15, tzinfo=UTC)
+        )
+
+    def test_a_failure_to_read_the_current_run_blocks_a_rerun(self):
+        api = self.Api(error=urllib.error.URLError("the API said no"))
+        listing = arca_cooldown.ensure_current_run(
+            api, self.listing_without_the_current_run(), 400, 2
+        )
+        self.assertFalse(listing.complete)
+        self.assertIn("attempt 2", listing.detail)
+
+        decision = arca_cooldown.evaluate(
+            listing.runs, {}, 400, self.NOW, current_attempt=2, listing=listing
+        )
+        self.assertTrue(decision.blocked, decision.reason)
+
+    def test_a_failure_on_a_first_attempt_is_harmless(self):
+        """A first attempt has no earlier attempts of its own to miss."""
+        api = self.Api(error=urllib.error.URLError("the API said no"))
+        listing = arca_cooldown.ensure_current_run(
+            api, self.listing_without_the_current_run(), 400, 1
+        )
+        self.assertTrue(listing.complete, listing.detail)
+
+        jobs = {(9000, 1): skipped_job("2026-07-28T11:00:30Z")}
+        decision = arca_cooldown.evaluate(
+            listing.runs, jobs, 400, self.NOW, current_attempt=1, listing=listing
+        )
+        self.assertFalse(decision.blocked, decision.reason)
+
+    def test_a_run_already_listed_is_not_fetched_again(self):
+        listing = arca_cooldown.RunListing(
+            [build_run(400, "2026-07-28T11:00:00Z", run_attempt=2)], True, "read"
+        )
+        api = self.Api(run=None)
+        self.assertIs(arca_cooldown.ensure_current_run(api, listing, 400, 2), listing)
+        self.assertEqual(api.asked, [])
+
+    def test_the_run_endpoint_is_addressed_by_id(self):
+        api = arca_cooldown.GitHubApi("t", "owner/repo")
+        request = api.build_request("/repos/owner/repo/actions/runs/400")
+        self.assertTrue(request.full_url.endswith("/actions/runs/400"))
 
 
 class TestRequestHeaders(unittest.TestCase):

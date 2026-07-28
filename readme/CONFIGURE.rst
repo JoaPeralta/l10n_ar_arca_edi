@@ -250,8 +250,13 @@ Three things protect the ticket:
 
   The listing pages until it can show that everything left is older than the
   window that matters. A fixed page would let a pile of blocked or skipped
-  attempts hide the one that took a ticket. If paging fails or hits its
-  defensive limit, the run is blocked rather than waved through.
+  attempts hide the one that took a ticket. That window spans 31 days 12 h
+  15 min, because runs are listed by *creation* and GitHub allows a re-run for
+  thirty days: an attempt that talked to ARCA this morning can belong to a run
+  created weeks ago. The current run is additionally fetched by id, so a re-run
+  can always inspect its own earlier attempts. If paging fails, if the current
+  run cannot be read during a re-run, or if the defensive limit is reached, the
+  run is blocked rather than waved through.
 * **Exclusion.** The ARCA job takes a repository-wide, branch-independent
   concurrency group with ``cancel-in-progress: false``. Two runs queue; they
   never overlap, and a push can never cancel a manual run -- a cancellation

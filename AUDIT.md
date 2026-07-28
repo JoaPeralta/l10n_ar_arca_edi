@@ -466,6 +466,32 @@ The calls also identify themselves with a `User-Agent` of
 `l10n-ar-arca-edi-cooldown/1.0`, so a throttled or refused request can be traced
 back to its cause.
 
+### R13 - The paging horizon ignored the re-run window
+
+R12's stop condition was `COOLDOWN + MAX_RUN_DURATION`, about 36 hours. But runs
+are listed by *creation*, and GitHub allows a re-run for thirty days after that.
+A run created a fortnight ago can have an attempt that talked to ARCA this
+morning, sitting a fortnight down the list -- and paging stopped long before
+reaching it.
+
+The horizon is now stated from the three things that actually bound it:
+
+    RELEVANCE_HORIZON = RERUN_ELIGIBILITY (30 days)
+                      + MAX_RUN_DURATION  (24 h)
+                      + COOLDOWN          (12 h 15 min)
+                      = 31 days, 12 h 15 min
+
+An attempt of a run created at `T` cannot have started its network step later
+than `T + RERUN_ELIGIBILITY + MAX_RUN_DURATION`, and only matters while that is
+within one cooldown of now.
+
+Paging is still not trusted with the one run that matters most. The current run
+is fetched by id through `GET /repos/{owner}/{repo}/actions/runs/{run_id}` and
+added to the listing when absent, so a re-run can always inspect its own earlier
+attempts even if the original run is old or falls past the defensive limit.
+Failing to read it blocks from attempt 2 on; on a first attempt there are no
+earlier attempts of its own to miss.
+
 ## Verification status
 
 Wording used deliberately, per the brief:
