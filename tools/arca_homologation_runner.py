@@ -95,6 +95,18 @@ def storage_problems(rows):
     return problems
 
 
+def is_full_sha(value):
+    """True only for a complete 40-character hexadecimal commit id.
+
+    Abbreviated ids are refused rather than expanded: two different commits can
+    share a short prefix, and this comparison is what decides whether a session
+    may run at all.
+    """
+    if not value or len(value) != 40:
+        return False
+    return all(char in "0123456789abcdef" for char in value.lower())
+
+
 def sha_problem(recorded, running):
     """Return why the running code does not match what this database was prepared for.
 
@@ -110,6 +122,16 @@ def sha_problem(recorded, running):
         return (
             "no se pudo determinar el SHA en ejecución (ARCA_HOMO_CODE_SHA "
             "ausente o inválido)"
+        )
+    if not is_full_sha(recorded):
+        return (
+            f"{SHA_PARAMETER} no es un SHA completo de 40 caracteres; "
+            "volvé a correr el bootstrap"
+        )
+    if not is_full_sha(running):
+        return (
+            "ARCA_HOMO_CODE_SHA no es un SHA completo de 40 caracteres. "
+            "Un prefijo abreviado no identifica un commit sin ambigüedad"
         )
     if recorded.lower() != running.lower():
         return (
@@ -286,7 +308,17 @@ def run_ticket_status(env, certificate):
     now = fields.Datetime.now()
     for service, entry in sorted(cache.items()):
         raw = (entry or {}).get("expiration")
-        expires_at = fields.Datetime.to_datetime(raw) if raw else None
+        # Parsed defensively: an unhandled failure here would raise with the
+        # cache entry still in scope, and that entry holds the token and the
+        # sign. Only the service name survives into the message.
+        try:
+            expires_at = fields.Datetime.to_datetime(raw) if raw else None
+        except (ValueError, TypeError):
+            print(
+                f"[runner] servicio={service} vencimiento ilegible; "
+                "el ticket no se considera reutilizable"
+            )
+            continue
         usable = ticket_is_usable(expires_at, now)
         print(
             f"[runner] servicio={service} vence={raw} "

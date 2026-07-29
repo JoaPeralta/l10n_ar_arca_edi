@@ -248,6 +248,56 @@ class TestTheShaVerdict(unittest.TestCase):
     def test_an_unknown_running_sha_is_reported(self):
         self.assertIn("ARCA_HOMO_CODE_SHA", runner.sha_problem(self.SHA, None))
 
+    def test_an_abbreviated_sha_is_refused_on_either_side(self):
+        """Two commits can share a prefix; this comparison decides whether to run."""
+        short = self.SHA[:7]
+        self.assertIn("40", runner.sha_problem(short, self.SHA))
+        self.assertIn("40", runner.sha_problem(self.SHA, short))
+
+    def test_a_non_hexadecimal_sha_is_refused(self):
+        self.assertIn("40", runner.sha_problem("z" * 40, self.SHA))
+        self.assertIn("40", runner.sha_problem(self.SHA, "z" * 40))
+
+    def test_the_full_sha_predicate(self):
+        self.assertTrue(runner.is_full_sha(self.SHA))
+        self.assertTrue(runner.is_full_sha(self.SHA.upper()))
+        self.assertFalse(runner.is_full_sha(self.SHA[:39]))
+        self.assertFalse(runner.is_full_sha(self.SHA + "a"))
+        self.assertFalse(runner.is_full_sha(""))
+        self.assertFalse(runner.is_full_sha(None))
+
+
+class TestNoParseErrorCanSurfaceTheCache(unittest.TestCase):
+    """The cache entry holds the token and the sign; a traceback must not carry it."""
+
+    def test_the_expiry_parse_is_guarded(self):
+        source = ast.get_source_segment(RUNNER_TEXT, function_node("run_ticket_status"))
+        self.assertIn("to_datetime", source)
+        self.assertIn("except (ValueError, TypeError)", source)
+        self.assertLess(source.index("try:"), source.index("to_datetime"))
+
+    def test_the_unreadable_message_names_only_the_service(self):
+        """Read the handler itself, not the lines after it.
+
+        The success path does print the expiry, which is the whole point of
+        ticket-status. What must not leak is anything the handler could reach
+        when the value turned out to be unparseable.
+        """
+        handlers = [
+            node
+            for node in ast.walk(function_node("run_ticket_status"))
+            if isinstance(node, ast.ExceptHandler)
+        ]
+        self.assertEqual(len(handlers), 1)
+        names = {
+            node.id
+            for node in ast.walk(handlers[0])
+            if isinstance(node, ast.Name)
+        }
+        for leak in ("entry", "cache", "raw"):
+            with self.subTest(leak=leak):
+                self.assertNotIn(leak, names)
+
 
 class TestTheStorageVerdict(unittest.TestCase):
     def test_material_in_the_database_has_no_problems(self):
@@ -323,6 +373,20 @@ class TestTheWorkflowCannotDestroyATicket(unittest.TestCase):
         older = ci["jobs"]["homologation"]["concurrency"]
         self.assertEqual(older["group"], WORKFLOW["concurrency"]["group"])
         self.assertIs(older["cancel-in-progress"], False)
+
+    def test_no_connection_variable_is_ever_echoed(self):
+        """Not even the database name: it arrives as a secret, so it is not printed."""
+        for step in JOB["steps"]:
+            body = str(step.get("run", ""))
+            found = re.findall(r"secrets\.ARCA_HOMO_PG\w+", body)
+            with self.subTest(step=step.get("name")):
+                self.assertEqual(found, [])
+
+    def test_no_url_with_a_password_is_built(self):
+        for marker in ("postgres://", "postgresql://", "DATABASE_URL"):
+            with self.subTest(marker=marker):
+                self.assertNotIn(marker, WORKFLOW_TEXT)
+                self.assertNotIn(marker, RUNNER_TEXT)
 
     def test_no_secret_is_echoed(self):
         """The reported metadata never includes a credential."""

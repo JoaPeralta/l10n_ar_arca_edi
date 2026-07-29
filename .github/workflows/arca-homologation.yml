@@ -62,13 +62,15 @@ jobs:
         with:
           path: extra-addons/l10n_ar_arca_edi
 
+      # Metadata only. No connection variable is echoed -- not even the database
+      # name, which arrives as a secret: printing a secret reference gains
+      # nothing and the masking that would hide it is not a reason to try.
       - name: Report what is about to run
         run: |
           echo "repository : ${GITHUB_REPOSITORY}"
           echo "ref        : ${GITHUB_REF}"
           echo "sha        : ${GITHUB_SHA}"
           echo "mode       : ${{ inputs.mode }}"
-          echo "database   : ${{ secrets.ARCA_HOMO_PGDATABASE }}"
           echo "environment: testing (asserted by the runner)"
 
       - name: Refuse to start without connection details
