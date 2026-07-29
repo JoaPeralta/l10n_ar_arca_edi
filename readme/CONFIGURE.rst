@@ -157,116 +157,85 @@ authorized.
 Requesting the CAE automatically on post is available under
 **Request CAE automatically** and is off by default.
 
-Running the homologacion session
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+La sesion de homologacion
+~~~~~~~~~~~~~~~~~~~~~~~~~
 
-``tests/test_homologation.py`` talks to the real homologacion environment. It
-holds exactly one test method, and that is the point.
+Homologacion corre contra una base PostgreSQL **persistente y dedicada**, nunca
+contra una base que se destruya al terminar.
 
-WSAA issues one access ticket per certificate and service, valid for about
-twelve hours, and refuses to issue a second while the first is alive::
+La razon es el ticket de acceso. WSAA emite uno por certificado y servicio, lo
+mantiene vivo unas doce horas y rechaza emitir un segundo mientras el primero
+siga vigente::
 
    El CEE ya posee un TA valido para el acceso al WSN solicitado
 
-The ticket cache lives in the database, and Odoo rolls the test transaction back
-between test methods. A session split across several methods therefore throws
-away its copy of a ticket ARCA still holds, and every method after the first is
-refused. So the reads and the optional emission all happen inside one method:
-one certificate, one database, one transaction, one cache, one process, one
-ticket.
+Un ticket emitido no se puede des-emitir. El modulo ya lo persiste
+correctamente -- lo confirma en una transaccion propia antes de devolver el
+control -- pero eso no sirve de nada si la base desaparece con la corrida. Por
+eso la base sobrevive, y por eso ya no existe una sesion ejecutada como test de
+Odoo: bajo ``current_test`` la topologia transaccional degrada y no demuestra
+durabilidad.
 
-It skips cleanly unless all five variables are set, and it cannot touch
-production: the certificate environment is pinned to ``testing`` and asserted
-before the first call.
+Preparar la base (una sola vez)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-.. code-block:: bash
-
-   # Whoever created the certificate in WSASS
-   export ARCA_HOMO_CERT_HOLDER_CUIT=20-12345678-9
-   # The taxpayer the invoices belong to
-   export ARCA_HOMO_REPRESENTED_CUIT=30-71234567-1
-   export ARCA_HOMO_CERT="$(base64 -w0 homologacion.crt)"
-   export ARCA_HOMO_PRIVATE_KEY="$(base64 -w0 homologacion.key)"
-   export ARCA_HOMO_POS=1
-
-**Read-only.** Consumes no voucher number:
+La provision de PostgreSQL vive en el repositorio de deployment. Una vez que la
+base existe y el modulo esta instalado, el bootstrap del addon carga el material
+fiscal:
 
 .. code-block:: bash
 
-   odoo -d <db> -i l10n_ar_arca_edi --test-enable \
-        --test-tags 'arca_homologation' --stop-after-init
+   ARCA_HOMO_ALLOW_BOOTSTRAP=1        odoo shell -d <base> ... < tools/arca_homologation_bootstrap.py
 
-It checks that ``FEDummy`` answers, that WSAA issues a ticket for the holder,
-that a second request for the same ticket is served from the cache, that the
-holder may act for the represented CUIT, that the point of sale is enabled for
-it, that the receptor VAT condition table still matches what ARCA reports, that
-the last authorized number is readable, and that querying a voucher that does
-not exist returns nothing -- the behaviour reconciliation depends on.
+Es idempotente y manual. Nunca sobrescribe el certificado, la clave privada, el
+cache del ticket ni los intentos de autorizacion: solo completa lo que falta.
+Fija ``ir_attachment.location = db`` antes de cargar nada, porque
+``certificate`` y ``private_key`` son ``Binary(attachment=True)`` y de otro modo
+irian a un filestore que el runner no tiene. Al terminar verifica en SQL que el
+material quedo en ``ir_attachment.db_datas``.
 
-**Emission.** The same command, the same session, one extra variable. It
-continues after the reads and issues one real voucher, reusing the ticket the
-reads obtained:
+Las credenciales se pasan **solo en la siembra inicial**, con el PEM codificado
+en base64. Despues viven en la base y las variables deben eliminarse de donde se
+hayan cargado.
+
+Inspeccionar la base
+^^^^^^^^^^^^^^^^^^^^
 
 .. code-block:: bash
 
-   export ARCA_HOMO_ALLOW_EMISSION=1
-   odoo -d <db> -i l10n_ar_arca_edi --test-enable \
-        --test-tags 'arca_homologation' --stop-after-init
+   ARCA_HOMO_MODE=preflight        odoo shell -d <base> ... < tools/arca_homologation_runner.py
 
-It authorizes an invoice end to end and reads it back with ``FECompConsultar``,
-checking that ARCA filed it under the represented CUIT.
+Dos modos, ambos de solo lectura y ninguno llega a ARCA:
 
-.. warning::
+* ``preflight`` -- verifica TLS contra ``pg_stat_ssl``, que el modulo este
+  instalado, que ``installed_sha`` coincida con el codigo en ejecucion, que el
+  almacenamiento de adjuntos sea la base, que ``auto_request_cae`` este apagado,
+  que haya exactamente un certificado en ``testing`` y que su material este
+  presente.
+* ``ticket-status`` -- lo anterior, mas el ticket cacheado informado **solo por
+  vencimiento**.
 
-   Use a point of sale reserved for testing. A consumed number cannot be
-   returned.
+Todo chequeo aborta en lugar de corregir. Un modo desconocido tambien aborta: no
+hay valor por defecto.
+
+En CI
+~~~~~
+
+``.github/workflows/arca-homologation.yml`` es el unico punto operacional, y es
+manual (``workflow_dispatch``). Corre en un GitHub Environment protegido, exige
+TLS, toma un grupo de concurrency global con ``cancel-in-progress: false``, tiene
+timeout de veinte minutos y **no instala ni actualiza el modulo**.
+
+Un paso posterior cuenta las lineas ``WSAA: requesting a ticket for service`` del
+log y falla si no son cero: ningun modo de este workflow puede autenticar.
+
+El CI ordinario ya no puede alcanzar ARCA. El certificado y la clave nunca se
+escriben en el repositorio, y el job ``secrets`` falla el build si aparece
+material de clave commiteado.
 
 .. note::
 
-   Odoo's numbering has to be aligned with ARCA's before an emission run: the
-   invoice number must be exactly one more than ``FECompUltimoAutorizado``.
-   The session says so and sends nothing when it is not.
-
-In CI
-~~~~~
-
-One manually triggered job, one Odoo invocation, one database. The
-``run_emission`` input decides whether ``ARCA_HOMO_ALLOW_EMISSION`` is set for
-that run; there is no second process and no second job.
-
-Three things protect the ticket:
-
-* **Cooldown.** ``.github/scripts/arca_cooldown.py`` runs before any step that
-  can reach the network and refuses to start until 12 h 15 min after the last
-  manual *attempt* whose ARCA step actually began. It uses only the job's
-  ``GITHUB_TOKEN`` and reads no fiscal value. Being blocked leaves the network
-  step ``skipped``, so a refused attempt does not extend its own cooldown.
-
-  Attempts, not runs: a re-run keeps its ``GITHUB_RUN_ID`` and only advances
-  ``GITHUB_RUN_ATTEMPT``, so every earlier attempt of the same run is read from
-  its own ``/attempts/{n}/jobs`` endpoint and only the current attempt is
-  excluded. Re-running a session that already reached ARCA is refused; re-running
-  one that was blocked before the network is not.
-
-  The listing pages until it can show that everything left is older than the
-  window that matters. A fixed page would let a pile of blocked or skipped
-  attempts hide the one that took a ticket. That window spans 65 days 12 h
-  15 min, because runs are listed by *creation*, GitHub allows a re-run for
-  thirty days, and a run may live for thirty-five: an attempt that talked to
-  ARCA this morning can belong to a run created two months ago. (Six hours is
-  the limit on a *job's* execution, and is not the bound that applies here.)
-  The current run is additionally fetched by id, so a re-run
-  can always inspect its own earlier attempts. If paging fails, if the current
-  run cannot be read during a re-run, or if the defensive limit is reached, the
-  run is blocked rather than waved through.
-* **Exclusion.** The ARCA job takes a repository-wide, branch-independent
-  concurrency group with ``cancel-in-progress: false``. Two runs queue; they
-  never overlap, and a push can never cancel a manual run -- a cancellation
-  after ``loginCms`` would leave ARCA holding a ticket nobody has a copy of.
-* **Counting.** The step's output is captured and the number of
-  ``WSAA: requesting a ticket for service`` lines must be exactly one. Neither
-  the token nor the sign is ever logged, and nothing searches for them.
-
-The certificate and key are read from the environment and never written to the
-repository. The ``secrets`` job fails the build if key material is ever
-committed.
+   Los modos que si llegan a ARCA -- una llamada dummy, la prueba de reutilizacion
+   del ticket y la emision de un comprobante -- todavia no existen. No estan
+   deshabilitados: estan ausentes, y llegan con el cambio que este autorizado a
+   crearlos.

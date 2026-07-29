@@ -39,17 +39,21 @@ commits through `fiscal.checkpoint()` **before returning to its caller** — on 
 dedicated cursor that is not the caller's, so a later rollback cannot take the
 ticket with it ([`models/fiscal_transaction.py:62,86`](../../models/fiscal_transaction.py)).
 
-The gap is **infrastructural**. The homologación job writes that committed
-ticket into database `homo_l10n_ar_arca_edi` hosted by a `postgres:16` *service
-container* ([`.github/workflows/ci.yml:268-279,339`](../../.github/workflows/ci.yml)).
-The service container is created and destroyed with the job. The ticket is
-durably committed to a disk that is thrown away minutes later.
+The gap was **infrastructural**. The old homologación job wrote that committed
+ticket into a database hosted by a `postgres:16` service container, created and
+destroyed with the job — the ticket was durably committed to a disk thrown away
+minutes later. That job, and the cooldown that existed to limit the damage, have
+been retired.
 
-> **Consequence for today's operator.** Until the persistent homologación
-> database exists, every manual run costs one ticket and one twelve-hour
-> cooldown. Steps 5 and 7 below cannot be satisfied yet; the preflight in
-> `.github/scripts/arca_cooldown.py` is the compensating control, and it must
-> not be bypassed.
+Homologación now runs through
+[`.github/workflows/arca-homologation.yml`](../../.github/workflows/arca-homologation.yml)
+against a persistent database, driven by
+[`tools/arca_homologation_runner.py`](../../tools/arca_homologation_runner.py).
+
+> **Consequence for today's operator.** The persistent database does not exist
+> yet, so no homologación run is possible at all — which is the safe state. The
+> workflow's only modes are read-only and none can authenticate. Step 5 below
+> is still blocked, and nothing may reach ARCA until it is satisfied.
 
 ---
 
@@ -130,22 +134,21 @@ If a usable ticket exists, the session must reuse it and perform **zero**
 precedes the lock, and it is repeated under the lock so a worker that arrives
 second finds what the first committed instead of authenticating again.
 
-If no usable ticket exists, the cooldown preflight decides whether a new one may
-be requested at all: `.github/scripts/arca_cooldown.py` blocks until **12 h 15
-min** after the last manual attempt whose ARCA step actually started (twelve
-hours of ticket, fifteen minutes for clock skew). It is deliberately
-conservative — anything it cannot classify counts as risky. A false block costs
-a wait; a false pass costs an orphaned ticket.
+If no usable ticket exists, one has to be obtained — and no mode that can do so
+exists yet. The cooldown that used to gate this is gone with the disposable
+database it protected: with a persistent database the ticket is *kept*, so the
+question stops being "has enough time passed" and becomes "is the cached one
+still valid", which step 6 answers.
 
-Do not bypass it. Do not shorten `COOLDOWN`.
+`ticket-status` reports exactly that, by expiry alone.
 
 ## 8. Call `loginCms` at most once per session
 
 The whole ARCA session is one invocation, one database, one process, one ticket.
-This is why `tests/test_homologation.py` has a single test method: a second
-method is a second transaction, and a second transaction is a second
-`loginCms`. `.github/scripts/test_homologation_design.py` asserts that property
-offline.
+The property is now structural rather than a matter of test layout: the runner
+has no mode that authenticates, and
+`.github/scripts/test_arca_homologation_runner.py` asserts that none of them
+exists — not disabled, absent.
 
 The workflow verifies it after the fact by counting the module's own log line:
 
@@ -249,8 +252,8 @@ Every session, successful or not, is recorded with:
 | Certificate | internal record id only, never its material |
 | Ticket cached on entry | yes / no |
 | Ticket expiration | timestamp only |
-| `loginCms` calls | 0 or 1 |
-| Emission requested | `run_emission` input |
+| `loginCms` calls | 0 today; no mode can authenticate |
+| Mode dispatched | `preflight` or `ticket-status` |
 
 Never recorded: token, sign, the credentials XML, the private key, or any URL
 carrying a password.
