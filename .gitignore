@@ -5,3 +5,6 @@
 *.pfx
 __pycache__/
 *.pyc
+
+# Local agent tooling artifacts (machine-specific absolute paths)
+.atl/
