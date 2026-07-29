@@ -218,10 +218,53 @@ jobs:
           fi
           echo "$total tests passed"
 
+      # The one guarantee the suite above cannot make. Under `current_test`
+      # fiscal_transaction takes its single-cursor branch and checkpoint()
+      # degrades to flush(), so an ORM test proving "the ticket is still there"
+      # proves only that it is there in the transaction that wrote it.
+      #
+      # This spawns real `odoo shell` processes against a database of its own:
+      # one obtains a ticket and exits, the next must find it in PostgreSQL.
+      # Still offline -- _authenticate is replaced and zeep.Client is made
+      # unbuildable in every child.
+      - name: Access ticket survives its process
+        working-directory: extra-addons/l10n_ar_arca_edi
+        env:
+          PGHOST: db
+          PGPORT: "5432"
+          PGUSER: odoo
+          PGPASSWORD: odoo
+        run: |
+          set -o pipefail
+          # Exported here rather than declared in `env:` because this job runs in
+          # a container: `github.workspace` is the path on the *host*, while
+          # GITHUB_WORKSPACE inside the container is where the checkout actually
+          # is. Only the shell variable is right on this side of the mount.
+          export ARCA_TEST_ADDONS_PATH="/usr/lib/python3/dist-packages/odoo/addons,${GITHUB_WORKSPACE}/extra-addons"
+          python3 -m unittest discover \
+            --start-directory integration \
+            --top-level-directory integration \
+            --pattern 'test_*.py' \
+            --verbose 2>&1 | tee cross-process.log
+
+      # A skip here would mean the proof silently did not run.
+      - name: The cross-process proof actually ran
+        run: |
+          set -euo pipefail
+          log=extra-addons/l10n_ar_arca_edi/cross-process.log
+          if grep -q "skipped" "$log"; then
+            echo "::error::The cross-process ticket proof was skipped."
+            grep -i "skip" "$log" || true
+            exit 1
+          fi
+          echo "The cross-process proof ran."
+
       - name: Upload the log
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: odoo-test-log
-          path: odoo-test.log
+          path: |
+            odoo-test.log
+            extra-addons/l10n_ar_arca_edi/cross-process.log
           if-no-files-found: ignore
