@@ -234,9 +234,13 @@ jobs:
           PGPORT: "5432"
           PGUSER: odoo
           PGPASSWORD: odoo
-          ARCA_TEST_ADDONS_PATH: /usr/lib/python3/dist-packages/odoo/addons,${{ github.workspace }}/extra-addons
         run: |
           set -o pipefail
+          # Exported here rather than declared in `env:` because this job runs in
+          # a container: `github.workspace` is the path on the *host*, while
+          # GITHUB_WORKSPACE inside the container is where the checkout actually
+          # is. Only the shell variable is right on this side of the mount.
+          export ARCA_TEST_ADDONS_PATH="/usr/lib/python3/dist-packages/odoo/addons,${GITHUB_WORKSPACE}/extra-addons"
           python3 -m unittest discover \
             --start-directory integration \
             --top-level-directory integration \

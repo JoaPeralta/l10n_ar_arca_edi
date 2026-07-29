@@ -186,6 +186,18 @@ class TestTicketSurvivesTheProcess(unittest.TestCase):
             raise AssertionError(
                 f"installing the addon failed:\n{result.stdout[-4000:]}\n{result.stderr[-4000:]}"
             )
+        # Odoo exits 0 when the addons path is wrong and the module is simply
+        # never found, so the exit status alone does not mean it is installed.
+        # Asked directly, because everything below assumes it.
+        state = cls._psql(
+            cls.database,
+            "SELECT state FROM ir_module_module WHERE name = 'l10n_ar_arca_edi'",
+        )
+        if state != "installed":
+            raise AssertionError(
+                f"l10n_ar_arca_edi is {state or 'absent'}, not installed. "
+                f"Addons path was {addons_path()!r}."
+            )
 
     @classmethod
     def _spawn(cls, role, extra=None):
