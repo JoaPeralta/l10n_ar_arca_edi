@@ -174,11 +174,13 @@ def role_prepare(env):
         record.action_process_certificate(base64.b64encode(cert_pem))
         return record
 
-    primary = build("cross-process primary", "20123456789", "testing")
-    other = build("cross-process other holder", "27234567897", "testing")
+    # Real check digits, not invented ones: the model validates them. These are
+    # the same numbers the addon's own fixtures use.
+    primary = build("cross-process primary", "20222222223", "testing")
+    other = build("cross-process other holder", "30111111118", "testing")
     # Its environment is the only thing that differs from `primary`, and nothing
     # in this process can reach a network, so it stays inert.
-    production = build("cross-process other environment", "30345678909", "production")
+    production = build("cross-process other environment", "30712345671", "production")
 
     env.cr.commit()
     emit("primary_id", primary.id)
