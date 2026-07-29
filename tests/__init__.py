@@ -6,7 +6,6 @@ from . import (
     test_authorization,
     test_certificate,
     test_concurrency,
-    test_homologation,
     test_numbering,
     test_payload,
     test_qr,

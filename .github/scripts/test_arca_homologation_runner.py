@@ -360,19 +360,20 @@ class TestTheWorkflowCannotDestroyATicket(unittest.TestCase):
         self.assertIn("WSAA: requesting a ticket for service", run)
         self.assertIn("-ne 0", run)
 
-    def test_it_shares_the_lock_with_the_older_homologation_job(self):
-        """Two paths can reach ARCA today; they must never run at the same time.
+    def test_it_is_the_only_workflow_that_can_reach_arca(self):
+        """The disposable path is gone, so there is nothing left to race against.
 
-        ARCA's limit follows the certificate and service, so serialising each
-        workflow against itself is not enough -- both have to queue behind the
-        same group.
+        This used to assert that both paths shared a concurrency group. The
+        older job was retired, so the guarantee is now stronger and simpler:
+        there is only one entry point.
         """
-        ci = yaml.safe_load(
-            (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
-        )
-        older = ci["jobs"]["homologation"]["concurrency"]
-        self.assertEqual(older["group"], WORKFLOW["concurrency"]["group"])
-        self.assertIs(older["cancel-in-progress"], False)
+        workflows = REPO_ROOT / ".github" / "workflows"
+        touching = [
+            path.name
+            for path in sorted(workflows.glob("*.yml"))
+            if "secrets.ARCA_HOMO_" in path.read_text(encoding="utf-8")
+        ]
+        self.assertEqual(touching, ["arca-homologation.yml"])
 
     def test_no_connection_variable_is_ever_echoed(self):
         """Not even the database name: it arrives as a secret, so it is not printed."""

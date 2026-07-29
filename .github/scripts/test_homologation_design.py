@@ -1,279 +1,174 @@
 # Copyright 2026 Leonobitech
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
-"""The properties that keep one homologación run to one ARCA access ticket.
+"""The disposable homologación path is gone, and it must not come back.
 
-None of these run Odoo and none of them reach the network. They read the
-workflow and the session module as text, because the guarantees they protect
-live in structure -- how many test methods, how many Odoo invocations, which
-concurrency group -- and structure is exactly what a well-meant refactor
-quietly breaks.
+Ordinary CI used to carry a job that ran a real ARCA session against a
+PostgreSQL service container. That database died with the job, taking with it
+the only copy of an access ticket ARCA keeps alive for twelve more hours -- so
+every run ended by making the next one impossible, and an elaborate cooldown
+existed only to keep that from happening too often.
+
+That job, its cooldown, its emission opt-in and the Odoo test it executed are
+removed. What replaces it is `arca-homologation.yml`, which runs against a
+database that keeps its ticket.
+
+None of these tests run Odoo and none reach the network. They read the workflows
+and the suite as text, because what they protect is an absence -- and an absence
+is exactly what a well-meant change restores by accident.
 """
 
 import ast
 import pathlib
-import re
 import unittest
 
 import yaml
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
-WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "ci.yml"
-SESSION_PATH = REPO_ROOT / "tests" / "test_homologation.py"
+WORKFLOWS = REPO_ROOT / ".github" / "workflows"
+CI_PATH = WORKFLOWS / "ci.yml"
+OPERATIONAL_PATH = WORKFLOWS / "arca-homologation.yml"
+TESTS_DIR = REPO_ROOT / "tests"
+SCRIPTS_DIR = REPO_ROOT / ".github" / "scripts"
 
-WORKFLOW_TEXT = WORKFLOW_PATH.read_text(encoding="utf-8")
-SESSION_TEXT = SESSION_PATH.read_text(encoding="utf-8")
+CI_TEXT = CI_PATH.read_text(encoding="utf-8")
+CI = yaml.safe_load(CI_TEXT)
+OPERATIONAL = yaml.safe_load(OPERATIONAL_PATH.read_text(encoding="utf-8"))
 
-
-def load_workflow():
-    """Parse ci.yml.
-
-    ``on:`` is read by YAML 1.1 as the boolean True, which is a well known
-    wart and harmless here: nothing below looks at that key.
-    """
-    return yaml.safe_load(WORKFLOW_TEXT)
+# YAML 1.1 reads a bare `on:` as the boolean True. Well known and harmless.
+CI_TRIGGERS = CI.get("on", CI.get(True))
 
 
-WORKFLOW = load_workflow()
-HOMOLOGATION_JOB = WORKFLOW["jobs"]["homologation"]
-SESSION_TREE = ast.parse(SESSION_TEXT)
+def test_files():
+    return sorted(TESTS_DIR.glob("test_*.py"))
 
 
-def session_class():
-    for node in SESSION_TREE.body:
-        if isinstance(node, ast.ClassDef) and node.name.startswith("TestArca"):
-            return node
-    raise AssertionError("No homologación session class found")
+def tag_arguments(tree):
+    """Every string handed to an @tagged decorator in a module."""
+    tags = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        for decorator in node.decorator_list:
+            if (
+                isinstance(decorator, ast.Call)
+                and isinstance(decorator.func, ast.Name)
+                and decorator.func.id == "tagged"
+            ):
+                for argument in decorator.args:
+                    if isinstance(argument, ast.Constant) and isinstance(
+                        argument.value, str
+                    ):
+                        tags.add(argument.value)
+    return tags
 
 
-def steps_named(job):
-    return [step.get("name", "") for step in job["steps"]]
+class TestOrdinaryCiCannotReachArca(unittest.TestCase):
+    def test_the_homologation_job_is_gone(self):
+        self.assertNotIn("homologation", CI["jobs"])
+        self.assertEqual(sorted(CI["jobs"]), ["lint", "secrets", "test"])
+
+    def test_the_emission_opt_in_is_gone(self):
+        self.assertNotIn("run_emission", CI_TEXT)
+        dispatch = CI_TRIGGERS.get("workflow_dispatch")
+        self.assertFalse(dispatch and dispatch.get("inputs"))
+
+    def test_only_the_offline_suite_keeps_a_database(self):
+        """The offline suite still needs one; nothing else may have one."""
+        with_services = [name for name, job in CI["jobs"].items() if "services" in job]
+        self.assertEqual(with_services, ["test"])
+
+    def test_ordinary_ci_never_consumes_a_homologation_secret(self):
+        self.assertNotIn("secrets.ARCA_HOMO_", CI_TEXT)
+        # The only mentions left belong to the secrets job, which greps the tree
+        # for hard-coded credentials rather than using any.
+        for line in CI_TEXT.splitlines():
+            if "ARCA_HOMO_" in line:
+                with self.subTest(line=line.strip()[:60]):
+                    self.assertIn("git grep", line)
+
+    def test_no_cooldown_survives_in_ordinary_ci(self):
+        for marker in ("cooldown", "arca_cooldown", "GITHUB_RUN_ATTEMPT"):
+            with self.subTest(marker=marker):
+                self.assertNotIn(marker, CI_TEXT)
+
+    def test_the_cooldown_tooling_was_removed(self):
+        for name in ("arca_cooldown.py", "test_arca_cooldown.py"):
+            with self.subTest(name=name):
+                self.assertFalse((SCRIPTS_DIR / name).exists())
+        self.assertFalse((SCRIPTS_DIR / "fixtures").exists())
 
 
-def step(job, name):
-    for entry in job["steps"]:
-        if entry.get("name") == name:
-            return entry
-    raise AssertionError(f"No step named {name!r}; found {steps_named(job)}")
+class TestOnlyOneOperationalEntryPoint(unittest.TestCase):
+    """Exactly one workflow may talk to the homologación database."""
+
+    def test_arca_homologation_is_the_only_one(self):
+        touching = []
+        for path in sorted(WORKFLOWS.glob("*.yml")):
+            text = path.read_text(encoding="utf-8")
+            if "secrets.ARCA_HOMO_" in text:
+                touching.append(path.name)
+        self.assertEqual(touching, ["arca-homologation.yml"])
+
+    def test_it_is_manual_only(self):
+        triggers = OPERATIONAL.get("on", OPERATIONAL.get(True))
+        self.assertEqual(set(triggers), {"workflow_dispatch"})
+
+    def test_it_neither_installs_nor_upgrades_nor_runs_tests(self):
+        for job in OPERATIONAL["jobs"].values():
+            for step in job["steps"]:
+                run = str(step.get("run", ""))
+                for forbidden in ("--init", "-i ", "--update", "-u ", "--test-enable"):
+                    with self.subTest(step=step.get("name"), flag=forbidden):
+                        self.assertNotIn(forbidden, run)
 
 
-class TestOneSessionMethod(unittest.TestCase):
-    """A second test method means a second transaction, and a second loginCms."""
+class TestNoDiscoveredTestCanReachArca(unittest.TestCase):
+    """A real session must not be reachable from the Odoo suite at all."""
 
-    def test_the_external_session_has_exactly_one_test_method(self):
-        klass = session_class()
-        methods = [
-            node.name
-            for node in klass.body
-            if isinstance(node, ast.FunctionDef) and node.name.startswith("test")
-        ]
-        self.assertEqual(methods, ["test_homologation_session"])
+    def test_the_real_session_module_is_gone(self):
+        self.assertFalse((TESTS_DIR / "test_homologation.py").exists())
 
-    def test_no_other_class_in_the_module_defines_a_test(self):
-        offenders = [
-            f"{node.name}.{child.name}"
-            for node in SESSION_TREE.body
-            if isinstance(node, ast.ClassDef) and node is not session_class()
-            for child in node.body
-            if isinstance(child, ast.FunctionDef) and child.name.startswith("test")
-        ]
-        self.assertEqual(offenders, [])
+    def test_it_was_not_hidden_by_dropping_only_the_import(self):
+        """An unimported module left in the tree is worse than either half."""
+        package = (TESTS_DIR / "__init__.py").read_text(encoding="utf-8")
+        self.assertNotIn("test_homologation", package)
+        for path in test_files():
+            with self.subTest(module=path.name):
+                self.assertIn(path.stem, package)
 
-    def test_the_session_runs_its_steps_in_the_documented_order(self):
-        """Environment first, ticket once, emission last."""
-        klass = session_class()
-        method = next(
-            node
-            for node in klass.body
-            if isinstance(node, ast.FunctionDef) and node.name == "test_homologation_session"
-        )
-        called = [
-            node.func.attr
-            for node in ast.walk(method)
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-        ]
+    def test_no_test_carries_a_real_session_tag(self):
+        for path in test_files():
+            tags = tag_arguments(ast.parse(path.read_text(encoding="utf-8")))
+            for forbidden in ("external", "arca_homologation"):
+                with self.subTest(module=path.name, tag=forbidden):
+                    self.assertNotIn(forbidden, tags)
+
+    def test_no_test_reads_credentials_from_the_environment(self):
+        for path in test_files():
+            text = path.read_text(encoding="utf-8")
+            for marker in ("ARCA_HOMO_", "os.environ", "getenv"):
+                with self.subTest(module=path.name, marker=marker):
+                    self.assertNotIn(marker, text)
+
+    def test_the_suite_is_not_filtered_by_a_tag_nothing_carries(self):
+        """Excluding an absent tag reads as if a hidden path still existed."""
+        self.assertNotIn("-arca_homologation", CI_TEXT)
+        self.assertIn("--test-tags '/l10n_ar_arca_edi'", CI_TEXT)
+
+
+class TestTheReplacementStillProvesWhatMattered(unittest.TestCase):
+    """The old job carried two guarantees; both had to survive it."""
+
+    def test_the_ticket_counter_survived(self):
+        text = OPERATIONAL_PATH.read_text(encoding="utf-8")
+        self.assertIn("WSAA: requesting a ticket for service", text)
+
+    def test_the_repository_wide_lock_survived(self):
+        concurrency = OPERATIONAL["concurrency"]
         self.assertEqual(
-            called,
-            [
-                "_assert_environment_is_testing",
-                "_assert_service_reachable",
-                "_obtain_and_assert_ticket",
-                "_assert_ticket_is_reused",
-                "_assert_represented_taxpayer_authorized",
-                "_assert_point_of_sale",
-                "_assert_receptor_conditions",
-                "_assert_last_authorized_number",
-                "_assert_nonexistent_voucher",
-                "_assert_optional_emission",
-            ],
+            concurrency["group"], "arca-homologation-${{ github.repository }}"
         )
-
-
-class TestEmissionStaysInsideTheSession(unittest.TestCase):
-
-    def test_the_emission_is_a_helper_of_the_session_class(self):
-        klass = session_class()
-        helpers = [node.name for node in klass.body if isinstance(node, ast.FunctionDef)]
-        self.assertIn("_assert_optional_emission", helpers)
-
-    def test_reading_alone_issues_nothing(self):
-        """The helper returns before touching an invoice unless opted in."""
-        klass = session_class()
-        emission = next(
-            node
-            for node in klass.body
-            if isinstance(node, ast.FunctionDef) and node.name == "_assert_optional_emission"
-        )
-        guard = next(node for node in emission.body if isinstance(node, ast.If))
-        self.assertIsInstance(guard.test, ast.UnaryOp)
-        self.assertIsInstance(guard.test.op, ast.Not)
-        self.assertEqual(guard.test.operand.func.id, "emission_allowed")
-        self.assertTrue(any(isinstance(node, ast.Return) for node in guard.body))
-        # Nothing that creates or authorizes an invoice happens before the gate.
-        before_the_gate = emission.body[: emission.body.index(guard)]
-        for node in before_the_gate:
-            for call in ast.walk(node):
-                if isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute):
-                    self.assertNotIn(
-                        call.func.attr,
-                        ("_new_invoice", "_post_invoice", "_l10n_ar_arca_request_cae"),
-                    )
-
-    def test_the_emission_does_not_authenticate_again(self):
-        """A second ticket request anywhere after the reuse check fails loudly."""
-        self.assertIn("_authenticate", SESSION_TEXT)
-        self.assertIn("A second WSAA ticket was requested", SESSION_TEXT)
-
-    def test_the_old_emission_tag_is_gone(self):
-        """It named a second suite, which by definition meant a second ticket."""
-        self.assertNotIn("arca_homologation_emission", SESSION_TEXT)
-        self.assertNotIn("arca_homologation_emission", WORKFLOW_TEXT)
-
-
-class TestOneOdooInvocation(unittest.TestCase):
-
-    def test_only_one_step_can_reach_arca(self):
-        odoo_steps = [
-            entry.get("name")
-            for entry in HOMOLOGATION_JOB["steps"]
-            if "odoo \\" in (entry.get("run") or "")
-        ]
-        self.assertEqual(odoo_steps, ["ARCA network session"])
-
-    def test_the_session_uses_a_single_database(self):
-        session = step(HOMOLOGATION_JOB, "ARCA network session")
-        databases = {
-            line.strip().removeprefix("-d ").rstrip("\\").strip()
-            for line in session["run"].splitlines()
-            if line.strip().startswith("-d ")
-        }
-        self.assertEqual(databases, {"homo_l10n_ar_arca_edi"})
-
-    def test_emission_is_opted_into_only_by_the_input(self):
-        session = step(HOMOLOGATION_JOB, "ARCA network session")
-        self.assertEqual(
-            session["env"]["ARCA_HOMO_ALLOW_EMISSION"],
-            "${{ inputs.run_emission && '1' || '' }}",
-        )
-
-    def test_there_is_no_second_homologation_job(self):
-        arca_jobs = [
-            name
-            for name, job in WORKFLOW["jobs"].items()
-            if "homolog" in name.casefold() or "homolog" in str(job.get("name", "")).casefold()
-        ]
-        self.assertEqual(arca_jobs, ["homologation"])
-
-
-class TestTheCooldownRunsFirst(unittest.TestCase):
-
-    def test_the_preflight_precedes_the_network_step(self):
-        names = steps_named(HOMOLOGATION_JOB)
-        preflight = "Refuse to start while a previous ticket may still be alive"
-        self.assertIn(preflight, names)
-        self.assertLess(names.index(preflight), names.index("ARCA network session"))
-
-    def test_the_preflight_uses_only_the_job_token(self):
-        preflight = step(
-            HOMOLOGATION_JOB, "Refuse to start while a previous ticket may still be alive"
-        )
-        self.assertEqual(list(preflight["env"]), ["GITHUB_TOKEN"])
-        self.assertEqual(preflight["env"]["GITHUB_TOKEN"], "${{ secrets.GITHUB_TOKEN }}")
-
-    def test_the_job_may_read_its_own_run_history(self):
-        self.assertEqual(HOMOLOGATION_JOB["permissions"]["actions"], "read")
-
-
-class TestOneTicketIsEnforcedAfterwards(unittest.TestCase):
-
-    def test_the_session_log_is_captured(self):
-        session = step(HOMOLOGATION_JOB, "ARCA network session")
-        self.assertIn("tee arca-homologation.log", session["run"])
-        self.assertIn("set -o pipefail", session["run"])
-
-    def test_the_number_of_ticket_requests_is_checked(self):
-        check = step(HOMOLOGATION_JOB, "Exactly one WSAA ticket was requested")
-        self.assertIn("WSAA: requesting a ticket for service", check["run"])
-        # Zero is a failure too: a session that ran must have authenticated.
-        self.assertIn('"$requests" -eq 0', check["run"])
-        self.assertIn('"$requests" -eq 1', check["run"])
-
-    def test_the_check_never_looks_for_credentials(self):
-        """It counts a log line. It must not go looking for what is in one."""
-        check = step(HOMOLOGATION_JOB, "Exactly one WSAA ticket was requested")
-        for forbidden in (r"\btoken\b", r"\bsign\b", r"private key"):
-            self.assertIsNone(
-                re.search(forbidden, check["run"], re.IGNORECASE),
-                f"The ticket count step mentions {forbidden}",
-            )
-
-
-class TestConcurrency(unittest.TestCase):
-    """Two runs never overlap, and a manual run is never cancelled."""
-
-    def test_the_arca_job_is_serialised_across_every_branch(self):
-        group = HOMOLOGATION_JOB["concurrency"]["group"]
-        self.assertEqual(group, "arca-homologation-${{ github.repository }}")
-        # Nothing branch-specific: two branches must share the one queue.
-        self.assertNotIn("github.ref", group)
-        self.assertNotIn("github.head_ref", group)
-        self.assertNotIn("github.sha", group)
-
-    def test_the_arca_job_is_never_cancelled(self):
-        self.assertIs(HOMOLOGATION_JOB["concurrency"]["cancel-in-progress"], False)
-
-    def test_a_manual_run_is_never_cancelled_at_the_workflow_level(self):
-        self.assertEqual(
-            WORKFLOW["concurrency"]["cancel-in-progress"],
-            "${{ github.event_name != 'workflow_dispatch' }}",
-        )
-
-    def test_a_push_can_never_share_a_group_with_a_manual_run(self):
-        """Different event, different group -- so a push cannot cancel it."""
-        group = WORKFLOW["concurrency"]["group"]
-        self.assertIn("github.event_name", group)
-
-        def rendered(event, ref):
-            return (
-                group.replace("${{ github.workflow }}", "CI")
-                .replace("${{ github.event_name }}", event)
-                .replace("${{ github.ref }}", ref)
-            )
-
-        branch = "refs/heads/feat/production-hardening"
-        self.assertNotEqual(rendered("push", branch), rendered("workflow_dispatch", branch))
-        # Two manual runs on the same branch do share it, and queue.
-        self.assertEqual(
-            rendered("workflow_dispatch", branch), rendered("workflow_dispatch", branch)
-        )
-
-    def test_the_job_group_and_the_workflow_group_are_distinct(self):
-        """Sharing them would make a run wait for a lock it holds itself."""
-        self.assertNotEqual(
-            WORKFLOW["concurrency"]["group"], HOMOLOGATION_JOB["concurrency"]["group"]
-        )
-
-    def test_the_arca_job_stays_manual(self):
-        self.assertEqual(HOMOLOGATION_JOB["if"], "github.event_name == 'workflow_dispatch'")
+        self.assertIs(concurrency["cancel-in-progress"], False)
 
 
 if __name__ == "__main__":

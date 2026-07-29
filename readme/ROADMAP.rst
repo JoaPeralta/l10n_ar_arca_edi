@@ -14,9 +14,11 @@ Known limitations
 * **Batch requests** are not implemented. Each invoice is authorized on its own
   request, which keeps the failure of one from affecting another.
 * **The receptor VAT condition table** (RG 5616) is embedded as a fallback and
-  validated locally. ``FEParamGetCondicionIvaReceptor`` is implemented and the
-  homologation suite asserts the embedded table still matches what ARCA
-  reports, but the table is not refreshed automatically.
+  validated locally. ``FEParamGetCondicionIvaReceptor`` is implemented, but the
+  table is not refreshed automatically and nothing currently compares it against
+  what ARCA reports. The retired homologación session used to make that
+  comparison; it is a live check, so it belongs to a network mode of the
+  homologación runner and has to be rebuilt there.
 * **The taxpayer registry is not consulted.** ARCA validates the receptor CUIT
   itself (validations 10063 and 10238); those come back as rejections rather
   than being anticipated locally.
