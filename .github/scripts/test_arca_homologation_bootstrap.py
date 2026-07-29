@@ -242,9 +242,103 @@ class TestItNeverReachesTheNetwork(unittest.TestCase):
                 self.assertNotIn(forbidden, imported)
 
     def test_the_wsaa_and_wsfe_services_are_never_used(self):
-        for marker in ("l10n_ar.arca.wsaa", "l10n_ar.arca.wsfe", "loginCms", "FEDummy"):
+        for marker in (
+            "l10n_ar.arca.wsaa",
+            "l10n_ar.arca.wsfe",
+            "_get_or_refresh_token",
+            "loginCms",
+            "FEDummy",
+            "FECAESolicitar",
+            "FECompConsultar",
+        ):
             with self.subTest(marker=marker):
                 self.assertNotIn(marker, BOOTSTRAP_TEXT)
+
+
+class TestNothingSecretIsEverPrinted(unittest.TestCase):
+    """Status messages name fields; they never read their values."""
+
+    SECRET_ATTRIBUTES = ("private_key", "certificate", "l10n_ar_arca_token_cache")
+    SECRET_VARIABLES = ("ARCA_HOMO_PRIVATE_KEY", "ARCA_HOMO_CERT")
+
+    def print_calls(self):
+        for node in ast.walk(BOOTSTRAP_TREE):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "print"
+            ):
+                yield node
+
+    def test_no_print_reads_a_secret_attribute(self):
+        for call in self.print_calls():
+            for inner in ast.walk(call):
+                if isinstance(inner, ast.Attribute):
+                    with self.subTest(line=call.lineno, attr=inner.attr):
+                        self.assertNotIn(inner.attr, self.SECRET_ATTRIBUTES)
+
+    def test_no_print_reads_a_credential_variable(self):
+        for call in self.print_calls():
+            for inner in ast.walk(call):
+                if isinstance(inner, ast.Subscript) and isinstance(
+                    inner.slice, ast.Constant
+                ):
+                    with self.subTest(line=call.lineno, key=inner.slice.value):
+                        self.assertNotIn(inner.slice.value, self.SECRET_VARIABLES)
+
+    def test_the_ticket_is_reported_by_expiry_only(self):
+        source = ast.get_source_segment(BOOTSTRAP_TEXT, function_node("report_ticket"))
+        self.assertIn("expiration", source)
+        for secret in ('"token"', "'token'", '"sign"', "'sign'"):
+            with self.subTest(secret=secret):
+                self.assertNotIn(secret, source)
+
+    def test_nothing_is_written_to_disk(self):
+        for marker in ("open(", "write_text", "tempfile", "mkstemp", "NamedTemporary"):
+            with self.subTest(marker=marker):
+                self.assertNotIn(marker, BOOTSTRAP_TEXT)
+
+
+class TestItAbortsInsteadOfCorrecting(unittest.TestCase):
+    """Every mismatch is a stop, never a silent fix."""
+
+    ABORTING = (
+        "enforce_testing",
+        "link_company",
+        "verify_xmlid_is_unique",
+        "verify_key_pair",
+        "verify_storage",
+    )
+
+    def test_each_check_can_abort(self):
+        for name in self.ABORTING:
+            with self.subTest(function=name):
+                source = ast.get_source_segment(BOOTSTRAP_TEXT, function_node(name))
+                self.assertIn("SystemExit", source)
+
+    def test_a_stray_certificate_aborts_instead_of_being_joined(self):
+        source = ast.get_source_segment(
+            BOOTSTRAP_TEXT, function_node("find_or_create_certificate")
+        )
+        self.assertIn("SystemExit", source)
+        self.assertIn("strays", source)
+
+    def test_a_different_company_certificate_is_never_reassigned(self):
+        source = ast.get_source_segment(BOOTSTRAP_TEXT, function_node("link_company"))
+        assignment = "company.sudo().l10n_ar_arca_certificate_id = certificate.id"
+        self.assertIn("existing.id != certificate.id", source)
+        self.assertIn(assignment, source)
+        # The mismatch has to be refused before anything can be reassigned.
+        self.assertLess(
+            source.index("existing.id != certificate.id"), source.index(assignment)
+        )
+
+    def test_the_key_pair_is_verified_unconditionally(self):
+        """Not inside an `if`: the check runs on every bootstrap."""
+        node = function_node("verify_key_pair")
+        top_level = [type(stmt) for stmt in node.body]
+        self.assertNotIn(ast.If, top_level[:3])
+        self.assertIn("public_numbers", ast.get_source_segment(BOOTSTRAP_TEXT, node))
 
 
 class TestTheOrderThatMakesItCorrect(unittest.TestCase):
@@ -270,9 +364,37 @@ class TestTheOrderThatMakesItCorrect(unittest.TestCase):
         "load_material",
         "link_company",
         "report_ticket",
+        "verify_xmlid_is_unique",
+        "verify_key_pair",
         "verify_storage",
         "record_installed_sha",
     )
+
+    def test_every_verification_precedes_the_recorded_sha(self):
+        order = calls_in("main")
+        sha = order.index("record_installed_sha")
+        for check in ("verify_xmlid_is_unique", "verify_key_pair", "verify_storage"):
+            with self.subTest(check=check):
+                self.assertLess(order.index(check), sha)
+
+    def test_there_is_exactly_one_commit(self):
+        """One transaction: an interrupted bootstrap rolls back and can be repeated."""
+        commits = [
+            node
+            for node in ast.walk(BOOTSTRAP_TREE)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "commit"
+        ]
+        self.assertEqual(len(commits), 1)
+        # Nothing that changes state runs after it: the commit closes the only
+        # transaction, so an interruption before it leaves the database untouched
+        # and the bootstrap can simply be run again.
+        order = calls_in("main")
+        commit_at = order.index("commit")
+        for step in self.STEPS:
+            with self.subTest(step=step):
+                self.assertLess(order.index(step), commit_at)
 
     def test_the_gate_is_checked_before_every_other_step(self):
         order = calls_in("main")

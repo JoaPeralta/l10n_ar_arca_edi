@@ -234,6 +234,24 @@ def find_or_create_certificate(env, company, environ):
         print(f"[bootstrap] Certificado existente reutilizado (id={certificate.id})")
         return certificate
 
+    # Nothing is pinned yet. If the company already carries a certificate, it is
+    # not ours and this script has no business deciding its fate: adding a second
+    # one next to it produces two certificates where the company uses one, and
+    # replacing it would destroy material that may hold a live ticket.
+    strays = (
+        env["l10n_ar.arca.certificate"]
+        .sudo()
+        .search([("company_id", "=", company.id)])
+    )
+    if strays:
+        raise SystemExit(
+            f"[bootstrap] ABORTA: la compañía {company.id} ya tiene "
+            f"{len(strays)} certificado(s) (ids: {strays.ids}) y ninguno está "
+            f"anclado a {CERTIFICATE_XMLID}.\n"
+            "No se reemplaza ni se agrega uno al lado: resolvelo a mano y volvé "
+            "a correr el bootstrap."
+        )
+
     holder_cuit = environ.get("ARCA_HOMO_CERT_HOLDER_CUIT")
     if not holder_cuit:
         raise SystemExit(
@@ -313,9 +331,61 @@ def load_material(certificate, environ):
         print("[bootstrap] certificate procesado por action_process_certificate()")
 
 
+def verify_xmlid_is_unique(env, certificate):
+    """The external identifier must name exactly one record, and it must be ours.
+
+    The id behind it is what the WSAA lock key and the token cache are scoped to,
+    so a second row -- or one pointing somewhere else -- means a live ticket could
+    be looked up against the wrong certificate.
+    """
+    module, _, name = CERTIFICATE_XMLID.partition(".")
+    rows = (
+        env["ir.model.data"]
+        .sudo()
+        .search([("module", "=", module), ("name", "=", name)])
+    )
+    if len(rows) != 1:
+        raise SystemExit(
+            f"[bootstrap] ABORTA: {CERTIFICATE_XMLID} apunta a {len(rows)} registros; "
+            "tiene que apuntar a exactamente uno."
+        )
+    if rows.model != "l10n_ar.arca.certificate" or rows.res_id != certificate.id:
+        raise SystemExit(
+            f"[bootstrap] ABORTA: {CERTIFICATE_XMLID} apunta a "
+            f"{rows.model}#{rows.res_id}, no al certificado {certificate.id}."
+        )
+    print(f"[bootstrap] {CERTIFICATE_XMLID} -> único registro id={certificate.id}")
+
+
+def verify_key_pair(certificate):
+    """Certificate and private key must belong together. Local crypto only.
+
+    ``action_process_certificate`` checks this when it loads a certificate, but
+    it only runs when one was absent. Checking unconditionally covers the run
+    where the key was written next to a certificate that already existed.
+    """
+    protected = certificate.sudo()
+    cert = protected._load_certificate()
+    key = protected._load_private_key()
+    if cert.public_key().public_numbers() != key.public_key().public_numbers():
+        raise SystemExit(
+            f"[bootstrap] ABORTA: el certificado y la clave privada de "
+            f"'{protected.name}' no son pareja. Nada se corrige automáticamente."
+        )
+    print("[bootstrap] Certificado y clave privada verificados como pareja")
+
+
 def link_company(certificate, company):
-    if company.sudo().l10n_ar_arca_certificate_id:
-        print("[bootstrap] La compañía ya tiene certificado asignado: se conserva")
+    """Point the company at the seeded certificate, never at a different one."""
+    existing = company.sudo().l10n_ar_arca_certificate_id
+    if existing and existing.id != certificate.id:
+        raise SystemExit(
+            f"[bootstrap] ABORTA: la compañía {company.id} apunta al certificado "
+            f"{existing.id}, distinto del sembrado ({certificate.id}). "
+            "No se reemplaza: reasignarlo puede dejar huérfano un ticket vigente."
+        )
+    if existing:
+        print("[bootstrap] La compañía ya apunta al certificado sembrado")
         return
     company.sudo().l10n_ar_arca_certificate_id = certificate.id
     print(f"[bootstrap] Certificado {certificate.id} asignado a la compañía {company.id}")
@@ -401,6 +471,12 @@ def main(env, environ=None):
     load_material(certificate, environ)
     link_company(certificate, company)
     report_ticket(certificate)
+
+    # Everything below only reads, and every one of them aborts rather than
+    # correcting: a bootstrap that quietly fixed a mismatch would be a bootstrap
+    # nobody could trust afterwards.
+    verify_xmlid_is_unique(env, certificate)
+    verify_key_pair(certificate)
     verify_storage(env, certificate)
 
     # Only now: the SHA is the claim that this database matches that code.
