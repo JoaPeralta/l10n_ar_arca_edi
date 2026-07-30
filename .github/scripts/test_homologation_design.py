@@ -19,6 +19,7 @@ is exactly what a well-meant change restores by accident.
 
 import ast
 import pathlib
+import re
 import unittest
 
 import yaml
@@ -38,8 +39,54 @@ OPERATIONAL = yaml.safe_load(OPERATIONAL_PATH.read_text(encoding="utf-8"))
 CI_TRIGGERS = CI.get("on", CI.get(True))
 
 
+# A password flag together with whatever value follows it. The value may be
+# quoted, may be a `${{ ... }}` expression -- which contains spaces, so a bare
+# `\S+` would stop at the first brace and read as harmless -- or may be a plain
+# token. `-w` is Odoo's short spelling of the same option; the lookbehind keeps
+# it from matching inside `--without-demo` or an English word in a comment.
+PASSWORD_ARGUMENT = re.compile(
+    r"(?:--db_password|(?<![\w-])-w)[=\s]+"
+    r"(\"[^\"]*\"|'[^']*'|\$\{\{[^}]*\}\}|\S+)"
+)
+
+# The one value a password flag may carry, and only in ordinary CI: the
+# password of a service container that dies with the job.
+DISPOSABLE_PASSWORD = "odoo"
+
+
 def test_files():
     return sorted(TESTS_DIR.glob("test_*.py"))
+
+
+def workflow_files():
+    return sorted([*WORKFLOWS.glob("*.yml"), *WORKFLOWS.glob("*.yaml")])
+
+
+def password_arguments_in(text):
+    """Every value handed to a password flag, in source order."""
+    return [match.group(1) for match in PASSWORD_ARGUMENT.finditer(text)]
+
+
+def unquoted(value):
+    """The value with one surrounding pair of quotes removed, if it has any."""
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        return value[1:-1]
+    return value
+
+
+def refused_password_arguments(workflow_name, text):
+    """Every password argument this policy refuses, in source order.
+
+    An allowlist, and deliberately not a list of secret-looking spellings. Any
+    workflow other than ordinary CI may pass no password argument at all --
+    whatever it would carry. Ordinary CI may pass exactly one value, the
+    literal `odoo`, so a shell expansion, a command substitution or a GitHub
+    expression is refused there too, whatever it is named.
+    """
+    values = password_arguments_in(text)
+    if workflow_name != CI_PATH.name:
+        return values
+    return [value for value in values if unquoted(value) != DISPOSABLE_PASSWORD]
 
 
 def tag_arguments(tree):
@@ -154,6 +201,132 @@ class TestNoDiscoveredTestCanReachArca(unittest.TestCase):
         """Excluding an absent tag reads as if a hidden path still existed."""
         self.assertNotIn("-arca_homologation", CI_TEXT)
         self.assertIn("--test-tags '/l10n_ar_arca_edi'", CI_TEXT)
+
+
+class TestNoWorkflowPutsAPasswordInArgv(unittest.TestCase):
+    """A password on the command line is published to the whole machine.
+
+    `/proc/<pid>/cmdline` is world-readable; `/proc/<pid>/environ` is readable
+    only by the same user and root. Odoo 19 already reads `PGPASSWORD` from the
+    environment on its own -- every database option declares an `env_name`, and
+    the command line wins only because it sits ahead of the environment in the
+    lookup chain. Passing the password as an argument is therefore not merely
+    redundant: it is the one spelling that gives it away.
+
+    The disposable database in ordinary CI is a different matter. Its password
+    is the literal `odoo`, it belongs to a service container that dies with the
+    job, and there is nothing there to protect. A test that refused that too
+    would be refusing the word rather than the exposure, and would be switched
+    off the first time it got in the way. So it is allowed -- as that literal,
+    in that file, and nothing else.
+    """
+
+    def test_no_workflow_but_ordinary_ci_passes_a_password_flag(self):
+        for path in workflow_files():
+            if path.name == CI_PATH.name:
+                continue
+            with self.subTest(workflow=path.name):
+                self.assertEqual(
+                    password_arguments_in(path.read_text(encoding="utf-8")), []
+                )
+
+    def test_ordinary_ci_passes_nothing_but_the_disposable_literal(self):
+        self.assertEqual(refused_password_arguments(CI_PATH.name, CI_TEXT), [])
+
+    def test_the_disposable_database_keeps_its_literal_password(self):
+        """Asserted, not merely tolerated: the exception has to stay visible."""
+        written = [unquoted(value) for value in password_arguments_in(CI_TEXT)]
+        self.assertIn(DISPOSABLE_PASSWORD, written)
+
+    def test_the_operational_workflow_still_receives_the_secret(self):
+        """Dropping the argument must not drop the environment variable."""
+        text = OPERATIONAL_PATH.read_text(encoding="utf-8")
+        self.assertIn("PGPASSWORD: ${{ secrets.ARCA_HOMO_PGPASSWORD }}", text)
+
+
+class TestThePasswordPolicyRefusesRenamedSecrets(unittest.TestCase):
+    """Synthetic cases, so the policy is exercised by more than today's tree.
+
+    The first version of this rule refused values that mentioned `PGPASSWORD`,
+    `secrets.` or `${{`. Renaming the variable walked straight past it:
+
+        env:
+          DB_PASS: ${{ secrets.ARCA_HOMO_PGPASSWORD }}
+        run: odoo --db_password="$DB_PASS"
+
+    A list of secret-looking spellings can only ever contain the spellings
+    someone already thought of, and the next one is always free. The rule below
+    allows one literal in one file and refuses everything else, so a name
+    nobody has invented yet is refused before it exists.
+    """
+
+    RENAMED = (
+        '--db_password="$DB_PASS"',
+        "--db_password=$DB_PASS",
+        '--db_password="${DB_PASS}"',
+        '-w "$DB_PASS"',
+        "-w ${DB_PASS}",
+    )
+
+    OTHERWISE_HIDDEN = (
+        '--db_password="$(cat /run/secrets/pg)"',
+        "--db_password=`cat /run/secrets/pg`",
+        '--db_password="${{ secrets.ARCA_HOMO_PGPASSWORD }}"',
+        "--db_password=${{ secrets.ANYTHING_AT_ALL }}",
+        '-w "${{ secrets.ARCA_HOMO_PGPASSWORD }}"',
+    )
+
+    ACCEPTED_IN_ORDINARY_CI = (
+        "--db_password=odoo",
+        '--db_password "odoo"',
+        "-w odoo",
+        '-w "odoo"',
+    )
+
+    def test_a_renamed_variable_is_refused_in_ordinary_ci(self):
+        for snippet in self.RENAMED:
+            with self.subTest(snippet=snippet):
+                self.assertNotEqual(
+                    refused_password_arguments(CI_PATH.name, snippet), []
+                )
+
+    def test_a_renamed_variable_is_refused_in_any_other_workflow(self):
+        for snippet in self.RENAMED:
+            with self.subTest(snippet=snippet):
+                self.assertNotEqual(
+                    refused_password_arguments("arca-homologation.yml", snippet), []
+                )
+
+    def test_substitutions_and_expressions_are_refused(self):
+        for snippet in self.OTHERWISE_HIDDEN:
+            for workflow in (CI_PATH.name, "arca-homologation.yml"):
+                with self.subTest(snippet=snippet, workflow=workflow):
+                    self.assertNotEqual(
+                        refused_password_arguments(workflow, snippet), []
+                    )
+
+    def test_the_disposable_literal_is_accepted_only_in_ordinary_ci(self):
+        for snippet in self.ACCEPTED_IN_ORDINARY_CI:
+            with self.subTest(snippet=snippet):
+                self.assertEqual(refused_password_arguments(CI_PATH.name, snippet), [])
+                # Same literal, wrong file: an operational workflow reaches a
+                # database worth protecting, so it may pass no password at all.
+                self.assertNotEqual(
+                    refused_password_arguments("arca-homologation.yml", snippet), []
+                )
+
+    def test_a_different_literal_is_refused_even_in_ordinary_ci(self):
+        for snippet in ("--db_password=odoo2", "--db_password=notodoo", "-w 'odoo '"):
+            with self.subTest(snippet=snippet):
+                self.assertNotEqual(
+                    refused_password_arguments(CI_PATH.name, snippet), []
+                )
+
+    def test_the_flag_is_read_as_a_flag_and_not_as_a_substring(self):
+        """`--without-demo` and ordinary prose must not register as `-w`."""
+        for snippet in ("--without-demo=all", "# Repository-wide and branch-independent"):
+            with self.subTest(snippet=snippet):
+                self.assertEqual(password_arguments_in(snippet), [])
 
 
 class TestTheReplacementStillProvesWhatMattered(unittest.TestCase):

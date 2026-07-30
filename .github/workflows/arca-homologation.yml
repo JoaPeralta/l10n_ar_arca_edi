@@ -109,11 +109,17 @@ jobs:
           # TLS is requested here and *verified* by the runner against
           # pg_stat_ssl: this database is reachable through a public TCP proxy,
           # so an unencrypted connection is refused rather than assumed away.
+          #
+          # The password is deliberately absent from this command. Odoo 19
+          # declares an `env_name` for every database option, so PGPASSWORD from
+          # the step environment above already reaches it; spelling it out as
+          # `--db_password` would only add a copy in /proc/<pid>/cmdline, which
+          # every process on the machine can read. The remaining options stay on
+          # the command line for now -- moving them is a separate change.
           odoo shell \
             --db_host="${PGHOST}" \
             --db_port="${PGPORT}" \
             --db_user="${PGUSER}" \
-            --db_password="${PGPASSWORD}" \
             --database="${PGDATABASE}" \
             --addons-path=/usr/lib/python3/dist-packages/odoo/addons,${GITHUB_WORKSPACE}/extra-addons \
             --max-cron-threads=0 \
