@@ -19,6 +19,7 @@ is exactly what a well-meant change restores by accident.
 
 import ast
 import pathlib
+import re
 import unittest
 
 import yaml
@@ -38,8 +39,30 @@ OPERATIONAL = yaml.safe_load(OPERATIONAL_PATH.read_text(encoding="utf-8"))
 CI_TRIGGERS = CI.get("on", CI.get(True))
 
 
+# A password flag together with whatever value follows it. The value may be
+# quoted, may be a `${{ ... }}` expression -- which contains spaces, so a bare
+# `\S+` would stop at the first brace and read as harmless -- or may be a plain
+# token. `-w` is Odoo's short spelling of the same option; the lookbehind keeps
+# it from matching inside `--without-demo` or an English word in a comment.
+PASSWORD_ARGUMENT = re.compile(
+    r"(?:--db_password|(?<![\w-])-w)[=\s]+"
+    r"(\"[^\"]*\"|'[^']*'|\$\{\{[^}]*\}\}|\S+)"
+)
+
+# What may never appear on the right-hand side of one of those flags. The two
+# direct spellings are the variable's own name and the `secrets.` prefix; any
+# other `${{ ... }}` expression is refused as well, so renaming the secret into
+# a differently spelled expression does not walk past this test.
+FORBIDDEN_IN_A_PASSWORD_ARGUMENT = ("PGPASSWORD", "secrets.", "${{")
+
+
 def test_files():
     return sorted(TESTS_DIR.glob("test_*.py"))
+
+
+def password_arguments_in(text):
+    """Every value handed to a password flag, in source order."""
+    return [match.group(1) for match in PASSWORD_ARGUMENT.finditer(text)]
 
 
 def tag_arguments(tree):
@@ -154,6 +177,41 @@ class TestNoDiscoveredTestCanReachArca(unittest.TestCase):
         """Excluding an absent tag reads as if a hidden path still existed."""
         self.assertNotIn("-arca_homologation", CI_TEXT)
         self.assertIn("--test-tags '/l10n_ar_arca_edi'", CI_TEXT)
+
+
+class TestNoWorkflowPutsAPasswordInArgv(unittest.TestCase):
+    """A password on the command line is published to the whole machine.
+
+    `/proc/<pid>/cmdline` is world-readable; `/proc/<pid>/environ` is readable
+    only by the same user and root. Odoo 19 already reads `PGPASSWORD` from the
+    environment on its own -- every database option declares an `env_name`, and
+    the command line wins only because it sits ahead of the environment in the
+    lookup chain. Passing the password as an argument is therefore not merely
+    redundant: it is the one spelling that gives it away.
+
+    The disposable database in ordinary CI is a different matter. Its password
+    is the literal `odoo`, it belongs to a service container that dies with the
+    job, and there is nothing there to protect. A test that refused that too
+    would be refusing the word rather than the exposure, and would be switched
+    off the first time it got in the way.
+    """
+
+    def test_no_password_flag_carries_a_secret(self):
+        for path in sorted(WORKFLOWS.glob("*.yml")):
+            text = path.read_text(encoding="utf-8")
+            for value in password_arguments_in(text):
+                for forbidden in FORBIDDEN_IN_A_PASSWORD_ARGUMENT:
+                    with self.subTest(workflow=path.name, marker=forbidden):
+                        self.assertNotIn(forbidden, value)
+
+    def test_the_disposable_database_keeps_its_literal_password(self):
+        """Asserted, not merely tolerated: the exception has to stay visible."""
+        self.assertIn("odoo", password_arguments_in(CI_TEXT))
+
+    def test_the_operational_workflow_still_receives_the_secret(self):
+        """Dropping the argument must not drop the environment variable."""
+        text = OPERATIONAL_PATH.read_text(encoding="utf-8")
+        self.assertIn("PGPASSWORD: ${{ secrets.ARCA_HOMO_PGPASSWORD }}", text)
 
 
 class TestTheReplacementStillProvesWhatMattered(unittest.TestCase):
