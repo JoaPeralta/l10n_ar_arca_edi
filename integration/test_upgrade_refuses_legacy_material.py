@@ -43,6 +43,7 @@ It needs PostgreSQL (``PGHOST``/``PGUSER``/``PGPASSWORD``) and an ``odoo`` on
 PATH, and skips with a clear reason when either is missing.
 """
 
+import ast
 import os
 import pathlib
 import shutil
@@ -53,8 +54,20 @@ import uuid
 HERE = pathlib.Path(__file__).resolve().parent
 REPO_ROOT = HERE.parent
 
+
+# The shape being reproduced: the last version before the fields moved into
+# columns. A literal, because it names a historical state that cannot change.
 PREVIOUS_VERSION = "19.0.2.0.0"
-NEW_VERSION = "19.0.3.0.0"
+
+# What the module upgrades *to*, read from the manifest rather than frozen.
+# It was a literal `19.0.3.0.0` and broke on the first patch release: the
+# assertion is "the module is recorded at the version it declares", not "at
+# 19.0.3.0.0 forever". The migration directory stays at 19.0.3.0.0 -- Odoo runs
+# every migration between the installed version and the target, so a later
+# patch still runs it.
+NEW_VERSION = ast.literal_eval(
+    (REPO_ROOT / "__manifest__.py").read_text(encoding="utf-8")
+)["version"]
 
 MODEL = "l10n_ar.arca.certificate"
 TABLE = "l10n_ar_arca_certificate"
