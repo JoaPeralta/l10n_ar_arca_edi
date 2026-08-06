@@ -4,8 +4,10 @@
 
 The upgrade moves ``private_key`` and ``certificate`` out of ``ir.attachment``
 and into columns. Odoo creates the columns and leaves the old attachments where
-they are, so a database that holds its material in the filestore comes back up
-with empty columns and a certificate that cannot sign.
+they are, so a database that still holds its material there comes back up with
+empty columns and a certificate that cannot sign -- whether that material's
+bytes sat in ``db_datas`` or in the filestore, because the module now reads the
+column and the column is empty either way.
 
 The script's whole job is to stop that upgrade. Everything about *how* it stops
 it is checkable here, without Odoo and without a database:

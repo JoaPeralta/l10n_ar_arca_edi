@@ -262,7 +262,7 @@ def role_reload(env):
     from cryptography.hazmat.primitives.asymmetric import padding
 
     # Both halves, reloaded from their columns and checked against each other.
-    # This is what WSAA needs and what a filestore restore used to lose.
+    # This is what WSAA needs, and what an incomplete restore used to lose.
     loaded_certificate = certificate._load_certificate()
     emit(
         "certificate_matches_key",

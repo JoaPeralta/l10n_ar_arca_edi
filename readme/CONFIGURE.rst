@@ -190,8 +190,9 @@ fiscal:
 Es idempotente y manual. Nunca sobrescribe el certificado, la clave privada, el
 cache del ticket ni los intentos de autorizacion: solo completa lo que falta.
 Fija ``ir_attachment.location = db`` antes de cargar nada, porque
-``certificate`` y ``private_key`` son ``Binary(attachment=True)`` y de otro modo
-irian a un filestore que el runner no tiene. Al terminar verifica en SQL que el
+``certificate`` y ``private_key`` son ``Binary(attachment=False)``: viven en
+columnas propias de ``l10n_ar_arca_certificate``, dentro de PostgreSQL y bajo el
+mismo contrato de backup que su registro. Al terminar verifica en SQL que el
 material quedo en ``ir_attachment.db_datas``.
 
 Las credenciales se pasan **solo en la siembra inicial**, con el PEM codificado

@@ -23,22 +23,24 @@ database does on every run.
 Where the fiscal material lives
 ------------------------------
 ``private_key`` and ``certificate`` are ``Binary(attachment=False)``, so both
-live in columns of ``l10n_ar_arca_certificate`` -- inside the row, inside the
-transaction, inside ``pg_dump``.
+live in columns of ``l10n_ar_arca_certificate`` -- inside the row, inside its
+transaction, under the same backup contract as the row itself.
 
 This used to be the opposite, and the script used to compensate. Both fields
-were ``attachment=True``, which put the bytes in the filestore: a directory on
-disk, as disposable on a runner as the database used to be. With a persistent
-database and an empty filestore the certificate row and the cached ticket both
-survived, and ``_check_usable()`` still raised "has no private key stored"
-*before* the cached ticket was ever read. So this script pinned
-``ir_attachment.location`` to ``db`` for the whole database and called
-``force_storage()``.
+were ``attachment=True``, which stores the value through ``ir.attachment``;
+where the content ends up is decided by ``ir_attachment.location``, whose
+default is ``file`` -- the filestore, a directory on disk, as disposable on a
+runner as the database used to be. With a persistent database and a filestore
+that did not survive, the certificate row and the cached ticket both survived
+and ``_check_usable()`` still raised "has no private key stored" *before* the
+cached ticket was ever read. So this script pinned ``ir_attachment.location``
+to ``db`` for the whole database and called ``force_storage()``.
 
 Both of those are gone. Pinning a global parameter to fix one module's fields
 was always too wide a lever -- it moved every attachment in the database,
-including ones belonging to nobody here -- and with the fields in columns it
-fixes nothing at all. What remains is the verification, rewritten to ask the
+including ones belonging to nobody here -- and it made this deployment's
+correctness depend on a setting anyone could change. With the fields in columns
+it fixes nothing at all. What remains is the verification, rewritten to ask the
 question that is now the right one: are the columns there, and do they hold
 bytes? It still aborts without recording anything if they do not.
 
@@ -146,10 +148,12 @@ def storage_problems(columns, sizes, legacy_attachments):
     ``columns``            names the table actually has.
     ``sizes``              ``{field: byte length}``; ``None`` means SQL NULL.
     ``legacy_attachments`` how many old ``ir.attachment`` rows still claim these
-                           fields -- a count, never their contents.
+                           fields -- a count, never their contents, and counted
+                           whether that content sits in ``db_datas`` or in the
+                           filestore.
 
     An empty list means both values are in columns of ``l10n_ar_arca_certificate``
-    and nothing depends on a filestore that a runner throws away.
+    and nothing here depends on ``ir.attachment`` or on how it is configured.
     """
     problems = []
     for field in MATERIAL_FIELDS:

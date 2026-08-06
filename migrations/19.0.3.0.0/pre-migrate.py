@@ -5,9 +5,15 @@
 19.0.3.0.0 moves ``private_key`` and ``certificate`` from ``attachment=True``
 to columns of ``l10n_ar_arca_certificate``. Odoo creates the columns and leaves
 the old ``ir.attachment`` rows exactly where they are -- so a database that
-holds its key in the filestore comes back up with an empty column, a
+still holds its material there comes back up with an empty column, a
 certificate that reports itself present through nothing at all, and a
 ``_check_usable()`` failure at the first authentication.
+
+That is true wherever the attachment's content happens to live. Whether
+``ir_attachment.location`` put those bytes in ``db_datas`` or in the filestore
+changes nothing about the outcome: the new column is empty either way, and the
+module reads the column. So the count below asks only whether such a row
+exists, never where its content is.
 
 This script does not migrate that material. It refuses to let the upgrade
 proceed while any of it exists.

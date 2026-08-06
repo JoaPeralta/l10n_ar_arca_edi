@@ -120,12 +120,14 @@ class TestTheStorageVerdict(unittest.TestCase):
     """Both values in their columns, and nothing left claiming them elsewhere.
 
     This class used to be about ``ir_attachment.db_datas`` and ``store_fname``,
-    because both fields were ``attachment=True`` and the bootstrap pinned
-    ``ir_attachment.location`` to ``db`` to keep them out of a filestore the
-    runner throws away. Since 19.0.3.0.0 they are columns of
-    ``l10n_ar_arca_certificate``, so the filestore is not in the picture and the
-    questions changed: does the column exist, does it hold bytes, and is there
-    an old attachment still claiming the field.
+    because both fields were ``attachment=True`` -- stored through
+    ``ir.attachment``, with the content's location decided by
+    ``ir_attachment.location`` -- and the bootstrap pinned that parameter to
+    ``db`` so the bytes would be inside PostgreSQL rather than in a filestore
+    the runner throws away. Since 19.0.3.0.0 they are columns of
+    ``l10n_ar_arca_certificate``, so ``ir.attachment`` is not in the picture at
+    all and the questions changed: does the column exist, does it hold bytes,
+    and is there an old attachment still claiming the field.
     """
 
     COLUMNS = {"certificate", "private_key"}

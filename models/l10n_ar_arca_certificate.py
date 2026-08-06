@@ -108,12 +108,21 @@ class L10nArArcaCertificate(models.Model):
     # signing path reaches it deliberately through sudo.
     #
     # `attachment=False` puts the bytes in the model's own column instead of in
-    # `ir.attachment`. An attachment-backed binary lives in the filestore, which
-    # is a directory on disk: it is written outside the row's transaction, it is
-    # not in a `pg_dump` of the database, and restoring that dump onto a host
-    # whose filestore was not copied with it produces a certificate that looks
-    # present and cannot sign. The key belongs where the record it authenticates
-    # is, under the same transaction and the same backup.
+    # `ir.attachment`.
+    #
+    # What that buys is independence from configuration. An attachment-backed
+    # binary is stored through `ir.attachment`, and where its *content* ends up
+    # is decided by `ir_attachment.location`: the default is `file`, the
+    # filestore on disk, and with `db` it can sit in `ir_attachment.db_datas`
+    # inside PostgreSQL. So such a field may need a coordinated restore of
+    # PostgreSQL and the filestore, or may be entirely inside PostgreSQL --
+    # depending on a global setting this module does not own and should not
+    # depend on. A key restored without its bytes produces a certificate that
+    # looks present and cannot sign.
+    #
+    # A column gives the stronger, stable guarantee: this pair is in
+    # PostgreSQL, in the row it authenticates, under the same transaction and
+    # the same backup contract as that row, whatever `ir.attachment` is set to.
     #
     # `copy=False` because `copy()` on an attachment-backed field duplicates the
     # attachment: one key, two records, and no way to tell afterwards which of
@@ -140,10 +149,11 @@ class L10nArArcaCertificate(models.Model):
 
     # Public material, and stored beside the key for the same reason the key is:
     # WSAA needs both halves to build a signature, so a restore that brings one
-    # back and not the other cannot authenticate either. Leaving this one in the
-    # filestore would have made `pg_dump` a complete backup of the secret half
-    # and an incomplete backup of the pair, which is the worse of the two
-    # failures -- it looks recoverable.
+    # back and not the other cannot authenticate either. Leaving this one behind
+    # `ir.attachment` would have put the two halves under different backup
+    # contracts -- one guaranteed by the row, one depending on how attachments
+    # happen to be configured -- which is the worse of the two failures, because
+    # it looks recoverable.
     #
     # No `groups`: a certificate is what ARCA hands back and what a counterparty
     # can read. It is not a secret and pretending otherwise teaches the wrong

@@ -81,11 +81,13 @@ def storage_problems(columns, sizes, legacy_attachments):
                            fields -- a count, never their contents.
 
     Empty means both values live in columns of ``l10n_ar_arca_certificate``, so
-    nothing depends on a filestore this runner does not have.
+    nothing here depends on ``ir.attachment`` or on how it is configured.
 
     This used to read ``db_datas`` and ``store_fname``, because both fields were
-    ``attachment=True`` and the bootstrap pinned ``ir_attachment.location`` to
-    ``db`` to keep them out of the filestore. They are columns now, the
+    ``attachment=True`` -- stored through ``ir.attachment``, with the content's
+    location decided by ``ir_attachment.location`` -- and the bootstrap pinned
+    that parameter to ``db`` so the bytes would be inside PostgreSQL rather than
+    in the filestore this runner does not have. They are columns now, the
     parameter is no longer set, and a runner still demanding it would abort
     every session against a correctly prepared database.
     """

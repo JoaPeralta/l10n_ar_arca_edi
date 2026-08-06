@@ -11,9 +11,10 @@ key. It needs Odoo, PostgreSQL and an installed module to say so.
 This one needs nothing but Python, and it asserts the three declarations those
 behaviours follow from. That matters for a specific reason: the behavioural
 tests can only run where a runner exists, and the declaration is one keyword
-argument away from silently reverting. ``attachment=True`` would move the key
-back into the filestore, and every behavioural test that did not run that day
-would have caught it.
+argument away from silently reverting. ``attachment=True`` would put the key
+back behind ``ir.attachment``, where its content's location depends on
+``ir_attachment.location`` rather than on the row -- and every behavioural test
+that did not run that day would have caught it.
 
 It also fixes the ordering inside ``action_generate_key_and_csr``. The refusal
 of a second generation is only worth anything if it happens *before* the key
@@ -153,7 +154,7 @@ class TheCertificateIsStoredBesideIt(unittest.TestCase):
     """WSAA needs both halves, so a backup that restores one is no backup.
 
     The certificate was left as an attachment in the first draft of this change,
-    on the reasoning that it is public material and the filestore is fine for
+    on the reasoning that it is public material and `ir.attachment` is fine for
     public material. That reasoning is right about secrecy and wrong about
     availability: a signature needs the key *and* the certificate, so a restore
     that brings back only the column half authenticates exactly as badly as one
@@ -179,7 +180,7 @@ class TheCertificateIsStoredBesideIt(unittest.TestCase):
         self.assertNotIn("groups", self.keywords)
 
     def test_the_two_fields_agree_on_storage(self):
-        """One in a column and one in the filestore is the worst arrangement."""
+        """Two halves under two different backup contracts is the worst case."""
         key = keywords(field_call("private_key"))
         self.assertEqual(key["attachment"], self.keywords["attachment"])
         self.assertEqual(key["copy"], self.keywords["copy"])

@@ -5,8 +5,7 @@
 This is the guarantee the storage change is for, and it is the one guarantee a
 ``TransactionCase`` cannot make. Under ``current_test`` nothing is committed, so
 "the key is in the column afterwards" proves only that it is there in the same
-transaction that wrote it -- which was equally true when the key lived in the
-filestore.
+transaction that wrote it -- which was equally true of the previous storage.
 
 So this runs real ``odoo shell`` processes against one disposable database.
 Process A generates the key and CSR through the production action and exits.
@@ -350,8 +349,9 @@ class TestPrivateKeySurvivesTheProcess(unittest.TestCase):
     def test_a_dump_of_the_table_alone_would_carry_both_halves(self):
         """The property the storage change is for, asked as SQL.
 
-        No filestore is consulted, because with both fields in columns there is
-        nothing in one to consult.
+        Nothing outside the row is consulted, because with both fields in
+        columns there is no attachment to consult and therefore no dependence
+        on how attachment content is stored.
         """
         both = self._psql(
             self.database,

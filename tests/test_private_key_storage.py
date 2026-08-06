@@ -5,20 +5,25 @@
 Three changes are covered here, and they are separate concerns that happen to
 share a model.
 
-**The key moved into the model's own column.** It used to be an attachment,
-which means the filestore: a directory on disk, written outside the row's
-transaction and absent from a ``pg_dump``. Restoring such a dump onto a host
-whose filestore did not come with it produces a certificate that reports itself
-present and cannot sign -- and it reports that at the first authentication,
-which for this deployment is the first invoice. The key now sits in the same row
-as the record it authenticates, under the same transaction and the same backup.
+**The key moved into the model's own column.** It used to be stored through
+``ir.attachment``, and where an attachment's content lives is decided by
+``ir_attachment.location``: the default is ``file``, the filestore on disk, and
+with ``db`` it can sit in ``ir_attachment.db_datas`` inside PostgreSQL. So the
+old arrangement might have needed a coordinated restore of PostgreSQL and the
+filestore, or might have been entirely inside PostgreSQL -- decided by a global
+setting this module does not own. A restore that brings back the row without
+the bytes produces a certificate that reports itself present and cannot sign,
+at the first authentication, which for this deployment is the first invoice.
+
+The key now sits in the same row as the record it authenticates, under the same
+transaction and the same backup contract as that row, whatever ``ir.attachment``
+is configured to do.
 
 **The certificate moved with it.** WSAA builds a signature from both halves, so
 a restore that brings back the key and not the certificate authenticates
 exactly as badly as one that brings back neither -- while looking recoverable.
-Leaving the public half in the filestore would have made ``pg_dump`` a complete
-backup of the secret and an incomplete backup of the pair, which is the worse
-of the two failures.
+Leaving the public half behind ``ir.attachment`` would have put the two halves
+under different backup contracts, which is the worse of the two failures.
 
 **A second generation is refused.** ``action_generate_key_and_csr`` used to
 accept a record already in ``csr_generated`` and overwrite the key in place.
@@ -246,7 +251,7 @@ class TheKeyLandsInTheColumn(PrivateKeyCommon):
         certificate = self._generated("No attachment")
         self.assertFalse(
             self._attachments_for(certificate, "private_key"),
-            "the key is still going to the filestore",
+            "the key is still being stored through ir.attachment",
         )
 
     def test_no_attachment_is_created_for_the_certificate_either(self):
@@ -258,7 +263,8 @@ class TheKeyLandsInTheColumn(PrivateKeyCommon):
 
         Without this, "no attachment found" could mean the search is wrong --
         a misspelled `res_field`, a `res_model` that never matches -- and every
-        assertion above would pass while the key sat in the filestore.
+        assertion above would pass while the key was still being stored through
+        `ir.attachment`.
 
         `res.partner.image_1920` is an `fields.Image`, which is a Binary with
         `attachment=True`. It is core Odoo, it is in the same database, and it
@@ -387,8 +393,8 @@ class TheCertificateLandsInItsColumnToo(PrivateKeyCommon):
     def test_and_it_fails_when_either_half_is_missing(self):
         """The control: a signature needs both, so losing one is not survivable.
 
-        This is the failure a filestore restore produces, reproduced by
-        emptying the column instead of losing a directory.
+        This is the failure an incomplete restore produces, reproduced by
+        emptying one column instead of losing whatever held its bytes.
         """
         for missing in ("private_key", "certificate"):
             with self.subTest(missing=missing):
@@ -399,10 +405,11 @@ class TheCertificateLandsInItsColumnToo(PrivateKeyCommon):
                     self.env["l10n_ar.arca.wsaa"]._sign_tra(certificate, "<tra/>")
 
     def test_a_restore_of_the_table_alone_carries_both(self):
-        """What a `pg_dump` of this table would bring back, asked as SQL.
+        """What a dump of this table alone would bring back, asked as SQL.
 
-        The filestore is not consulted, because with both fields in columns
-        there is nothing in it to consult.
+        Nothing outside the row is consulted, because with both fields in
+        columns there is nothing outside the row to consult -- no attachment,
+        and therefore no dependence on how attachment content is stored.
         """
         certificate = self._activated("Cert restore")
         self.env.cr.execute(
@@ -584,7 +591,7 @@ class OrdinaryUsersAreUnaffected(PrivateKeyCommon):
         self.assertTrue(certificate.with_user(user).private_key_stored)
 
     def test_and_cannot_reach_it_through_an_attachment_search(self):
-        """The route the old storage opened: read the filestore instead."""
+        """The route the old storage opened: read `ir.attachment` instead."""
         certificate = self._generated("User attachment")
         user = self._invoicing_user()
         found = (
