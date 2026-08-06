@@ -210,18 +210,31 @@ class TestTheSecretsStayOut(unittest.TestCase):
 
 
 class TestCiRunsItAndNoticesASkip(unittest.TestCase):
+    # The step runs `unittest discover` over the whole `integration` directory,
+    # so it carries every cross-process proof rather than this one alone. Its
+    # name says so now, and the fragment matched here is the part that cannot
+    # change while the step is still about surviving a process.
+    STEP = "survive their process"
+    SKIP_CHECK = "cross-process proofs actually ran"
+
     def test_the_proof_is_wired_into_the_test_job(self):
-        step = step_named("Access ticket survives its process")
+        step = step_named(self.STEP)
         self.assertIn("integration", step["run"])
         self.assertIn("unittest discover", step["run"])
 
     def test_a_silent_skip_fails_the_build(self):
-        step = step_named("cross-process proof actually ran")
+        step = step_named(self.SKIP_CHECK)
         self.assertIn("skipped", step["run"])
         self.assertIn("exit 1", step["run"])
 
+    def test_and_this_proof_is_named_in_that_check(self):
+        """Discovery finding only some of the files would stay green otherwise."""
+        self.assertIn(
+            "TestTicketSurvivesTheProcess", step_named(self.SKIP_CHECK)["run"]
+        )
+
     def test_it_runs_against_the_job_database(self):
-        step = step_named("Access ticket survives its process")
+        step = step_named(self.STEP)
         self.assertEqual(step["env"]["PGHOST"], "db")
 
 

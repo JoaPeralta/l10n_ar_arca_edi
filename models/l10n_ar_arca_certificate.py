@@ -106,8 +106,21 @@ class L10nArArcaCertificate(models.Model):
     # The private key is the one secret that must never leave the server. The
     # field group keeps it out of every ordinary read, export and RPC call; the
     # signing path reaches it deliberately through sudo.
+    #
+    # `attachment=False` puts the bytes in the model's own column instead of in
+    # `ir.attachment`. An attachment-backed binary lives in the filestore, which
+    # is a directory on disk: it is written outside the row's transaction, it is
+    # not in a `pg_dump` of the database, and restoring that dump onto a host
+    # whose filestore was not copied with it produces a certificate that looks
+    # present and cannot sign. The key belongs where the record it authenticates
+    # is, under the same transaction and the same backup.
+    #
+    # `copy=False` because `copy()` on an attachment-backed field duplicates the
+    # attachment: one key, two records, and no way to tell afterwards which of
+    # them ARCA issued the certificate for.
     private_key = fields.Binary(
-        attachment=True,
+        attachment=False,
+        copy=False,
         groups="base.group_system",
         help="RSA private key in PEM format.",
     )
@@ -303,8 +316,31 @@ class L10nArArcaCertificate(models.Model):
                     self.name,
                 )
             )
-        if self.state not in ("draft", "csr_generated"):
-            raise UserError(_("A CSR can only be generated on a draft certificate."))
+        # Draft only, and `csr_generated` is the case this is really about.
+        #
+        # A second ordinary call used to be allowed there, and it overwrote the
+        # private key in place. Anyone who had already uploaded that CSR to the
+        # ARCA portal -- which is the entire point of generating one -- would
+        # receive a certificate for a key this record no longer holds, and would
+        # find out at the first authentication, with an error that names none of
+        # this. Losing the key is not recoverable: ARCA issues the certificate
+        # against the CSR's public key and nothing regenerates the private half.
+        #
+        # So the refusal happens here, before the key pair is generated and
+        # before any write. Nothing about the record moves: not the key, not the
+        # CSR, not the filenames, not the state.
+        if self.state != "draft":
+            raise UserError(
+                _(
+                    "A CSR was already generated for certificate '%s'. Generating "
+                    "another would replace the private key, and the certificate "
+                    "ARCA issues for the CSR you already uploaded would be "
+                    "unusable.\n\n"
+                    "If that CSR is not the one you want, create a new "
+                    "certificate record.",
+                    self.name,
+                )
+            )
 
         key = rsa.generate_private_key(public_exponent=65537, key_size=RSA_KEY_SIZE)
         private_key_pem = key.private_bytes(
