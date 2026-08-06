@@ -304,6 +304,88 @@ class NothingPrivateReachesTheLog(unittest.TestCase):
             self.assertNotIn(marker, text, marker)
 
 
+class TheStateGuardTestDemandsTheRightFailure(unittest.TestCase):
+    """One test, one contract, checked where Odoo is not needed to check it.
+
+    Why this exists and why it is this narrow
+    -----------------------------------------
+    ``test_the_state_guard_refuses_an_ordinary_user_too`` was written as
+    ``assertRaises((AccessError, UserError))``. That does not run under Odoo at
+    all: ``TestCase.assertRaises`` calls ``issubclass()`` on its argument, and a
+    tuple raises ``TypeError: issubclass() arg 1 must be a class``. It took a
+    runner to find that, and runners have been scarce.
+
+    It was also the wrong assertion. The record is in ``csr_generated``, so the
+    branch under test is the state guard this PR added -- and accepting
+    ``AccessError`` as an equally good outcome would let the test pass for the
+    wrong reason on the day H-05 is fixed, which is a different change.
+
+    Deliberately scoped to this one test rather than made a rule about tuples
+    everywhere: elsewhere in this repository a tuple can be exactly right, and a
+    blanket ban would be a rule nobody asked for enforced on code nobody
+    reviewed for it.
+    """
+
+    STORAGE_TESTS = REPO / "tests" / "test_private_key_storage.py"
+    TEST_NAME = "test_the_state_guard_refuses_an_ordinary_user_too"
+
+    def setUp(self):
+        source = self.STORAGE_TESTS.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        self.node = next(
+            (
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, ast.FunctionDef) and node.name == self.TEST_NAME
+            ),
+            None,
+        )
+        self.assertIsNotNone(self.node, f"{self.TEST_NAME} is gone")
+        self.body = ast.unparse(self.node)
+
+    def _assert_raises_arguments(self):
+        """What each `assertRaises` in this test is given."""
+        return [
+            node.args[0]
+            for node in ast.walk(self.node)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "assertRaises"
+            and node.args
+        ]
+
+    def test_it_expects_exactly_one_exception_class(self):
+        arguments = self._assert_raises_arguments()
+        self.assertEqual(len(arguments), 1, "the test no longer asserts a raise")
+        self.assertIsInstance(
+            arguments[0],
+            ast.Name,
+            "assertRaises was given something other than a bare class",
+        )
+
+    def test_and_that_class_is_UserError(self):
+        self.assertEqual(self._assert_raises_arguments()[0].id, "UserError")
+
+    def test_it_is_not_given_a_tuple(self):
+        """Odoo calls `issubclass()` on it; a tuple is a TypeError, not a skip."""
+        argument = self._assert_raises_arguments()[0]
+        self.assertNotIsInstance(argument, ast.Tuple)
+
+    def test_and_does_not_accept_an_access_error_instead(self):
+        """A different failure for a different reason, fixed by a different PR."""
+        self.assertNotIn("AccessError", self.body)
+
+    def test_it_checks_the_message_of_the_branch_it_is_about(self):
+        """`already generated` is the `csr_generated` branch, not the `active` one."""
+        self.assertIn("already generated", self.body)
+        self.assertNotIn("would make", self.body)
+
+    def test_and_still_proves_the_key_did_not_move(self):
+        """The refusal is only worth asserting if nothing changed with it."""
+        self.assertIn("invalidate_recordset", self.body)
+        self.assertIn("assertEqual(self._digest", self.body)
+
+
 class TheModuleVersionWasIncremented(unittest.TestCase):
 
     def setUp(self):

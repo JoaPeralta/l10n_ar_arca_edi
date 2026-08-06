@@ -34,8 +34,9 @@ The one thing these tests *cannot* prove is that the bytes survive the process
 that wrote them: under ``TransactionCase`` nothing is committed, so a second
 cursor on the same database would see an empty table for reasons that have
 nothing to do with this change. That proof is
-``integration/test_private_key_across_processes.py``, which uses two real
-``odoo shell`` processes.
+``integration/test_private_key_across_processes.py``, which runs five real
+``odoo shell`` processes against one disposable database -- seed, reload,
+refuse on ``csr_generated``, refuse on ``active``, and duplicate.
 """
 
 import base64
@@ -612,13 +613,21 @@ class OrdinaryUsersAreUnaffected(PrivateKeyCommon):
         What this asserts is the narrower thing that is true: once a CSR exists,
         the state guard closes the door to everybody, which is what protects the
         key that has already been generated.
+
+        `UserError` specifically, and the message with it. A tuple would not
+        even run -- Odoo's `TestCase.assertRaises` calls `issubclass()` on its
+        argument and a tuple raises `TypeError: issubclass() arg 1 must be a
+        class` -- and accepting either exception would let this pass for the
+        wrong reason on the day an access check lands, which is a different
+        change with its own PR.
         """
         certificate = self._generated("User regenerate")
         user = self._invoicing_user()
         before = self._digest(certificate.sudo().private_key)
 
-        with self.assertRaises((AccessError, UserError)):
+        with self.assertRaises(UserError) as caught:
             certificate.with_user(user).action_generate_key_and_csr()
+        self.assertIn("already generated", str(caught.exception))
 
         certificate.invalidate_recordset()
         self.assertEqual(self._digest(certificate.sudo().private_key), before)
