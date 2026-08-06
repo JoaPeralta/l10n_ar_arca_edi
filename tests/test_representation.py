@@ -57,9 +57,15 @@ class TestArcaRepresentation(ArcaTestCommon):
 
         csr = x509.load_pem_x509_csr(certificate.csr_pem.encode())
         serial = csr.subject.get_attributes_for_oid(NameOID.SERIAL_NUMBER)[0].value
-        # The digits, which is what ARCA parses. The hyphenated form belongs on
-        # a screen; test_certificate.py covers the format itself.
-        self.assertEqual(serial, f"CUIT {certificate._get_holder_cuit()}")
+        # The digits, which is what ARCA parses. This test is about whose
+        # identity the CSR carries, so the expectation is normalised here from
+        # the fixture's own value rather than asked of a model helper: a test
+        # that derives its expectation from the code under test cannot fail.
+        # test_certificate.py pins the exact value and the exact format.
+        expected_digits = "".join(
+            character for character in certificate.holder_cuit if character.isdigit()
+        )
+        self.assertEqual(serial, f"CUIT {expected_digits}")
         self.assertNotIn(self.issuer_cuit, serial)
 
     def test_the_certificate_is_validated_against_the_holder(self):

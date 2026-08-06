@@ -25,9 +25,9 @@ from ..models.l10n_ar_arca_certificate import (
 )
 from .common import TEST_HOLDER_CUIT, ArcaTestCommon
 
-# A synthetic CUIT with a correct verification digit, used only by the CSR
-# format tests. Deliberately nobody's: this file is public, and a CUIT is
-# personal data even when it belongs to a company's legal representative.
+# A CUIT with a correct verification digit, used only by the CSR format tests.
+# Synthetic test-only value. It is not the real certificate holder CUIT selected
+# for VIARENGO and must never be replaced with production data.
 CSR_HOLDER_CUIT = "20-12345678-6"
 CSR_HOLDER_DIGITS = "20123456786"
 
@@ -99,12 +99,19 @@ class TestCertificateUpload(ArcaTestCommon):
         This assertion used to read ``f"CUIT {certificate._format_holder_cuit()}"``,
         which made the test agree with the code instead of with ARCA: whatever
         the helper produced was declared correct by definition.
+
+        So the expectation is derived here, from the value the fixture stored,
+        rather than asked of any helper in the model. Swapping one production
+        helper for another would have kept the same circularity.
         """
         certificate = self._draft_certificate()
         certificate.action_generate_key_and_csr()
         csr = x509.load_pem_x509_csr(certificate.csr_pem.encode())
         serial = csr.subject.get_attributes_for_oid(NameOID.SERIAL_NUMBER)[0].value
-        self.assertEqual(serial, f"CUIT {certificate._get_holder_cuit()}")
+        expected_digits = "".join(
+            character for character in certificate.holder_cuit if character.isdigit()
+        )
+        self.assertEqual(serial, f"CUIT {expected_digits}")
         self.assertRegex(serial, ARCA_SERIAL_NUMBER)
 
     def test_certificate_for_a_different_key_is_refused(self):
