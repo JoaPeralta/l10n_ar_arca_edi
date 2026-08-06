@@ -457,11 +457,43 @@ class OrdinaryUsersAreUnaffected(PrivateKeyCommon):
             found.filtered(lambda record: record.res_field == "private_key")
         )
 
-    def test_and_cannot_trigger_a_regeneration(self):
+    def test_the_state_guard_refuses_an_ordinary_user_too(self):
+        """And it is the *state* guard that refuses, not an access check.
+
+        Said plainly because the distinction matters and the obvious version of
+        this test hides it. `action_generate_key_and_csr` runs `self.sudo()`
+        without a `check_access`, so on a record still in `draft` an ordinary
+        user can reach the write -- that is audit finding H-05, it is open, and
+        nothing in this change addresses it.
+
+        What this asserts is the narrower thing that is true: once a CSR exists,
+        the state guard closes the door to everybody, which is what protects the
+        key that has already been generated.
+        """
         certificate = self._generated("User regenerate")
         user = self._invoicing_user()
+        before = self._digest(certificate.sudo().private_key)
+
         with self.assertRaises((AccessError, UserError)):
             certificate.with_user(user).action_generate_key_and_csr()
+
+        certificate.invalidate_recordset()
+        self.assertEqual(self._digest(certificate.sudo().private_key), before)
+
+    def test_a_draft_is_not_yet_protected_from_one(self):
+        """The open half of H-05, written down rather than left to be discovered.
+
+        A draft holds no key, so nothing is lost here today -- but if this ever
+        starts passing because an access check was added, this test is the one
+        that should be deleted, and deliberately.
+        """
+        draft = self._draft("User draft")
+        user = self._invoicing_user()
+        try:
+            draft.with_user(user).action_generate_key_and_csr()
+        except AccessError:
+            self.skipTest("an access check was added; H-05 is closed")
+        self.assertEqual(draft.state, "csr_generated")
 
 
 @tagged("post_install", "-at_install")
