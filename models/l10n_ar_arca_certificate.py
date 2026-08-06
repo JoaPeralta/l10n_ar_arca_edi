@@ -138,8 +138,22 @@ class L10nArArcaCertificate(models.Model):
     )
     csr_filename = fields.Char(readonly=True)
 
+    # Public material, and stored beside the key for the same reason the key is:
+    # WSAA needs both halves to build a signature, so a restore that brings one
+    # back and not the other cannot authenticate either. Leaving this one in the
+    # filestore would have made `pg_dump` a complete backup of the secret half
+    # and an incomplete backup of the pair, which is the worse of the two
+    # failures -- it looks recoverable.
+    #
+    # No `groups`: a certificate is what ARCA hands back and what a counterparty
+    # can read. It is not a secret and pretending otherwise teaches the wrong
+    # thing about the key next to it.
+    #
+    # `copy=False` all the same: a duplicate that carries the certificate but
+    # not the key would claim an identity it cannot sign for.
     certificate = fields.Binary(
-        attachment=True,
+        attachment=False,
+        copy=False,
         help="Certificate issued by ARCA, in PEM format.",
     )
     certificate_filename = fields.Char()

@@ -148,16 +148,41 @@ class ThePrivateKeyIsStoredInTheColumn(unittest.TestCase):
         self.assertEqual(cache.get("groups"), "base.group_system")
         self.assertIs(cache.get("copy"), False)
 
-    def test_the_certificate_field_is_still_attachment_backed(self):
-        """Deliberate, and the live control the Odoo test uses.
 
-        The issued certificate is public material -- it is what ARCA hands back
-        and what the counterparty can read. Leaving it in the filestore is fine,
-        and it gives the behavioural test a field in the same model that *does*
-        create an `ir.attachment`, so "no attachment for the key" is measured
-        against something rather than asserted into a vacuum.
-        """
-        self.assertIs(keywords(field_call("certificate")).get("attachment"), True)
+class TheCertificateIsStoredBesideIt(unittest.TestCase):
+    """WSAA needs both halves, so a backup that restores one is no backup.
+
+    The certificate was left as an attachment in the first draft of this change,
+    on the reasoning that it is public material and the filestore is fine for
+    public material. That reasoning is right about secrecy and wrong about
+    availability: a signature needs the key *and* the certificate, so a restore
+    that brings back only the column half authenticates exactly as badly as one
+    that brings back neither -- while looking recoverable.
+    """
+
+    def setUp(self):
+        self.keywords = keywords(field_call("certificate"))
+
+    def test_it_is_not_attachment_backed_either(self):
+        self.assertIn("attachment", self.keywords)
+        self.assertIs(self.keywords["attachment"], False)
+
+    def test_it_is_not_copied(self):
+        """A duplicate carrying the certificate would claim an identity it
+        cannot sign for: `copy=False` on the key alone leaves that gap."""
+        self.assertIn("copy", self.keywords)
+        self.assertIs(self.keywords["copy"], False)
+
+    def test_it_carries_no_group(self):
+        """Deliberate. It is what ARCA hands back and what a counterparty
+        reads; restricting it would teach the wrong thing about the key."""
+        self.assertNotIn("groups", self.keywords)
+
+    def test_the_two_fields_agree_on_storage(self):
+        """One in a column and one in the filestore is the worst arrangement."""
+        key = keywords(field_call("private_key"))
+        self.assertEqual(key["attachment"], self.keywords["attachment"])
+        self.assertEqual(key["copy"], self.keywords["copy"])
 
 
 class TheContractCheckerCanFail(unittest.TestCase):

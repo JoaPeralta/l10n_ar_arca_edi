@@ -15,6 +15,7 @@ are one edit apart.
 
 import ast
 import pathlib
+import re
 import unittest
 
 import yaml
@@ -139,9 +140,33 @@ class TestNothingCanReachArca(unittest.TestCase):
                 self.assertNotIn(marker, CHILD_TEXT)
                 self.assertNotIn(marker, DRIVER_TEXT)
 
-    def test_no_certificate_is_uploaded(self):
-        """Uploading one is how a record becomes usable; nothing here needs it."""
-        self.assertNotIn("action_process_certificate", CHILD_TEXT)
+    def test_the_certificate_it_uploads_is_one_it_made_itself(self):
+        """`action_process_certificate` is called, and that is fine.
+
+        The record has to reach `active` for `_sign_tra` to be exercised, and
+        that needs a certificate. What matters is where it comes from: this
+        child builds a self-signed one over the key it just generated. Nothing
+        is requested from ARCA and no ARCA-issued certificate is involved.
+        """
+        self.assertIn("action_process_certificate", CHILD_TEXT)
+        source = ast.get_source_segment(
+            CHILD_TEXT, function(CHILD_TREE, "role_generate")
+        )
+        self.assertIn("self_signed_certificate(certificate)", source)
+
+    def test_and_it_is_signed_by_the_key_it_certifies(self):
+        source = ast.get_source_segment(
+            CHILD_TEXT, function(CHILD_TREE, "self_signed_certificate")
+        )
+        self.assertIn("issuer_name(subject)", source)
+        self.assertIn("subject_name(subject)", source)
+        self.assertIn("sign(key,", source)
+
+    def test_the_certificate_material_never_comes_from_the_environment(self):
+        """A real one could only arrive that way, and must not."""
+        for variable in ("ARCA_HOMO_CERT", "ARCA_HOMO_PRIVATE_KEY"):
+            self.assertNotIn(variable, CHILD_TEXT, variable)
+            self.assertNotIn(variable, DRIVER_TEXT, variable)
 
     def test_the_database_is_created_and_dropped_by_the_driver(self):
         self.assertIn("CREATE DATABASE", DRIVER_TEXT)
@@ -183,7 +208,10 @@ class TestTheKeyStaysOut(unittest.TestCase):
             if not isinstance(value, ast.Call):
                 continue
             source = ast.unparse(value)
-            if "private_key" in source or "csr_pem" in source:
+            if any(
+                material in source
+                for material in ("private_key", "csr_pem", ".certificate")
+            ):
                 with self.subTest(line=line):
                     self.assertTrue(
                         source.startswith("digest(")
@@ -212,13 +240,24 @@ class TestTheKeyStaysOut(unittest.TestCase):
         for marker in ("BEGIN PRIVATE KEY", "BEGIN RSA PRIVATE"):
             self.assertIn(marker, DRIVER_TEXT, marker)
 
-    def test_no_real_cuit_appears_in_either_file(self):
-        """Only the synthetic holder, and it is declared as such."""
+    def test_the_only_cuit_in_either_file_is_the_synthetic_one(self):
+        """Stated as an allowlist rather than a denylist.
+
+        The obvious version of this test names the real holder CUIT so it can
+        assert its absence -- and thereby writes it into the repository, which
+        is the thing being prevented. So every CUIT-shaped string is extracted
+        and the set is compared against the one value that may appear.
+        """
+        synthetic = {"20-12345678-6", "20123456786"}
+        pattern = re.compile(r"\b\d{2}-?\d{8}-?\d\b")
+        for name, text in (("child", CHILD_TEXT), ("driver", DRIVER_TEXT)):
+            found = set(pattern.findall(text))
+            with self.subTest(file=name):
+                self.assertTrue(found.issubset(synthetic), found - synthetic)
+
+    def test_and_it_is_declared_as_synthetic(self):
         self.assertIn('HOLDER_CUIT = "20-12345678-6"', CHILD_TEXT)
-        for real in ("30717865940", "30-71786594-0"):
-            with self.subTest(real=real):
-                self.assertNotIn(real, CHILD_TEXT)
-                self.assertNotIn(real, DRIVER_TEXT)
+        self.assertIn("Synthetic", CHILD_TEXT)
 
 
 class TestCiRunsItAndNoticesASkip(unittest.TestCase):

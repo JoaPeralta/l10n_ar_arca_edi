@@ -14,7 +14,12 @@ come from.
 
 Nothing reachable from here can leave the machine: ``zeep.Client`` is replaced
 by one that raises on construction, so a SOAP client cannot be built even by
-accident. No certificate is uploaded, nothing contacts ARCA, WSAA or WSFE.
+accident, and nothing contacts ARCA, WSAA or WSFE.
+
+The certificate this generates is self-signed here, over the key the record
+just made, so ``action_process_certificate`` accepts it. It is local crypto and
+throwaway material: no certificate is requested from ARCA and none issued by
+ARCA is ever involved.
 
 Markers are printed as ``ARCA-TEST key=value``. The key is never among them --
 only SHA-256 digests of it, which is what lets the parent compare two processes
@@ -83,21 +88,68 @@ def load_key(certificate):
     )
 
 
-def column_on_an_independent_connection(env, certificate_id):
-    """Read the column on a connection of its own.
+# The only two columns this file reads. Named as a constant so the query below
+# can never be built from anything a caller passes in.
+READABLE_COLUMNS = ("private_key", "certificate")
+
+COLUMN_QUERIES = {
+    "private_key": "SELECT private_key FROM l10n_ar_arca_certificate WHERE id = %s",
+    "certificate": "SELECT certificate FROM l10n_ar_arca_certificate WHERE id = %s",
+}
+
+
+def column_on_an_independent_connection(env, certificate_id, column="private_key"):
+    """Read a column on a connection of its own.
 
     A second connection sees committed data and nothing else, so a non-empty
     answer here is the property this whole file exists to establish.
+
+    The query is looked up, never built: a formatted table or column name in a
+    file that reads private keys is not a risk worth taking for brevity.
     """
+    if column not in READABLE_COLUMNS:
+        raise SystemExit(f"columna no permitida: {column!r}")
     with env.registry.cursor() as independent:
-        independent.execute(
-            "SELECT private_key FROM l10n_ar_arca_certificate WHERE id = %s",
-            (certificate_id,),
-        )
+        independent.execute(COLUMN_QUERIES[column], (certificate_id,))
         row = independent.fetchone()
     if not row or row[0] is None:
         return ""
     return digest(row[0])
+
+
+def self_signed_certificate(certificate):
+    """A certificate over this record's own key. Local crypto, throwaway.
+
+    Self-signed on purpose: the subject only has to satisfy the module's own
+    checks -- same public key, same holder CUIT, not expired -- and asking ARCA
+    for a real one is exactly what this file may not do.
+    """
+    import datetime
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.x509.oid import NameOID
+
+    key = load_key(certificate)
+    subject = x509.Name(
+        [
+            x509.NameAttribute(NameOID.COUNTRY_NAME, "AR"),
+            x509.NameAttribute(NameOID.COMMON_NAME, "cross-process"),
+            x509.NameAttribute(NameOID.SERIAL_NUMBER, f"CUIT {HOLDER_CUIT}"),
+        ]
+    )
+    now = datetime.datetime.now(datetime.timezone.utc)
+    return (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=365))
+        .sign(key, hashes.SHA256())
+        .public_bytes(serialization.Encoding.PEM)
+    )
 
 
 def attachment_count(env, certificate_id, field):
@@ -131,11 +183,18 @@ def role_generate(env):
         }
     )
     certificate.action_generate_key_and_csr()
+    # The certificate half, self-signed over the key this record just made, so
+    # `action_process_certificate` accepts it. Local crypto only: nothing is
+    # requested from ARCA and no real certificate is involved.
+    certificate.action_process_certificate(
+        base64.b64encode(self_signed_certificate(certificate))
+    )
     env.cr.commit()
 
     emit("certificate_id", certificate.id)
     emit("state", certificate.state)
     emit("key_digest", digest(certificate.private_key))
+    emit("cert_digest", digest(certificate.certificate))
     emit("csr_digest", digest(certificate.csr_pem))
     emit("key_filename", certificate.private_key_filename)
     emit("csr_filename", certificate.csr_filename)
@@ -145,7 +204,12 @@ def role_generate(env):
         "column_digest_on_another_connection",
         column_on_an_independent_connection(env, certificate.id),
     )
+    emit(
+        "cert_column_digest_on_another_connection",
+        column_on_an_independent_connection(env, certificate.id, "certificate"),
+    )
     emit("attachments_for_key", attachment_count(env, certificate.id, "private_key"))
+    emit("attachments_for_cert", attachment_count(env, certificate.id, "certificate"))
 
 
 def role_reload(env):
@@ -157,14 +221,31 @@ def role_reload(env):
 
     key = load_key(certificate)
     emit("key_digest", digest(certificate.private_key))
+    emit("cert_digest", digest(certificate.certificate))
     emit("csr_digest", digest(certificate.csr_pem))
     emit("state", certificate.state)
     emit("key_size", key.key_size)
     emit("attachments_for_key", attachment_count(env, certificate.id, "private_key"))
+    emit("attachments_for_cert", attachment_count(env, certificate.id, "certificate"))
 
     from cryptography import x509
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.asymmetric import padding
+
+    # Both halves, reloaded from their columns and checked against each other.
+    # This is what WSAA needs and what a filestore restore used to lose.
+    loaded_certificate = certificate._load_certificate()
+    emit(
+        "certificate_matches_key",
+        loaded_certificate.public_key().public_numbers()
+        == key.public_key().public_numbers(),
+    )
+
+    # `_sign_tra` is the production WSAA path: it reads the key and the
+    # certificate and builds a CMS signature from both. Nothing is sent.
+    signed_tra = env["l10n_ar.arca.wsaa"].sudo()._sign_tra(certificate, "<tra/>")
+    emit("sign_tra_produced_a_signature", bool(signed_tra))
+    emit("sign_tra_digest_length", len(digest(signed_tra)))
 
     csr = x509.load_pem_x509_csr(certificate.csr_pem.encode())
     emit(
@@ -242,13 +323,23 @@ def role_duplicate(env):
 
     emit("duplicate_id", duplicate.id)
     emit("original_key_digest", digest(certificate.private_key))
+    emit("original_cert_digest", digest(certificate.certificate))
     emit("duplicate_key_digest", digest(duplicate.private_key))
+    emit("duplicate_cert_digest", digest(duplicate.certificate))
     emit("duplicate_state", duplicate.state)
     emit(
         "duplicate_column_digest",
         column_on_an_independent_connection(env, duplicate.id),
     )
+    emit(
+        "duplicate_cert_column_digest",
+        column_on_an_independent_connection(env, duplicate.id, "certificate"),
+    )
     emit("duplicate_attachments", attachment_count(env, duplicate.id, "private_key"))
+    emit(
+        "duplicate_cert_attachments",
+        attachment_count(env, duplicate.id, "certificate"),
+    )
 
 
 ROLES = {

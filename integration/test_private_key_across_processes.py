@@ -14,12 +14,18 @@ Process B starts with an empty cache and a new cursor and must load the same
 key out of PostgreSQL, verify it is RSA-2048, verify the CSR carries its public
 half, and sign a synthetic payload with it. Process C attempts a second
 generation and must be refused without changing a byte. Process D duplicates
-the record and must get no key.
+the record and must get neither half.
+
+The certificate is checked alongside the key throughout, because WSAA builds a
+signature from both and a restore that carries one and not the other fails just
+as completely -- while looking recoverable.
 
 Offline throughout. ``zeep.Client`` is replaced in every child by one that
-raises on construction, so no SOAP client can be built; no certificate is
-uploaded and nothing contacts ARCA, WSAA or WSFE. The CUIT is synthetic and the
-database is created and dropped by this test.
+raises on construction, so no SOAP client can be built, and nothing contacts
+ARCA, WSAA or WSFE. The certificate is self-signed inside the child over the key
+that child just generated -- local crypto and throwaway material, never one ARCA
+issued. The CUIT is synthetic and the database is created and dropped by this
+test.
 
 No key material is ever printed: the children emit SHA-256 digests, and the
 assertions compare digests across processes.
@@ -282,25 +288,67 @@ class TestPrivateKeySurvivesTheProcess(unittest.TestCase):
     def test_and_created_no_attachment_for_it(self):
         self.assertEqual(self.generated["attachments_for_key"], "0")
 
-    def test_the_column_exists_in_the_table_at_all(self):
-        """`attachment=True` leaves no column; the assertions above need one."""
+    def test_the_certificate_landed_in_its_column_too(self):
+        """WSAA needs both halves; a restore bringing back one is no restore."""
+        self.assertTrue(self.generated["cert_digest"])
+        self.assertTrue(
+            self.generated["cert_column_digest_on_another_connection"],
+            "the certificate column is empty on an independent connection",
+        )
+        self.assertEqual(
+            self.generated["cert_column_digest_on_another_connection"],
+            self.generated["cert_digest"],
+        )
+
+    def test_and_no_attachment_for_the_certificate_either(self):
+        self.assertEqual(self.generated["attachments_for_cert"], "0")
+
+    def test_the_record_reached_active(self):
+        self.assertEqual(self.generated["state"], "active")
+
+    def test_both_columns_exist_in_the_table_at_all(self):
+        """`attachment=True` leaves no column; the assertions above need them."""
         found = self._psql(
             self.database,
-            "SELECT 1 FROM information_schema.columns "
+            "SELECT count(*) FROM information_schema.columns "
             "WHERE table_name = 'l10n_ar_arca_certificate' "
-            "AND column_name = 'private_key'",
+            "AND column_name IN ('private_key', 'certificate')",
         )
-        self.assertEqual(found, "1")
+        self.assertEqual(found, "2")
 
-    def test_no_row_in_ir_attachment_names_the_private_key(self):
+    def test_a_dump_of_the_table_alone_would_carry_both_halves(self):
+        """The property the storage change is for, asked as SQL.
+
+        No filestore is consulted, because with both fields in columns there is
+        nothing in one to consult.
+        """
+        both = self._psql(
+            self.database,
+            "SELECT octet_length(private_key) > 0 "
+            "AND octet_length(certificate) > 0 "
+            "FROM l10n_ar_arca_certificate WHERE id = "
+            + str(int(self.certificate_id)),
+        )
+        self.assertEqual(both, "t")
+
+    def test_no_row_in_ir_attachment_names_either_field(self):
         """Asked of the database directly, not through the ORM."""
         count = self._psql(
             self.database,
             "SELECT count(*) FROM ir_attachment "
             "WHERE res_model = 'l10n_ar.arca.certificate' "
-            "AND res_field = 'private_key'",
+            "AND res_field IN ('private_key', 'certificate')",
         )
         self.assertEqual(count, "0")
+
+    def test_but_ir_attachment_is_not_simply_empty(self):
+        """The control: the table holds rows, so "0" above means something.
+
+        An installed Odoo always has attachments -- icons, assets, reports. If
+        this came back zero, the query above would be proving nothing.
+        """
+        total = self._psql(self.database, "SELECT count(*) > 0 FROM ir_attachment")
+        self.assertEqual(total, "t")
 
     # ------------------------------------------------------------------
     # Process B: a new process, a new cursor, the same key
@@ -333,6 +381,22 @@ class TestPrivateKeySurvivesTheProcess(unittest.TestCase):
 
     def test_the_later_process_still_finds_no_attachment(self):
         self.assertEqual(self.reloaded["attachments_for_key"], "0")
+        self.assertEqual(self.reloaded["attachments_for_cert"], "0")
+
+    def test_it_loads_the_same_certificate(self):
+        self.assertTrue(self.reloaded["cert_digest"])
+        self.assertEqual(self.reloaded["cert_digest"], self.generated["cert_digest"])
+
+    def test_and_that_certificate_matches_the_reloaded_key(self):
+        """Both halves out of their columns, checked against each other."""
+        self.assertEqual(self.reloaded["certificate_matches_key"], "True")
+
+    def test_sign_tra_builds_a_signature_from_both_reloaded_halves(self):
+        """The production WSAA path, in a process that wrote neither half."""
+        self.assertEqual(self.reloaded["sign_tra_produced_a_signature"], "True")
+        # A digest is 64 hex characters. Anything else would mean the child
+        # emitted something that is not a digest of a real signature.
+        self.assertEqual(int(self.reloaded["sign_tra_digest_length"]), 64)
 
     # ------------------------------------------------------------------
     # Process C: the second generation
@@ -393,15 +457,25 @@ class TestPrivateKeySurvivesTheProcess(unittest.TestCase):
     def test_a_duplicate_gets_no_key(self):
         self.assertEqual(self.duplicated["duplicate_key_digest"], "")
 
-    def test_not_even_in_the_column(self):
+    def test_and_no_certificate_either(self):
+        """A copy carrying the certificate would claim an identity it cannot
+        sign for, which is worse than a copy carrying nothing."""
+        self.assertEqual(self.duplicated["duplicate_cert_digest"], "")
+
+    def test_not_even_in_the_columns(self):
         self.assertEqual(self.duplicated["duplicate_column_digest"], "")
+        self.assertEqual(self.duplicated["duplicate_cert_column_digest"], "")
 
     def test_and_no_attachment_was_copied(self):
         self.assertEqual(self.duplicated["duplicate_attachments"], "0")
+        self.assertEqual(self.duplicated["duplicate_cert_attachments"], "0")
 
-    def test_the_original_kept_its_key(self):
+    def test_the_original_kept_both_halves(self):
         self.assertEqual(
             self.duplicated["original_key_digest"], self.generated["key_digest"]
+        )
+        self.assertEqual(
+            self.duplicated["original_cert_digest"], self.generated["cert_digest"]
         )
 
     def test_and_the_duplicate_is_a_draft(self):

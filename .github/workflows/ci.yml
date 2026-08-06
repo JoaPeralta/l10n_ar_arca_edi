@@ -265,9 +265,12 @@ jobs:
             grep -i "skip" "$log" || true
             exit 1
           fi
-          # Named individually: discovery finding only one of the two files
-          # would leave the run green with half the evidence.
-          for proof in TestTicketSurvivesTheProcess TestPrivateKeySurvivesTheProcess; do
+          # Named individually: discovery finding only some of the files would
+          # leave the run green with part of the evidence.
+          for proof in TestTicketSurvivesTheProcess \
+                       TestPrivateKeySurvivesTheProcess \
+                       TestUpgradeWithNothingToLose \
+                       TestUpgradeWithMaterialInAttachments; do
             if ! grep -q "${proof}" "$log"; then
               echo "::error::${proof} did not run."
               exit 1

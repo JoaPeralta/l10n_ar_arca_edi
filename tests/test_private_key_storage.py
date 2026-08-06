@@ -1,9 +1,9 @@
 # Copyright 2026 Leonobitech
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
-"""Where the private key lives, and what a second generation may not do.
+"""Where the fiscal material lives, and what a second generation may not do.
 
-Two changes are covered here, and they are separate concerns that happen to
-share a field.
+Three changes are covered here, and they are separate concerns that happen to
+share a model.
 
 **The key moved into the model's own column.** It used to be an attachment,
 which means the filestore: a directory on disk, written outside the row's
@@ -12,6 +12,13 @@ whose filestore did not come with it produces a certificate that reports itself
 present and cannot sign -- and it reports that at the first authentication,
 which for this deployment is the first invoice. The key now sits in the same row
 as the record it authenticates, under the same transaction and the same backup.
+
+**The certificate moved with it.** WSAA builds a signature from both halves, so
+a restore that brings back the key and not the certificate authenticates
+exactly as badly as one that brings back neither -- while looking recoverable.
+Leaving the public half in the filestore would have made ``pg_dump`` a complete
+backup of the secret and an incomplete backup of the pair, which is the worse
+of the two failures.
 
 **A second generation is refused.** ``action_generate_key_and_csr`` used to
 accept a record already in ``csr_generated`` and overwrite the key in place.
@@ -54,6 +61,14 @@ CERTIFICATE_LOGGER = "odoo.addons.l10n_ar_arca_edi.models.l10n_ar_arca_certifica
 # What a payload signature is checked against. Nothing fiscal: the point is that
 # the key works, not that ARCA would accept this.
 SYNTHETIC_PAYLOAD = b"<arca-test-payload>not a fiscal document</arca-test-payload>"
+
+# A 1x1 transparent PNG, used only as the live control for the attachment
+# search: `res.partner.image_1920` is an `fields.Image`, which is a Binary with
+# `attachment=True`, so writing to it really does create an `ir.attachment`.
+ONE_PIXEL_PNG = (
+    b"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGA"
+    b"hKmMIQAAAABJRU5ErkJggg=="
+)
 
 
 class PrivateKeyCommon(ArcaTestCommon):
@@ -102,6 +117,57 @@ class PrivateKeyCommon(ArcaTestCommon):
             )
         )
 
+    def _activated(self, name="Key storage"):
+        """A record with both halves: key generated, certificate uploaded.
+
+        The certificate is self-signed over this record's own key, so
+        `action_process_certificate` accepts it. Nothing is requested from ARCA.
+        """
+        certificate = self._generated(name)
+        cert_pem = self._certificate_for(
+            self._key_of(certificate), STORAGE_HOLDER_CUIT
+        )
+        certificate.action_process_certificate(base64.b64encode(cert_pem))
+        self.env.flush_all()
+        return certificate
+
+    def _certificate_for(self, key, holder_cuit):
+        """A self-signed certificate over an existing key. Local crypto only."""
+        import datetime
+
+        from cryptography.x509.oid import NameOID
+
+        subject = x509.Name(
+            [
+                x509.NameAttribute(NameOID.COUNTRY_NAME, "AR"),
+                x509.NameAttribute(NameOID.COMMON_NAME, "storage-control"),
+                x509.NameAttribute(NameOID.SERIAL_NUMBER, f"CUIT {holder_cuit}"),
+            ]
+        )
+        now = datetime.datetime.now(datetime.timezone.utc)
+        return (
+            x509.CertificateBuilder()
+            .subject_name(subject)
+            .issuer_name(subject)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - datetime.timedelta(days=1))
+            .not_valid_after(now + datetime.timedelta(days=365))
+            .sign(key, hashes.SHA256())
+            .public_bytes(serialization.Encoding.PEM)
+        )
+
+    def _invoicing_user(self, suffix=""):
+        return self.env["res.users"].create(
+            {
+                "name": "Invoicing only, key storage",
+                "login": f"arca_key_storage_{suffix}_{self.env.cr.dbname[:4]}",
+                "company_id": self.company_ri.id,
+                "company_ids": [(6, 0, self.company_ri.ids)],
+                "group_ids": [(6, 0, [self.env.ref("account.group_account_invoice").id])],
+            }
+        )
+
     def _key_of(self, certificate):
         return serialization.load_pem_private_key(
             base64.b64decode(certificate.sudo().private_key), password=None
@@ -132,19 +198,28 @@ class TheFieldDeclaresWhereItStores(PrivateKeyCommon):
     def test_it_stays_behind_the_technical_group(self):
         self.assertEqual(self.field.groups, "base.group_system")
 
-    def test_it_has_a_column_of_its_own_in_the_table(self):
+    def test_the_certificate_is_stored_the_same_way(self):
+        """Both halves, or a restore brings back something that cannot sign."""
+        certificate = self.env["l10n_ar.arca.certificate"]._fields["certificate"]
+        self.assertFalse(certificate.attachment)
+        self.assertFalse(certificate.copy)
+
+    def test_but_the_certificate_is_not_a_secret(self):
+        """No group: it is public material and pretending otherwise misleads."""
+        self.assertFalse(
+            self.env["l10n_ar.arca.certificate"]._fields["certificate"].groups
+        )
+
+    def test_both_have_a_column_of_their_own_in_the_table(self):
         """`attachment=True` leaves no column at all; this is that difference."""
         self.env.cr.execute(
-            "SELECT 1 FROM information_schema.columns "
+            "SELECT column_name FROM information_schema.columns "
             "WHERE table_name = 'l10n_ar_arca_certificate' "
-            "AND column_name = 'private_key'"
+            "AND column_name IN ('private_key', 'certificate')"
         )
-        self.assertTrue(self.env.cr.fetchone(), "private_key has no column")
-
-    def test_the_certificate_field_is_still_attachment_backed(self):
-        """The live control for the assertions below, in the same model."""
-        self.assertTrue(
-            self.env["l10n_ar.arca.certificate"]._fields["certificate"].attachment
+        self.assertEqual(
+            {row[0] for row in self.env.cr.fetchall()},
+            {"private_key", "certificate"},
         )
 
 
@@ -173,23 +248,41 @@ class TheKeyLandsInTheColumn(PrivateKeyCommon):
             "the key is still going to the filestore",
         )
 
-    def test_and_the_control_shows_an_attachment_would_have_been_visible(self):
-        """The same query, against the field that *is* attachment-backed.
+    def test_no_attachment_is_created_for_the_certificate_either(self):
+        certificate = self._activated("No cert attachment")
+        self.assertFalse(self._attachments_for(certificate, "certificate"))
 
-        Without this, "no attachment found" could mean the search was wrong.
+    def test_and_the_control_shows_such_a_search_does_find_attachments(self):
+        """The same query shape, against a field that really is attachment-backed.
+
+        Without this, "no attachment found" could mean the search is wrong --
+        a misspelled `res_field`, a `res_model` that never matches -- and every
+        assertion above would pass while the key sat in the filestore.
+
+        `res.partner.image_1920` is an `fields.Image`, which is a Binary with
+        `attachment=True`. It is core Odoo, it is in the same database, and it
+        is nothing to do with this module, so it cannot be broken by the change
+        under test.
         """
-        certificate = self._generated("Attachment control")
-        # A certificate for this record's own key, so the upload is accepted.
-        cert_pem = self._certificate_for(
-            self._key_of(certificate), STORAGE_HOLDER_CUIT
-        )
-        certificate.action_process_certificate(base64.b64encode(cert_pem))
+        partner = self.company_ri.partner_id
+        partner.sudo().write({"image_1920": ONE_PIXEL_PNG})
         self.env.flush_all()
-        self.assertTrue(
-            self._attachments_for(certificate, "certificate"),
-            "the control field created no attachment either, so the search is wrong",
+
+        found = (
+            self.env["ir.attachment"]
+            .sudo()
+            .search(
+                [
+                    ("res_model", "=", "res.partner"),
+                    ("res_field", "=", "image_1920"),
+                    ("res_id", "=", partner.id),
+                ]
+            )
         )
-        self.assertFalse(self._attachments_for(certificate, "private_key"))
+        self.assertTrue(
+            found,
+            "an attachment-backed field produced no attachment: the search is wrong",
+        )
 
     def test_the_key_is_rsa_2048(self):
         certificate = self._generated("RSA size")
@@ -243,42 +336,79 @@ class TheKeyLandsInTheColumn(PrivateKeyCommon):
             return
         self.assertNotIn("private_key", values[0])
 
-    def _invoicing_user(self):
-        return self.env["res.users"].create(
-            {
-                "name": "Invoicing only, key storage",
-                "login": f"arca_key_storage_user_{self.env.cr.dbname[:4]}",
-                "company_id": self.company_ri.id,
-                "company_ids": [(6, 0, self.company_ri.ids)],
-                "group_ids": [(6, 0, [self.env.ref("account.group_account_invoice").id])],
-            }
+
+@tagged("post_install", "-at_install")
+class TheCertificateLandsInItsColumnToo(PrivateKeyCommon):
+    """WSAA builds a signature from both halves. A restore needs both."""
+
+    def test_processing_a_certificate_writes_the_column(self):
+        certificate = self._activated("Cert column")
+        stored = self._column(certificate, "certificate")
+        self.assertIsNotNone(stored, "the certificate column is empty")
+        self.assertTrue(stored)
+
+    def test_and_what_the_column_holds_parses_as_a_certificate(self):
+        certificate = self._activated("Cert parse")
+        loaded = x509.load_pem_x509_certificate(
+            base64.b64decode(self._column(certificate, "certificate"))
+        )
+        self.assertIsInstance(loaded, x509.Certificate)
+
+    def test_the_certificate_matches_the_private_key(self):
+        """The pair, checked from what the two columns hold."""
+        certificate = self._activated("Cert pair")
+        loaded = x509.load_pem_x509_certificate(
+            base64.b64decode(self._column(certificate, "certificate"))
+        )
+        key = serialization.load_pem_private_key(
+            base64.b64decode(self._column(certificate, "private_key")), password=None
+        )
+        self.assertEqual(
+            loaded.public_key().public_numbers(),
+            key.public_key().public_numbers(),
         )
 
-    def _certificate_for(self, key, holder_cuit):
-        """A self-signed certificate over an existing key, for upload tests."""
-        import datetime
+    def test_the_record_became_active(self):
+        self.assertEqual(self._activated("Cert active").state, "active")
 
-        from cryptography.x509.oid import NameOID
+    def test_a_signature_is_built_from_both_reloaded_halves(self):
+        """`_sign_tra` is the WSAA path: it needs the key and the certificate."""
+        certificate = self._activated("Cert sign")
+        certificate.invalidate_recordset()
+        self.env.registry.clear_cache()
+        signed = self.env["l10n_ar.arca.wsaa"]._sign_tra(certificate, "<tra/>")
+        self.assertTrue(signed)
+        self.assertTrue(base64.b64decode(signed))
 
-        subject = x509.Name(
-            [
-                x509.NameAttribute(NameOID.COUNTRY_NAME, "AR"),
-                x509.NameAttribute(NameOID.COMMON_NAME, "storage-control"),
-                x509.NameAttribute(NameOID.SERIAL_NUMBER, f"CUIT {holder_cuit}"),
-            ]
+    def test_and_it_fails_when_either_half_is_missing(self):
+        """The control: a signature needs both, so losing one is not survivable.
+
+        This is the failure a filestore restore produces, reproduced by
+        emptying the column instead of losing a directory.
+        """
+        for missing in ("private_key", "certificate"):
+            with self.subTest(missing=missing):
+                certificate = self._activated(f"Cert half {missing}")
+                certificate.sudo().write({missing: False})
+                self.env.flush_all()
+                with self.assertRaises(UserError):
+                    self.env["l10n_ar.arca.wsaa"]._sign_tra(certificate, "<tra/>")
+
+    def test_a_restore_of_the_table_alone_carries_both(self):
+        """What a `pg_dump` of this table would bring back, asked as SQL.
+
+        The filestore is not consulted, because with both fields in columns
+        there is nothing in it to consult.
+        """
+        certificate = self._activated("Cert restore")
+        self.env.cr.execute(
+            "SELECT OCTET_LENGTH(private_key), OCTET_LENGTH(certificate) "
+            "FROM l10n_ar_arca_certificate WHERE id = %s",
+            (certificate.id,),
         )
-        now = datetime.datetime.now(datetime.timezone.utc)
-        return (
-            x509.CertificateBuilder()
-            .subject_name(subject)
-            .issuer_name(subject)
-            .public_key(key.public_key())
-            .serial_number(x509.random_serial_number())
-            .not_valid_before(now - datetime.timedelta(days=1))
-            .not_valid_after(now + datetime.timedelta(days=365))
-            .sign(key, hashes.SHA256())
-            .public_bytes(serialization.Encoding.PEM)
-        )
+        key_bytes, cert_bytes = self.env.cr.fetchone()
+        self.assertTrue(key_bytes, "the key would not survive a table-only restore")
+        self.assertTrue(cert_bytes, "the certificate would not survive it either")
 
 
 @tagged("post_install", "-at_install")
@@ -310,6 +440,27 @@ class ACopyDoesNotCarryTheKey(PrivateKeyCommon):
         duplicate = certificate.copy()
         self.assertEqual(duplicate.state, "draft")
         self.assertFalse(duplicate.private_key_stored)
+
+    def test_the_copy_carries_neither_half(self):
+        """A duplicate with the certificate and no key would claim an identity
+        it cannot sign for, which is worse than carrying nothing."""
+        certificate = self._activated("Copy both")
+        duplicate = certificate.copy()
+        self.env.flush_all()
+        self.assertFalse(duplicate.sudo().private_key)
+        self.assertFalse(duplicate.sudo().certificate)
+        self.assertIsNone(self._column(duplicate, "private_key"))
+        self.assertIsNone(self._column(duplicate, "certificate"))
+
+    def test_and_the_original_keeps_both(self):
+        certificate = self._activated("Copy both original")
+        key_before = self._digest(certificate.sudo().private_key)
+        cert_before = self._digest(certificate.sudo().certificate)
+        certificate.copy()
+        self.env.flush_all()
+        certificate.invalidate_recordset()
+        self.assertEqual(self._digest(certificate.sudo().private_key), key_before)
+        self.assertEqual(self._digest(certificate.sudo().certificate), cert_before)
 
 
 @tagged("post_install", "-at_install")
@@ -414,17 +565,6 @@ class ASecondGenerationIsRefused(PrivateKeyCommon):
 class OrdinaryUsersAreUnaffected(PrivateKeyCommon):
     """Moving the bytes must not move the boundary around them."""
 
-    def _invoicing_user(self):
-        return self.env["res.users"].create(
-            {
-                "name": "Invoicing only, unaffected",
-                "login": f"arca_unaffected_{self.env.cr.dbname[:4]}",
-                "company_id": self.company_ri.id,
-                "company_ids": [(6, 0, self.company_ri.ids)],
-                "group_ids": [(6, 0, [self.env.ref("account.group_account_invoice").id])],
-            }
-        )
-
     def test_an_invoicing_user_still_cannot_read_the_key(self):
         certificate = self._generated("User read")
         user = self._invoicing_user()
@@ -480,20 +620,12 @@ class OrdinaryUsersAreUnaffected(PrivateKeyCommon):
         certificate.invalidate_recordset()
         self.assertEqual(self._digest(certificate.sudo().private_key), before)
 
-    def test_a_draft_is_not_yet_protected_from_one(self):
-        """The open half of H-05, written down rather than left to be discovered.
-
-        A draft holds no key, so nothing is lost here today -- but if this ever
-        starts passing because an access check was added, this test is the one
-        that should be deleted, and deliberately.
-        """
-        draft = self._draft("User draft")
-        user = self._invoicing_user()
-        try:
-            draft.with_user(user).action_generate_key_and_csr()
-        except AccessError:
-            self.skipTest("an access check was added; H-05 is closed")
-        self.assertEqual(draft.state, "csr_generated")
+    # The other half of H-05 -- that an ordinary user can still generate from a
+    # `draft`, because `action_generate_key_and_csr` runs `self.sudo()` with no
+    # `check_access` -- is deliberately NOT asserted here. A green test stating
+    # that as expected behaviour would read like a decision, and it is a defect
+    # with an open finding. It gets its own PR and a RED test demanding
+    # AccessError before any sudo or write.
 
 
 @tagged("post_install", "-at_install")

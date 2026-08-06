@@ -20,17 +20,32 @@ transaction before returning to its caller, so a rollback cannot take it -- but
 nothing survives the database being deleted, which is what a throwaway CI
 database does on every run.
 
-Why a persistent database is still not enough
----------------------------------------------
-``certificate`` and ``private_key`` are ``Binary(attachment=True)``, so Odoo
-writes them to the filestore on disk. On a runner that disk is as disposable as
-the database used to be. With a persistent database and an empty filestore, the
-certificate row and the cached ticket both survive and ``_check_usable()`` still
-raises "has no private key stored" *before* the cached ticket is ever read.
+Where the fiscal material lives
+------------------------------
+``private_key`` and ``certificate`` are ``Binary(attachment=False)``, so both
+live in columns of ``l10n_ar_arca_certificate`` -- inside the row, inside the
+transaction, inside ``pg_dump``.
 
-So this script pins ``ir_attachment.location`` to ``db`` before writing any
-material, and proves in SQL that the bytes landed in ``ir_attachment.db_datas``
-with no ``store_fname``. If they did not, it aborts without recording anything.
+This used to be the opposite, and the script used to compensate. Both fields
+were ``attachment=True``, which put the bytes in the filestore: a directory on
+disk, as disposable on a runner as the database used to be. With a persistent
+database and an empty filestore the certificate row and the cached ticket both
+survived, and ``_check_usable()`` still raised "has no private key stored"
+*before* the cached ticket was ever read. So this script pinned
+``ir_attachment.location`` to ``db`` for the whole database and called
+``force_storage()``.
+
+Both of those are gone. Pinning a global parameter to fix one module's fields
+was always too wide a lever -- it moved every attachment in the database,
+including ones belonging to nobody here -- and with the fields in columns it
+fixes nothing at all. What remains is the verification, rewritten to ask the
+question that is now the right one: are the columns there, and do they hold
+bytes? It still aborts without recording anything if they do not.
+
+It also refuses to proceed while any *old* attachment still claims these
+fields. Such a row means the material this database actually holds is somewhere
+the module no longer reads, and continuing would seed a certificate that cannot
+sign. Only the count is read: never ``db_datas``, never the filestore.
 
 What it must never do
 ---------------------
@@ -61,8 +76,7 @@ CERTIFICATE_NAME = "ARCA homologación"
 # code", and a half-finished bootstrap must never make it.
 SHA_PARAMETER = "l10n_ar_arca_edi.installed_sha"
 
-STORAGE_PARAMETER = "ir_attachment.location"
-STORAGE_IN_DATABASE = "db"
+TABLE = "l10n_ar_arca_certificate"
 
 # The one environment this database may ever hold.
 ENVIRONMENT = "testing"
@@ -126,25 +140,36 @@ def resolve_code_sha(environ, build_marker=None):
     return None
 
 
-def storage_problems(rows):
-    """Return why the fiscal material is not safely in the database.
+def storage_problems(columns, sizes, legacy_attachments):
+    """Return why the fiscal material is not safely inside the row.
 
-    ``rows`` are ``(res_field, in_database, on_disk, size)``. An empty list means
-    every attachment lives in ``ir_attachment.db_datas`` and nothing depends on a
-    filestore that a runner throws away.
+    ``columns``            names the table actually has.
+    ``sizes``              ``{field: byte length}``; ``None`` means SQL NULL.
+    ``legacy_attachments`` how many old ``ir.attachment`` rows still claim these
+                           fields -- a count, never their contents.
+
+    An empty list means both values are in columns of ``l10n_ar_arca_certificate``
+    and nothing depends on a filestore that a runner throws away.
     """
     problems = []
-    seen = {row[0] for row in rows}
     for field in MATERIAL_FIELDS:
-        if field not in seen:
-            problems.append(f"no hay adjunto para '{field}'")
-    for res_field, in_database, on_disk, size in rows:
-        if not in_database:
-            problems.append(f"'{res_field}' no tiene db_datas")
-        if on_disk:
-            problems.append(f"'{res_field}' todavía apunta al filestore (store_fname)")
-        if in_database and not size:
-            problems.append(f"'{res_field}' tiene db_datas vacío")
+        if field not in columns:
+            problems.append(
+                f"la tabla {TABLE} no tiene la columna '{field}' "
+                "(¿el módulo quedó en una versión anterior?)"
+            )
+            continue
+        size = sizes.get(field)
+        if size is None:
+            problems.append(f"'{field}' está vacío en su columna")
+        elif not size:
+            problems.append(f"'{field}' tiene la columna con cero bytes")
+    if legacy_attachments:
+        problems.append(
+            f"quedan {legacy_attachments} adjunto(s) antiguos para "
+            f"{' y '.join(MATERIAL_FIELDS)}: el material real puede estar donde "
+            "el módulo ya no lo lee"
+        )
     return problems
 
 
@@ -177,23 +202,23 @@ def check_module_installed(env):
     print("[bootstrap] Módulo instalado verificado")
 
 
-def pin_attachment_storage(env):
-    """Force attachments into the database, before any material is written."""
-    params = env["ir.config_parameter"].sudo()
-    current = params.get_param(STORAGE_PARAMETER)
-    if current != STORAGE_IN_DATABASE:
-        params.set_param(STORAGE_PARAMETER, STORAGE_IN_DATABASE)
-        print(f"[bootstrap] {STORAGE_PARAMETER}: {current!r} -> {STORAGE_IN_DATABASE!r}")
-    else:
-        print(f"[bootstrap] {STORAGE_PARAMETER} ya era {STORAGE_IN_DATABASE!r}")
+def check_material_columns(env):
+    """Both fields must exist as columns before any material is written.
 
-    # Anything written before the switch is still on disk. Moving it now is what
-    # makes the guarantee true rather than merely intended.
-    try:
-        env["ir.attachment"].sudo().force_storage()
-        print("[bootstrap] force_storage(): adjuntos preexistentes migrados a la base")
-    except Exception as exc:  # noqa: BLE001
-        print(f"[bootstrap] AVISO: force_storage() no pudo completarse: {exc}")
+    Cheap, and it fails at the top rather than after the write: a module left at
+    the previous version has no such columns, and writing into it would put the
+    material where the running code cannot find it.
+    """
+    columns = read_material_columns(env)
+    missing = [field for field in MATERIAL_FIELDS if field not in columns]
+    if missing:
+        raise SystemExit(
+            f"[bootstrap] ABORTA: la tabla {TABLE} no tiene la(s) columna(s) "
+            f"{', '.join(missing)}.\n"
+            "Esta base parece estar en una versión del módulo anterior a "
+            "19.0.3.0.0. Actualizala antes de sembrar material."
+        )
+    print(f"[bootstrap] Columnas {', '.join(MATERIAL_FIELDS)} verificadas en {TABLE}")
 
 
 def disable_auto_request(env):
@@ -402,36 +427,71 @@ def report_ticket(certificate):
         print(f"[bootstrap] Cache de TA: servicio={service} vence={expiration} (intacto)")
 
 
-def read_material_storage(env, certificate):
+def read_material_columns(env):
+    """Which of the two fields exist as columns on the table. Names only."""
     env.cr.execute(
         """
-        SELECT res_field,
-               db_datas IS NOT NULL    AS in_database,
-               store_fname IS NOT NULL AS on_disk,
-               COALESCE(LENGTH(db_datas), 0) AS bytes
+        SELECT column_name
+          FROM information_schema.columns
+         WHERE table_name = %s
+           AND column_name IN %s
+        """,
+        (TABLE, MATERIAL_FIELDS),
+    )
+    return {row[0] for row in env.cr.fetchall()}
+
+
+def read_material_sizes(env, certificate):
+    """How many bytes each column holds. Lengths only -- never the values."""
+    env.cr.execute(
+        f"""
+        SELECT OCTET_LENGTH(private_key), OCTET_LENGTH(certificate)
+          FROM {TABLE}
+         WHERE id = %s
+        """,  # noqa: S608 -- TABLE is a constant in this file, not an input
+        (certificate.id,),
+    )
+    row = env.cr.fetchone() or (None, None)
+    return {"private_key": row[0], "certificate": row[1]}
+
+
+def count_legacy_attachments(env, certificate):
+    """How many old attachments still claim these fields. A count, nothing else.
+
+    Never ``db_datas``, never ``store_fname``, never the filestore: the question
+    is whether any exist, and reading one would mean handling material this
+    script has no reason to touch.
+    """
+    env.cr.execute(
+        """
+        SELECT COUNT(*)
           FROM ir_attachment
          WHERE res_model = 'l10n_ar.arca.certificate'
            AND res_id = %s
            AND res_field IN %s
-         ORDER BY res_field
         """,
         (certificate.id, MATERIAL_FIELDS),
     )
-    return env.cr.fetchall()
+    return env.cr.fetchone()[0]
 
 
 def verify_storage(env, certificate):
-    """Prove in SQL that the material is in the database, not on disk."""
-    rows = read_material_storage(env, certificate)
-    for res_field, in_database, on_disk, size in rows:
+    """Prove in SQL that the material is in the row, and nowhere else."""
+    columns = read_material_columns(env)
+    sizes = read_material_sizes(env, certificate)
+    legacy = count_legacy_attachments(env, certificate)
+
+    for field in MATERIAL_FIELDS:
         print(
-            f"[bootstrap] almacenamiento {res_field}: en_base={in_database} "
-            f"en_disco={on_disk} bytes={size}"
+            f"[bootstrap] almacenamiento {field}: columna={field in columns} "
+            f"bytes={sizes.get(field)}"
         )
-    problems = storage_problems(rows)
+    print(f"[bootstrap] adjuntos antiguos para esos campos: {legacy}")
+
+    problems = storage_problems(columns, sizes, legacy)
     if problems:
         raise SystemExit(
-            "[bootstrap] ABORTA: el material fiscal no quedó dentro de PostgreSQL:\n  - "
+            "[bootstrap] ABORTA: el material fiscal no quedó dentro de la fila:\n  - "
             + "\n  - ".join(problems)
             + "\nUn filestore descartable pierde la clave, y con ella el ticket."
         )
@@ -461,8 +521,10 @@ def main(env, environ=None):
 
     build_marker = pathlib.Path(__file__).resolve().parent.parent / ".viarengo-build-sha"
 
-    # Order matters: storage is pinned before any material is written.
-    pin_attachment_storage(env)
+    # Order matters: the columns are checked before any material is written, so
+    # a database still on the previous version is refused rather than seeded
+    # into fields the running code does not read.
+    check_material_columns(env)
     disable_auto_request(env)
 
     company = target_company(env, environ)
