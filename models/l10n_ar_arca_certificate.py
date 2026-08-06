@@ -324,9 +324,14 @@ class L10nArArcaCertificate(models.Model):
                         x509.NameAttribute(NameOID.COMMON_NAME, self.name),
                         # ARCA issues the certificate to the fiscal key that
                         # creates it, so the subject carries the holder's CUIT.
+                        #
+                        # Digits, not the hyphenated form: ARCA parses this
+                        # attribute and requires `CUIT` + one space + the eleven
+                        # digits. `_format_holder_cuit()` exists for screens and
+                        # is the wrong thing here.
                         x509.NameAttribute(
                             NameOID.SERIAL_NUMBER,
-                            f"CUIT {self._format_holder_cuit()}",
+                            f"CUIT {self._get_holder_cuit()}",
                         ),
                     ]
                 )
@@ -344,11 +349,12 @@ class L10nArArcaCertificate(models.Model):
                 "state": "csr_generated",
             }
         )
+        # No holder here. The record id identifies which certificate this was,
+        # and a CUIT is personal data that would sit in the log forever.
         _logger.info(
-            "Generated an RSA-%s key and CSR for certificate %s (holder %s, env %s)",
+            "Generated an RSA-%s key and CSR for certificate %s (env %s)",
             RSA_KEY_SIZE,
             self.id,
-            self._format_holder_cuit(),
             self.environment,
         )
         return self._notify(

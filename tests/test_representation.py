@@ -57,8 +57,10 @@ class TestArcaRepresentation(ArcaTestCommon):
 
         csr = x509.load_pem_x509_csr(certificate.csr_pem.encode())
         serial = csr.subject.get_attributes_for_oid(NameOID.SERIAL_NUMBER)[0].value
-        self.assertEqual(serial, f"CUIT {certificate._format_holder_cuit()}")
-        self.assertNotIn(self.issuer_cuit, serial.replace("-", ""))
+        # The digits, which is what ARCA parses. The hyphenated form belongs on
+        # a screen; test_certificate.py covers the format itself.
+        self.assertEqual(serial, f"CUIT {certificate._get_holder_cuit()}")
+        self.assertNotIn(self.issuer_cuit, serial)
 
     def test_the_certificate_is_validated_against_the_holder(self):
         """Accepted because the subject names the holder, not the company."""
