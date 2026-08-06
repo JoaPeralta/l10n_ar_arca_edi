@@ -2,7 +2,7 @@
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
 {
     "name": "Argentina - ARCA Electronic Invoicing",
-    "version": "19.0.3.0.0",
+    "version": "19.0.3.0.1",
     "category": "Accounting/Localizations",
     "summary": "Electronic invoicing integration with ARCA (ex-AFIP) for Argentina",
     "development_status": "Beta",

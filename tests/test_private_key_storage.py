@@ -608,43 +608,35 @@ class OrdinaryUsersAreUnaffected(PrivateKeyCommon):
             found.filtered(lambda record: record.res_field == "private_key")
         )
 
-    def test_the_state_guard_refuses_an_ordinary_user_too(self):
-        """And it is the *state* guard that refuses, not an access check.
+    def test_an_ordinary_user_is_refused_before_the_state_guard(self):
+        """Renamed and re-aimed when H-05 was closed.
 
-        Said plainly because the distinction matters and the obvious version of
-        this test hides it. `action_generate_key_and_csr` runs `self.sudo()`
-        without a `check_access`, so on a record still in `draft` an ordinary
-        user can reach the write -- that is audit finding H-05, it is open, and
-        nothing in this change addresses it.
+        This used to be `test_the_state_guard_refuses_an_ordinary_user_too`,
+        and it demanded `UserError` with "already generated" -- because at the
+        time that *was* what happened: `action_generate_key_and_csr` elevated to
+        `sudo` without asking whether the caller could write, so an invoicing
+        user reached the state guard and was turned away by it rather than by
+        the authorisation boundary.
 
-        What this asserts is the narrower thing that is true: once a CSR exists,
-        the state guard closes the door to everybody, which is what protects the
-        key that has already been generated.
+        The old assertion described the defect. It is not kept as a
+        compatibility case, because it never described a decision anybody made.
 
-        `UserError` specifically, and the message with it. A tuple would not
-        even run -- Odoo's `TestCase.assertRaises` calls `issubclass()` on its
-        argument and a tuple raises `TypeError: issubclass() arg 1 must be a
-        class` -- and accepting either exception would let this pass for the
-        wrong reason on the day an access check lands, which is a different
-        change with its own PR.
+        With `self.check_access("write")` now running before the guards, this
+        user is refused with `AccessError` in every state, and the guard's
+        message never reaches them. The authorisation boundary itself is
+        covered in full by `test_csr_generation_authorization.py`; what stays
+        here is the one thing this file is about -- the key does not move.
         """
         certificate = self._generated("User regenerate")
         user = self._invoicing_user()
         before = self._digest(certificate.sudo().private_key)
 
-        with self.assertRaises(UserError) as caught:
+        with self.assertRaises(AccessError) as caught:
             certificate.with_user(user).action_generate_key_and_csr()
-        self.assertIn("already generated", str(caught.exception))
+        self.assertNotIn("already generated", str(caught.exception))
 
         certificate.invalidate_recordset()
         self.assertEqual(self._digest(certificate.sudo().private_key), before)
-
-    # The other half of H-05 -- that an ordinary user can still generate from a
-    # `draft`, because `action_generate_key_and_csr` runs `self.sudo()` with no
-    # `check_access` -- is deliberately NOT asserted here. A green test stating
-    # that as expected behaviour would read like a decision, and it is a defect
-    # with an open finding. It gets its own PR and a RED test demanding
-    # AccessError before any sudo or write.
 
 
 @tagged("post_install", "-at_install")

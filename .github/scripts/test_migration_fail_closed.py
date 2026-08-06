@@ -53,6 +53,10 @@ def function(name):
     raise AssertionError(f"no function named {name!r}")
 
 
+def version_tuple(text):
+    return tuple(int(part) for part in text.split("."))
+
+
 def executable_source():
     """The file's code, with comments and every docstring removed.
 
@@ -87,11 +91,25 @@ class TestItIsWhereOdooWillFindIt(unittest.TestCase):
         """`post` would run after the columns exist, which is too late."""
         self.assertEqual(MIGRATION.name, "pre-migrate.py")
 
-    def test_the_directory_is_the_manifest_version(self):
+    def test_the_directory_is_the_version_that_introduced_it(self):
+        """Not "the current version" -- the version whose upgrade needs it.
+
+        This used to compare the directory against the manifest, which held
+        while they happened to be equal and broke the moment a patch release
+        landed without a migration of its own. A migration directory names the
+        version being upgraded *to* when that script must run, and later patch
+        releases do not retroactively need it.
+        """
+        self.assertEqual(MIGRATION.parent.name, VERSION)
+
+    def test_and_the_module_is_at_or_past_that_version(self):
+        """A directory ahead of the manifest would never run."""
         manifest = ast.literal_eval(
             (REPO_ROOT / "__manifest__.py").read_text(encoding="utf-8")
         )
-        self.assertEqual(MIGRATION.parent.name, manifest["version"])
+        self.assertGreaterEqual(
+            version_tuple(manifest["version"]), version_tuple(VERSION)
+        )
 
     def test_it_exposes_odoo_s_entry_point(self):
         node = function("migrate")

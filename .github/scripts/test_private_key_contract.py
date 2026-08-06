@@ -305,34 +305,40 @@ class NothingPrivateReachesTheLog(unittest.TestCase):
             self.assertNotIn(marker, text, marker)
 
 
-class TheStateGuardTestDemandsTheRightFailure(unittest.TestCase):
+class TheOrdinaryUserTestDemandsTheRightFailure(unittest.TestCase):
     """One test, one contract, checked where Odoo is not needed to check it.
 
-    Why this exists and why it is this narrow
-    -----------------------------------------
-    ``test_the_state_guard_refuses_an_ordinary_user_too`` was written as
-    ``assertRaises((AccessError, UserError))``. That does not run under Odoo at
-    all: ``TestCase.assertRaises`` calls ``issubclass()`` on its argument, and a
-    tuple raises ``TypeError: issubclass() arg 1 must be a class``. It took a
-    runner to find that, and runners have been scarce.
+    History, because this class has now guarded two different contracts and the
+    second replaced the first on purpose.
 
-    It was also the wrong assertion. The record is in ``csr_generated``, so the
-    branch under test is the state guard this PR added -- and accepting
-    ``AccessError`` as an equally good outcome would let the test pass for the
-    wrong reason on the day H-05 is fixed, which is a different change.
+    It was written as `TheStateGuardTestDemandsTheRightFailure`, locking
+    `test_the_state_guard_refuses_an_ordinary_user_too` to `UserError` with
+    "already generated". That was right at the time and is wrong now. It was
+    right because the assertion it replaced --
+    `assertRaises((AccessError, UserError))` -- does not run under Odoo at all:
+    `TestCase.assertRaises` calls `issubclass()` on its argument and a tuple
+    raises `TypeError: issubclass() arg 1 must be a class`. It was also
+    accepting either exception, which would have passed for the wrong reason
+    the day an access check landed.
 
-    Deliberately scoped to this one test rather than made a rule about tuples
-    everywhere: elsewhere in this repository a tuple can be exactly right, and a
-    blanket ban would be a rule nobody asked for enforced on code nobody
-    reviewed for it.
+    That day is this PR. With `self.check_access("write")` before the state
+    guards, an invoicing user is refused with `AccessError` in every state and
+    never sees the guard's message. So the contract inverts: the test is
+    renamed `test_an_ordinary_user_is_refused_before_the_state_guard`, and what
+    is locked here is `AccessError` and the *absence* of the guard's message.
+
+    Still scoped to this one test rather than made a rule about tuples
+    everywhere: elsewhere in this repository a tuple can be exactly right.
     """
 
     STORAGE_TESTS = REPO / "tests" / "test_private_key_storage.py"
-    TEST_NAME = "test_the_state_guard_refuses_an_ordinary_user_too"
+    TEST_NAME = "test_an_ordinary_user_is_refused_before_the_state_guard"
+    RETIRED_NAME = "test_the_state_guard_refuses_an_ordinary_user_too"
 
     def setUp(self):
         source = self.STORAGE_TESTS.read_text(encoding="utf-8")
         tree = ast.parse(source)
+        self.source = source
         self.node = next(
             (
                 node
@@ -343,6 +349,17 @@ class TheStateGuardTestDemandsTheRightFailure(unittest.TestCase):
         )
         self.assertIsNotNone(self.node, f"{self.TEST_NAME} is gone")
         self.body = ast.unparse(self.node)
+        # The statements only. The docstring names `UserError` on purpose, to
+        # say what this test used to demand and why it no longer does, and a
+        # text search cannot tell that apart from an assertion.
+        self.code = "\n".join(
+            ast.unparse(statement)
+            for statement in self.node.body
+            if not (
+                isinstance(statement, ast.Expr)
+                and isinstance(statement.value, ast.Constant)
+            )
+        )
 
     def _assert_raises_arguments(self):
         """What each `assertRaises` in this test is given."""
@@ -364,27 +381,30 @@ class TheStateGuardTestDemandsTheRightFailure(unittest.TestCase):
             "assertRaises was given something other than a bare class",
         )
 
-    def test_and_that_class_is_UserError(self):
-        self.assertEqual(self._assert_raises_arguments()[0].id, "UserError")
+    def test_and_that_class_is_AccessError(self):
+        """The boundary is authorisation now, not state."""
+        self.assertEqual(self._assert_raises_arguments()[0].id, "AccessError")
 
     def test_it_is_not_given_a_tuple(self):
         """Odoo calls `issubclass()` on it; a tuple is a TypeError, not a skip."""
-        argument = self._assert_raises_arguments()[0]
-        self.assertNotIsInstance(argument, ast.Tuple)
+        self.assertNotIsInstance(self._assert_raises_arguments()[0], ast.Tuple)
 
-    def test_and_does_not_accept_an_access_error_instead(self):
-        """A different failure for a different reason, fixed by a different PR."""
-        self.assertNotIn("AccessError", self.body)
+    def test_and_does_not_accept_a_user_error_instead(self):
+        """A `UserError` here would mean the state guard answered first."""
+        self.assertNotIn("UserError", self.code)
 
-    def test_it_checks_the_message_of_the_branch_it_is_about(self):
-        """`already generated` is the `csr_generated` branch, not the `active` one."""
-        self.assertIn("already generated", self.body)
-        self.assertNotIn("would make", self.body)
+    def test_it_asserts_the_guard_message_does_not_leak(self):
+        """An unauthorised caller must not learn which guard they would hit."""
+        self.assertIn("assertNotIn", self.code)
+        self.assertIn("already generated", self.code)
 
     def test_and_still_proves_the_key_did_not_move(self):
-        """The refusal is only worth asserting if nothing changed with it."""
-        self.assertIn("invalidate_recordset", self.body)
-        self.assertIn("assertEqual(self._digest", self.body)
+        self.assertIn("invalidate_recordset", self.code)
+        self.assertIn("assertEqual(self._digest", self.code)
+
+    def test_the_retired_name_is_gone_rather_than_left_contradicting(self):
+        """It asserted the defect. Keeping it would assert two boundaries."""
+        self.assertNotIn(f"def {self.RETIRED_NAME}", self.source)
 
 
 class TheModuleVersionWasIncremented(unittest.TestCase):
