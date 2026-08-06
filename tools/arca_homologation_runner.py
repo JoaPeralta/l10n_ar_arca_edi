@@ -44,10 +44,9 @@ import os
 TICKET_RENEWAL_MARGIN_MINUTES = 15
 
 SHA_PARAMETER = "l10n_ar_arca_edi.installed_sha"
-STORAGE_PARAMETER = "ir_attachment.location"
-STORAGE_IN_DATABASE = "db"
 ENVIRONMENT = "testing"
 MATERIAL_FIELDS = ("certificate", "private_key")
+TABLE = "l10n_ar_arca_certificate"
 
 MODE_VARIABLE = "ARCA_HOMO_MODE"
 PREFLIGHT = "preflight"
@@ -73,25 +72,41 @@ def resolve_mode(environ):
     return requested if requested in AVAILABLE_MODES else None
 
 
-def storage_problems(rows):
+def storage_problems(columns, sizes, legacy_attachments):
     """Return why the fiscal material is not safely inside PostgreSQL.
 
-    ``rows`` are ``(res_field, in_database, on_disk, size)``. Empty means every
-    attachment lives in ``ir_attachment.db_datas``, so nothing depends on a
-    filestore this runner does not have.
+    ``columns``            names the table actually has.
+    ``sizes``              ``{field: byte length}``; ``None`` means SQL NULL.
+    ``legacy_attachments`` how many old ``ir.attachment`` rows still claim these
+                           fields -- a count, never their contents.
+
+    Empty means both values live in columns of ``l10n_ar_arca_certificate``, so
+    nothing here depends on ``ir.attachment`` or on how it is configured.
+
+    This used to read ``db_datas`` and ``store_fname``, because both fields were
+    ``attachment=True`` -- stored through ``ir.attachment``, with the content's
+    location decided by ``ir_attachment.location`` -- and the bootstrap pinned
+    that parameter to ``db`` so the bytes would be inside PostgreSQL rather than
+    in the filestore this runner does not have. They are columns now, the
+    parameter is no longer set, and a runner still demanding it would abort
+    every session against a correctly prepared database.
     """
     problems = []
-    seen = {row[0] for row in rows}
     for field in MATERIAL_FIELDS:
-        if field not in seen:
-            problems.append(f"no hay adjunto para '{field}'")
-    for res_field, in_database, on_disk, size in rows:
-        if not in_database:
-            problems.append(f"'{res_field}' no tiene db_datas")
-        if on_disk:
-            problems.append(f"'{res_field}' todavía apunta al filestore (store_fname)")
-        if in_database and not size:
-            problems.append(f"'{res_field}' tiene db_datas vacío")
+        if field not in columns:
+            problems.append(f"la tabla {TABLE} no tiene la columna '{field}'")
+            continue
+        size = sizes.get(field)
+        if size is None:
+            problems.append(f"'{field}' está vacío en su columna")
+        elif not size:
+            problems.append(f"'{field}' tiene la columna con cero bytes")
+    if legacy_attachments:
+        problems.append(
+            f"quedan {legacy_attachments} adjunto(s) antiguos para "
+            f"{' y '.join(MATERIAL_FIELDS)}: el material real puede estar donde "
+            "el módulo ya no lo lee"
+        )
     return problems
 
 
@@ -191,17 +206,6 @@ def check_installed_sha(env, environ):
     print(f"[runner] SHA coincide: {recorded}")
 
 
-def check_attachment_storage(env):
-    location = env["ir.config_parameter"].sudo().get_param(STORAGE_PARAMETER)
-    if location != STORAGE_IN_DATABASE:
-        raise SystemExit(
-            f"[runner] ABORTA: {STORAGE_PARAMETER}={location!r}. El material "
-            "fiscal tiene que vivir en la base, no en un filestore que este "
-            "proceso no tiene."
-        )
-    print(f"[runner] {STORAGE_PARAMETER}={STORAGE_IN_DATABASE}")
-
-
 def certificates(env):
     found = env["l10n_ar.arca.certificate"].sudo().search([])
     if not found:
@@ -233,27 +237,54 @@ def check_material_present(certificate):
 
 
 def check_material_storage(env, certificate):
+    """Both values in their columns, and no old attachment claiming them.
+
+    Lengths and a count. Never ``db_datas``, never ``store_fname``, never the
+    filestore: this process has no business reading fiscal material, only
+    establishing that it is where the module will look for it.
+    """
     env.cr.execute(
         """
-        SELECT res_field,
-               db_datas IS NOT NULL    AS in_database,
-               store_fname IS NOT NULL AS on_disk,
-               COALESCE(LENGTH(db_datas), 0) AS bytes
+        SELECT column_name
+          FROM information_schema.columns
+         WHERE table_name = %s
+           AND column_name IN %s
+        """,
+        (TABLE, MATERIAL_FIELDS),
+    )
+    columns = {row[0] for row in env.cr.fetchall()}
+
+    env.cr.execute(
+        f"""
+        SELECT OCTET_LENGTH(private_key), OCTET_LENGTH(certificate)
+          FROM {TABLE}
+         WHERE id = %s
+        """,  # noqa: S608 -- TABLE is a constant in this file, not an input
+        (certificate.id,),
+    )
+    row = env.cr.fetchone() or (None, None)
+    sizes = {"private_key": row[0], "certificate": row[1]}
+
+    env.cr.execute(
+        """
+        SELECT COUNT(*)
           FROM ir_attachment
          WHERE res_model = 'l10n_ar.arca.certificate'
            AND res_id = %s
            AND res_field IN %s
-         ORDER BY res_field
         """,
         (certificate.id, MATERIAL_FIELDS),
     )
-    rows = env.cr.fetchall()
-    for res_field, in_database, on_disk, size in rows:
+    legacy = env.cr.fetchone()[0]
+
+    for field in MATERIAL_FIELDS:
         print(
-            f"[runner] almacenamiento {res_field}: en_base={in_database} "
-            f"en_disco={on_disk} bytes={size}"
+            f"[runner] almacenamiento {field}: columna={field in columns} "
+            f"bytes={sizes.get(field)}"
         )
-    problems = storage_problems(rows)
+    print(f"[runner] adjuntos antiguos para esos campos: {legacy}")
+
+    problems = storage_problems(columns, sizes, legacy)
     if problems:
         raise SystemExit(
             "[runner] ABORTA: el material fiscal no está dentro de PostgreSQL:\n  - "
@@ -278,7 +309,6 @@ def run_preflight(env, environ):
     check_tls(env)
     check_module_installed(env)
     check_installed_sha(env, environ)
-    check_attachment_storage(env)
     check_auto_request_is_off(env)
 
     found = certificates(env)

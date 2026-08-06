@@ -137,7 +137,6 @@ class TestPreflightGuardsEveryMode(unittest.TestCase):
             "check_tls",
             "check_module_installed",
             "check_installed_sha",
-            "check_attachment_storage",
             "check_auto_request_is_off",
             "check_environment",
             "check_material_present",
@@ -151,7 +150,6 @@ class TestPreflightGuardsEveryMode(unittest.TestCase):
             "check_tls",
             "check_module_installed",
             "check_installed_sha",
-            "check_attachment_storage",
             "check_auto_request_is_off",
             "check_environment",
             "check_material_present",
@@ -300,18 +298,56 @@ class TestNoParseErrorCanSurfaceTheCache(unittest.TestCase):
 
 
 class TestTheStorageVerdict(unittest.TestCase):
-    def test_material_in_the_database_has_no_problems(self):
-        rows = [("certificate", True, False, 1200), ("private_key", True, False, 1700)]
-        self.assertEqual(runner.storage_problems(rows), [])
+    """Columns now, not attachments.
 
-    def test_material_on_disk_is_a_problem(self):
-        rows = [("certificate", True, True, 1200), ("private_key", True, False, 1700)]
-        self.assertTrue(
-            any("store_fname" in p for p in runner.storage_problems(rows))
-        )
+    The runner used to demand `ir_attachment.location == db` and read
+    `db_datas`. Since 19.0.3.0.0 both fields are columns of
+    `l10n_ar_arca_certificate`, the parameter is no longer set by the bootstrap,
+    and a runner still demanding it would abort every session against a
+    correctly prepared database.
+    """
+
+    COLUMNS = {"certificate", "private_key"}
+    SIZES = {"certificate": 1200, "private_key": 1700}
+
+    def test_material_in_its_columns_has_no_problems(self):
+        self.assertEqual(runner.storage_problems(self.COLUMNS, self.SIZES, 0), [])
+
+    def test_a_missing_column_is_a_problem(self):
+        problems = runner.storage_problems({"certificate"}, self.SIZES, 0)
+        self.assertTrue(any("private_key" in problem for problem in problems))
 
     def test_missing_material_is_a_problem(self):
-        self.assertEqual(len(runner.storage_problems([])), 2)
+        self.assertEqual(len(runner.storage_problems(set(), {}, 0)), 2)
+
+    def test_an_empty_column_is_a_problem(self):
+        sizes = {"certificate": None, "private_key": 1700}
+        problems = runner.storage_problems(self.COLUMNS, sizes, 0)
+        self.assertTrue(any("vacío" in problem for problem in problems))
+
+    def test_a_leftover_attachment_is_a_problem(self):
+        problems = runner.storage_problems(self.COLUMNS, self.SIZES, 2)
+        self.assertTrue(any("adjunto" in problem for problem in problems))
+
+    def test_the_storage_parameter_is_no_longer_demanded(self):
+        """It is not set any more, so demanding it would abort every run.
+
+        Asserted on what the module defines rather than on its text: the
+        docstring of `storage_problems` names the parameter on purpose, to say
+        why it went.
+        """
+        self.assertFalse(hasattr(runner, "STORAGE_PARAMETER"))
+        self.assertFalse(hasattr(runner, "STORAGE_IN_DATABASE"))
+        self.assertFalse(hasattr(runner, "check_attachment_storage"))
+
+    def test_and_the_preflight_no_longer_calls_it(self):
+        source = ast.get_source_segment(RUNNER_TEXT, function_node("run_preflight"))
+        self.assertNotIn("check_attachment_storage", source)
+
+    def test_but_the_preflight_still_checks_where_the_material_is(self):
+        """Removing the demand must not remove the verification."""
+        source = ast.get_source_segment(RUNNER_TEXT, function_node("run_preflight"))
+        self.assertIn("check_material_storage", source)
 
 
 class TestTheWorkflowCannotDestroyATicket(unittest.TestCase):

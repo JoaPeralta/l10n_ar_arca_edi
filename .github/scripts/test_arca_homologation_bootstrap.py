@@ -117,40 +117,67 @@ class TestMaterialIsOnlyRequiredWhenAbsent(unittest.TestCase):
 
 
 class TestTheStorageVerdict(unittest.TestCase):
-    """A filestore a runner throws away must never look acceptable."""
+    """Both values in their columns, and nothing left claiming them elsewhere.
 
-    def good_rows(self):
-        return [("certificate", True, False, 1200), ("private_key", True, False, 1700)]
+    This class used to be about ``ir_attachment.db_datas`` and ``store_fname``,
+    because both fields were ``attachment=True`` -- stored through
+    ``ir.attachment``, with the content's location decided by
+    ``ir_attachment.location`` -- and the bootstrap pinned that parameter to
+    ``db`` so the bytes would be inside PostgreSQL rather than in a filestore
+    the runner throws away. Since 19.0.3.0.0 they are columns of
+    ``l10n_ar_arca_certificate``, so ``ir.attachment`` is not in the picture at
+    all and the questions changed: does the column exist, does it hold bytes,
+    and is there an old attachment still claiming the field.
+    """
 
-    def test_material_in_the_database_has_no_problems(self):
-        self.assertEqual(bootstrap.storage_problems(self.good_rows()), [])
+    COLUMNS = {"certificate", "private_key"}
 
-    def test_a_missing_attachment_is_a_problem(self):
-        rows = [("certificate", True, False, 1200)]
-        self.assertTrue(
-            any("private_key" in problem for problem in bootstrap.storage_problems(rows))
+    def good_sizes(self):
+        return {"certificate": 1200, "private_key": 1700}
+
+    def verdict(self, columns=None, sizes=None, legacy=0):
+        return bootstrap.storage_problems(
+            self.COLUMNS if columns is None else columns,
+            self.good_sizes() if sizes is None else sizes,
+            legacy,
         )
 
-    def test_no_rows_at_all_is_a_problem(self):
-        self.assertEqual(len(bootstrap.storage_problems([])), 2)
+    def test_material_in_its_columns_has_no_problems(self):
+        self.assertEqual(self.verdict(), [])
 
-    def test_material_still_on_disk_is_a_problem(self):
-        rows = [("certificate", True, True, 1200), ("private_key", True, False, 1700)]
-        self.assertTrue(
-            any("store_fname" in problem for problem in bootstrap.storage_problems(rows))
-        )
+    def test_a_missing_column_is_a_problem(self):
+        problems = self.verdict(columns={"certificate"})
+        self.assertTrue(any("private_key" in problem for problem in problems))
+        self.assertTrue(any("columna" in problem for problem in problems))
 
-    def test_material_without_db_datas_is_a_problem(self):
-        rows = [("certificate", False, False, 0), ("private_key", True, False, 1700)]
-        self.assertTrue(
-            any("db_datas" in problem for problem in bootstrap.storage_problems(rows))
-        )
+    def test_no_columns_at_all_is_two_problems(self):
+        """What a database still on the previous version looks like."""
+        self.assertEqual(len(self.verdict(columns=set(), sizes={})), 2)
 
-    def test_empty_db_datas_is_a_problem(self):
-        rows = [("certificate", True, False, 0), ("private_key", True, False, 1700)]
-        self.assertTrue(
-            any("vacío" in problem for problem in bootstrap.storage_problems(rows))
-        )
+    def test_a_null_column_is_a_problem(self):
+        problems = self.verdict(sizes={"certificate": None, "private_key": 1700})
+        self.assertTrue(any("vacío" in problem for problem in problems))
+
+    def test_a_zero_byte_column_is_a_problem(self):
+        problems = self.verdict(sizes={"certificate": 0, "private_key": 1700})
+        self.assertTrue(any("cero bytes" in problem for problem in problems))
+
+    def test_a_leftover_attachment_is_a_problem(self):
+        """The material may be sitting where the module no longer reads it."""
+        self.assertTrue(any("adjunto" in problem for problem in self.verdict(legacy=1)))
+
+    def test_and_the_count_is_reported_rather_than_the_contents(self):
+        problems = self.verdict(legacy=3)
+        self.assertTrue(any("3" in problem for problem in problems))
+        for problem in problems:
+            for forbidden in ("db_datas", "store_fname", "BEGIN"):
+                self.assertNotIn(forbidden, problem)
+
+    def test_the_old_attachment_vocabulary_is_gone(self):
+        """A message about `db_datas` would now describe nothing that exists."""
+        for problem in self.verdict(columns=set(), sizes={}, legacy=2):
+            for stale in ("db_datas", "store_fname", "filestore"):
+                self.assertNotIn(stale, problem)
 
 
 class TestTheRecordedSha(unittest.TestCase):
@@ -342,12 +369,14 @@ class TestItAbortsInsteadOfCorrecting(unittest.TestCase):
 
 
 class TestTheOrderThatMakesItCorrect(unittest.TestCase):
-    """Storage before material, and the SHA only after everything succeeded."""
+    """Columns before material, and the SHA only after everything succeeded."""
 
-    def test_storage_is_pinned_before_material_is_loaded(self):
+    def test_the_columns_are_checked_before_material_is_loaded(self):
+        """A database on the previous version has none, and must be refused
+        before anything is written into fields the code does not read."""
         order = calls_in("main")
         self.assertLess(
-            order.index("pin_attachment_storage"), order.index("load_material")
+            order.index("check_material_columns"), order.index("load_material")
         )
 
     def test_the_sha_is_recorded_after_storage_is_verified(self):
@@ -356,7 +385,7 @@ class TestTheOrderThatMakesItCorrect(unittest.TestCase):
 
     STEPS = (
         "check_module_installed",
-        "pin_attachment_storage",
+        "check_material_columns",
         "disable_auto_request",
         "target_company",
         "find_or_create_certificate",

@@ -106,8 +106,30 @@ class L10nArArcaCertificate(models.Model):
     # The private key is the one secret that must never leave the server. The
     # field group keeps it out of every ordinary read, export and RPC call; the
     # signing path reaches it deliberately through sudo.
+    #
+    # `attachment=False` puts the bytes in the model's own column instead of in
+    # `ir.attachment`.
+    #
+    # What that buys is independence from configuration. An attachment-backed
+    # binary is stored through `ir.attachment`, and where its *content* ends up
+    # is decided by `ir_attachment.location`: the default is `file`, the
+    # filestore on disk, and with `db` it can sit in `ir_attachment.db_datas`
+    # inside PostgreSQL. So such a field may need a coordinated restore of
+    # PostgreSQL and the filestore, or may be entirely inside PostgreSQL --
+    # depending on a global setting this module does not own and should not
+    # depend on. A key restored without its bytes produces a certificate that
+    # looks present and cannot sign.
+    #
+    # A column gives the stronger, stable guarantee: this pair is in
+    # PostgreSQL, in the row it authenticates, under the same transaction and
+    # the same backup contract as that row, whatever `ir.attachment` is set to.
+    #
+    # `copy=False` because `copy()` on an attachment-backed field duplicates the
+    # attachment: one key, two records, and no way to tell afterwards which of
+    # them ARCA issued the certificate for.
     private_key = fields.Binary(
-        attachment=True,
+        attachment=False,
+        copy=False,
         groups="base.group_system",
         help="RSA private key in PEM format.",
     )
@@ -125,8 +147,23 @@ class L10nArArcaCertificate(models.Model):
     )
     csr_filename = fields.Char(readonly=True)
 
+    # Public material, and stored beside the key for the same reason the key is:
+    # WSAA needs both halves to build a signature, so a restore that brings one
+    # back and not the other cannot authenticate either. Leaving this one behind
+    # `ir.attachment` would have put the two halves under different backup
+    # contracts -- one guaranteed by the row, one depending on how attachments
+    # happen to be configured -- which is the worse of the two failures, because
+    # it looks recoverable.
+    #
+    # No `groups`: a certificate is what ARCA hands back and what a counterparty
+    # can read. It is not a secret and pretending otherwise teaches the wrong
+    # thing about the key next to it.
+    #
+    # `copy=False` all the same: a duplicate that carries the certificate but
+    # not the key would claim an identity it cannot sign for.
     certificate = fields.Binary(
-        attachment=True,
+        attachment=False,
+        copy=False,
         help="Certificate issued by ARCA, in PEM format.",
     )
     certificate_filename = fields.Char()
@@ -303,8 +340,31 @@ class L10nArArcaCertificate(models.Model):
                     self.name,
                 )
             )
-        if self.state not in ("draft", "csr_generated"):
-            raise UserError(_("A CSR can only be generated on a draft certificate."))
+        # Draft only, and `csr_generated` is the case this is really about.
+        #
+        # A second ordinary call used to be allowed there, and it overwrote the
+        # private key in place. Anyone who had already uploaded that CSR to the
+        # ARCA portal -- which is the entire point of generating one -- would
+        # receive a certificate for a key this record no longer holds, and would
+        # find out at the first authentication, with an error that names none of
+        # this. Losing the key is not recoverable: ARCA issues the certificate
+        # against the CSR's public key and nothing regenerates the private half.
+        #
+        # So the refusal happens here, before the key pair is generated and
+        # before any write. Nothing about the record moves: not the key, not the
+        # CSR, not the filenames, not the state.
+        if self.state != "draft":
+            raise UserError(
+                _(
+                    "A CSR was already generated for certificate '%s'. Generating "
+                    "another would replace the private key, and the certificate "
+                    "ARCA issues for the CSR you already uploaded would be "
+                    "unusable.\n\n"
+                    "If that CSR is not the one you want, create a new "
+                    "certificate record.",
+                    self.name,
+                )
+            )
 
         key = rsa.generate_private_key(public_exponent=65537, key_size=RSA_KEY_SIZE)
         private_key_pem = key.private_bytes(

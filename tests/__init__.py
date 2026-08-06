@@ -8,6 +8,7 @@ from . import (
     test_concurrency,
     test_numbering,
     test_payload,
+    test_private_key_storage,
     test_qr,
     test_representation,
     test_scope,
