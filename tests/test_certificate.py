@@ -8,12 +8,34 @@ is validated on the way in and unreachable on the way out.
 
 import base64
 import datetime
+import re
+
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import NameOID
 
 from odoo.exceptions import AccessError, UserError, ValidationError
 from odoo.tests import tagged
 
-from ..models.l10n_ar_arca_certificate import compute_cuit_check_digit, is_valid_cuit
+from ..models.l10n_ar_arca_certificate import (
+    RSA_KEY_SIZE,
+    compute_cuit_check_digit,
+    is_valid_cuit,
+)
 from .common import TEST_HOLDER_CUIT, ArcaTestCommon
+
+# A CUIT with a correct verification digit, used only by the CSR format tests.
+# Synthetic test-only value. It is not the real certificate holder CUIT selected
+# for VIARENGO and must never be replaced with production data.
+CSR_HOLDER_CUIT = "20-12345678-6"
+CSR_HOLDER_DIGITS = "20123456786"
+
+# What ARCA accepts in the X.509 serialNumber: the four letters, one space, and
+# eleven digits with nothing between them.
+ARCA_SERIAL_NUMBER = re.compile(r"^CUIT [0-9]{11}$")
+
+CERTIFICATE_LOGGER = "odoo.addons.l10n_ar_arca_edi.models.l10n_ar_arca_certificate"
 
 
 @tagged("post_install", "-at_install")
@@ -72,14 +94,25 @@ class TestCertificateUpload(ArcaTestCommon):
         self.assertIn("BEGIN CERTIFICATE REQUEST", certificate.csr_pem)
 
     def test_csr_carries_the_cuit_as_serial_number(self):
-        from cryptography import x509
-        from cryptography.x509.oid import NameOID
+        """In ARCA's format, which is not the human-readable one.
 
+        This assertion used to read ``f"CUIT {certificate._format_holder_cuit()}"``,
+        which made the test agree with the code instead of with ARCA: whatever
+        the helper produced was declared correct by definition.
+
+        So the expectation is derived here, from the value the fixture stored,
+        rather than asked of any helper in the model. Swapping one production
+        helper for another would have kept the same circularity.
+        """
         certificate = self._draft_certificate()
         certificate.action_generate_key_and_csr()
         csr = x509.load_pem_x509_csr(certificate.csr_pem.encode())
         serial = csr.subject.get_attributes_for_oid(NameOID.SERIAL_NUMBER)[0].value
-        self.assertEqual(serial, f"CUIT {certificate._format_holder_cuit()}")
+        expected_digits = "".join(
+            character for character in certificate.holder_cuit if character.isdigit()
+        )
+        self.assertEqual(serial, f"CUIT {expected_digits}")
+        self.assertRegex(serial, ARCA_SERIAL_NUMBER)
 
     def test_certificate_for_a_different_key_is_refused(self):
         """The most common upload mistake, caught before it becomes a auth error."""
@@ -257,3 +290,154 @@ class TestPrivateKeyProtection(ArcaTestCommon):
         signed = wsaa._sign_tra(self.certificate.with_user(user), "<tra/>")
         self.assertTrue(signed)
         self.assertIsInstance(base64.b64decode(signed), bytes)
+
+
+@tagged("post_install", "-at_install")
+class TestCsrSerialNumberFormat(ArcaTestCommon):
+    """The one field in the CSR that ARCA parses rather than displays.
+
+    ARCA requires the X.509 ``serialNumber`` to be ``CUIT`` + one space + the
+    eleven digits, with no separators. The hyphenated form reads better to a
+    person and is rejected by the portal, so nothing here compares the CSR
+    against a helper in this module: every assertion is against the shape ARCA
+    documents, written out.
+
+    A real CSR is generated and parsed back with ``cryptography``. No
+    certificate is requested, no key is kept, and nothing reaches ARCA.
+    """
+
+    def _csr_for(self, cuit=CSR_HOLDER_CUIT):
+        certificate = self.env["l10n_ar.arca.certificate"].create(
+            {
+                "name": f"CSR format {self.env.cr.dbname[:4]}",
+                "company_id": self.company_ri.id,
+                "holder_cuit": cuit,
+                "environment": "testing",
+            }
+        )
+        certificate.action_generate_key_and_csr()
+        return certificate, x509.load_pem_x509_csr(certificate.csr_pem.encode())
+
+    def _serial_of(self, csr):
+        attributes = csr.subject.get_attributes_for_oid(NameOID.SERIAL_NUMBER)
+        self.assertEqual(len(attributes), 1, "the CSR must carry one serialNumber")
+        return attributes[0].value
+
+    def _generate_logging(self, name):
+        certificate = self.env["l10n_ar.arca.certificate"].create(
+            {
+                "name": f"{name} {self.env.cr.dbname[:4]}",
+                "company_id": self.company_ri.id,
+                "holder_cuit": CSR_HOLDER_CUIT,
+                "environment": "testing",
+            }
+        )
+        with self.assertLogs(CERTIFICATE_LOGGER, level="INFO") as captured:
+            certificate.action_generate_key_and_csr()
+        return certificate, "\n".join(captured.output)
+
+    # -- the format itself ---------------------------------------------
+    def test_the_serial_number_is_the_cuit_without_separators(self):
+        _certificate, csr = self._csr_for()
+        self.assertEqual(self._serial_of(csr), f"CUIT {CSR_HOLDER_DIGITS}")
+
+    def test_and_matches_the_shape_arca_requires(self):
+        _certificate, csr = self._csr_for()
+        self.assertRegex(self._serial_of(csr), ARCA_SERIAL_NUMBER)
+
+    def test_and_carries_no_hyphens(self):
+        """The whole defect, stated on its own so a failure names itself."""
+        serial = self._serial_of(self._csr_for()[1])
+        self.assertNotIn("-", serial)
+        self.assertNotIn(" ", serial[5:], "no separator of any kind after the space")
+
+    def test_a_hyphenated_holder_cuit_is_normalised(self):
+        """The stored value keeps its hyphens. The CSR does not."""
+        certificate, csr = self._csr_for()
+        self.assertIn("-", certificate.holder_cuit)
+        self.assertNotIn("-", self._serial_of(csr))
+
+    # -- which identity it carries -------------------------------------
+    def test_it_is_the_holder_and_not_the_issuer(self):
+        """Two CUITs exist here. The certificate belongs to the holder."""
+        certificate, csr = self._csr_for()
+        issuer = "".join(ch for ch in (certificate.issuer_cuit or "") if ch.isdigit())
+        self.assertTrue(issuer, "the fixture company has no CUIT to tell apart")
+        self.assertNotEqual(
+            issuer,
+            CSR_HOLDER_DIGITS,
+            "the fixture must keep holder and issuer different or this proves nothing",
+        )
+        serial = self._serial_of(csr)
+        self.assertEqual(serial, f"CUIT {CSR_HOLDER_DIGITS}")
+        self.assertNotIn(issuer, serial)
+
+    # -- what the change must not have altered -------------------------
+    def test_the_csr_is_still_rsa_2048(self):
+        _certificate, csr = self._csr_for()
+        public_key = csr.public_key()
+        self.assertIsInstance(public_key, rsa.RSAPublicKey)
+        self.assertEqual(public_key.key_size, RSA_KEY_SIZE)
+        self.assertEqual(public_key.key_size, 2048)
+
+    def test_and_still_signed_with_sha256(self):
+        _certificate, csr = self._csr_for()
+        self.assertIsInstance(csr.signature_hash_algorithm, hashes.SHA256)
+        self.assertTrue(csr.is_signature_valid)
+
+    # -- privacy --------------------------------------------------------
+    def test_the_holder_cuit_never_reaches_the_log(self):
+        """Generating a CSR is routine. A CUIT in the log is permanent."""
+        _certificate, logged = self._generate_logging("CSR log")
+        for secret in (CSR_HOLDER_DIGITS, CSR_HOLDER_CUIT, "12345678"):
+            self.assertNotIn(secret, logged, f"the log names {secret}")
+
+    def test_but_still_says_enough_to_diagnose(self):
+        certificate, logged = self._generate_logging("CSR diag")
+        self.assertIn(str(RSA_KEY_SIZE), logged)
+        self.assertIn(str(certificate.id), logged)
+        self.assertIn(certificate.environment, logged)
+
+    def test_and_no_key_material_is_ever_logged(self):
+        _certificate, logged = self._generate_logging("CSR key")
+        for marker in ("BEGIN PRIVATE KEY", "BEGIN RSA", "BEGIN CERTIFICATE REQUEST"):
+            self.assertNotIn(marker, logged, marker)
+
+    # -- the positive control -------------------------------------------
+    def test_the_hyphenated_form_would_fail_every_assertion_above(self):
+        """Proof that the assertions can fail.
+
+        Builds the serialNumber the way the code used to build it and shows the
+        equality, the regex and the no-hyphen check all reject it. A format test
+        that cannot reject the wrong format is decoration.
+        """
+        certificate, _csr = self._csr_for()
+        old_form = f"CUIT {certificate._format_holder_cuit()}"
+
+        self.assertEqual(old_form, "CUIT 20-12345678-6")
+        self.assertNotEqual(old_form, f"CUIT {CSR_HOLDER_DIGITS}")
+        self.assertNotRegex(old_form, ARCA_SERIAL_NUMBER)
+        self.assertIn("-", old_form)
+
+        # And a CSR really carrying it is rejected by the same assertion the
+        # tests above apply, so those are checking the parsed CSR rather than a
+        # constant that happens to match.
+        key = rsa.generate_private_key(public_exponent=65537, key_size=RSA_KEY_SIZE)
+        old_csr = (
+            x509.CertificateSigningRequestBuilder()
+            .subject_name(
+                x509.Name(
+                    [
+                        x509.NameAttribute(NameOID.COUNTRY_NAME, "AR"),
+                        x509.NameAttribute(NameOID.SERIAL_NUMBER, old_form),
+                    ]
+                )
+            )
+            .sign(key, hashes.SHA256())
+        )
+        self.assertNotRegex(self._serial_of(old_csr), ARCA_SERIAL_NUMBER)
+
+    def test_the_human_readable_helper_is_still_available(self):
+        """It was not deleted: it is the right thing for a screen."""
+        certificate, _csr = self._csr_for()
+        self.assertEqual(certificate._format_holder_cuit(), CSR_HOLDER_CUIT)
