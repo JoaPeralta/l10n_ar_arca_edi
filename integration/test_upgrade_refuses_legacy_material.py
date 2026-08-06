@@ -123,6 +123,13 @@ class UpgradeCase(unittest.TestCase):
             cls._pretend_to_be_the_previous_version()
             if cls.WITH_LEGACY_MATERIAL:
                 cls._insert_legacy_attachments()
+            # Captured before the upgrade, because afterwards case A has its
+            # columns back and the question cannot be asked any more.
+            cls.before = {
+                "columns": cls._columns(),
+                "attachments": cls._attachment_count(),
+                "version": cls._recorded_version(),
+            }
             cls.upgrade = cls._upgrade()
         except Exception:
             cls._drop()
@@ -265,29 +272,44 @@ class UpgradeCase(unittest.TestCase):
     # Shared observations
     # ------------------------------------------------------------------
 
-    def existing_columns(self):
-        found = self.psql(
+    @classmethod
+    def _columns(cls):
+        found = cls._psql(
+            cls.database,
             "SELECT column_name FROM information_schema.columns "
             f"WHERE table_name = '{TABLE}' "
             "AND column_name IN ('private_key', 'certificate') "
-            "ORDER BY column_name"
+            "ORDER BY column_name",
         )
         return sorted(line for line in found.splitlines() if line)
 
-    def legacy_attachment_count(self):
+    @classmethod
+    def _attachment_count(cls):
         return int(
-            self.psql(
+            cls._psql(
+                cls.database,
                 "SELECT count(*) FROM ir_attachment "
                 f"WHERE res_model = '{MODEL}' "
-                "AND res_field IN ('private_key', 'certificate')"
+                "AND res_field IN ('private_key', 'certificate')",
             )
         )
 
-    def recorded_version(self):
-        return self.psql(
+    @classmethod
+    def _recorded_version(cls):
+        return cls._psql(
+            cls.database,
             "SELECT latest_version FROM ir_module_module "
-            "WHERE name = 'l10n_ar_arca_edi'"
+            "WHERE name = 'l10n_ar_arca_edi'",
         )
+
+    def existing_columns(self):
+        return self._columns()
+
+    def legacy_attachment_count(self):
+        return self._attachment_count()
+
+    def recorded_version(self):
+        return self._recorded_version()
 
     def output(self):
         return self.upgrade.stdout + self.upgrade.stderr
@@ -299,9 +321,19 @@ class TestUpgradeWithNothingToLose(UpgradeCase):
 
     WITH_LEGACY_MATERIAL = False
 
-    def test_the_setup_really_removed_the_columns(self):
-        """Otherwise the upgrade below proves nothing about creating them."""
-        self.assertEqual(self.legacy_attachment_count(), 0)
+    def test_the_setup_really_produced_the_previous_shape(self):
+        """A positive control, measured before the upgrade ran.
+
+        With the columns already present the upgrade would prove nothing about
+        creating them, and with the version already current the migration would
+        never have been invoked at all.
+        """
+        self.assertEqual(self.before["columns"], [])
+        self.assertEqual(self.before["version"], PREVIOUS_VERSION)
+
+    def test_and_there_was_nothing_in_attachments(self):
+        """The one thing that separates this case from the other."""
+        self.assertEqual(self.before["attachments"], 0)
 
     def test_the_upgrade_succeeded(self):
         self.assertEqual(
@@ -332,9 +364,14 @@ class TestUpgradeWithMaterialInAttachments(UpgradeCase):
 
     WITH_LEGACY_MATERIAL = True
 
-    def test_the_setup_really_created_the_legacy_rows(self):
+    def test_the_setup_really_produced_the_previous_shape(self):
+        """Measured before the upgrade, and identical to case A but for one row."""
+        self.assertEqual(self.before["columns"], [])
+        self.assertEqual(self.before["version"], PREVIOUS_VERSION)
+
+    def test_and_the_legacy_rows_were_really_there(self):
         """A positive control: with none of these the refusal proves nothing."""
-        self.assertEqual(self.legacy_attachment_count(), len(FIELDS))
+        self.assertEqual(self.before["attachments"], len(FIELDS))
 
     def test_the_upgrade_was_refused(self):
         self.assertNotEqual(

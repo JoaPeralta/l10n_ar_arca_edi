@@ -12,9 +12,11 @@ So this runs real ``odoo shell`` processes against one disposable database.
 Process A generates the key and CSR through the production action and exits.
 Process B starts with an empty cache and a new cursor and must load the same
 key out of PostgreSQL, verify it is RSA-2048, verify the CSR carries its public
-half, and sign a synthetic payload with it. Process C attempts a second
-generation and must be refused without changing a byte. Process D duplicates
-the record and must get neither half.
+half, and sign a synthetic payload with it. Processes C and D attempt a
+second generation -- one against a record still at ``csr_generated``, one
+against a record already ``active`` -- and both must be refused, with different
+messages and without a byte moving. Process E duplicates the record and must
+get neither half.
 
 The certificate is checked alongside the key throughout, because WSAA builds a
 signature from both and a restore that carries one and not the other fails just
@@ -120,8 +122,10 @@ class TestPrivateKeySurvivesTheProcess(unittest.TestCase):
             cls._install()
             cls.generated = cls._run_child("generate")
             cls.certificate_id = cls.generated["certificate_id"]
+            cls.csr_certificate_id = cls.generated["csr_certificate_id"]
             cls.reloaded = cls._run_child("reload")
             cls.refused = cls._run_child("refuse")
+            cls.refused_active = cls._run_child("refuse_active")
             cls.duplicated = cls._run_child("duplicate")
         except Exception:
             cls._drop()
@@ -150,6 +154,9 @@ class TestPrivateKeySurvivesTheProcess(unittest.TestCase):
         certificate_id = getattr(cls, "certificate_id", None)
         if certificate_id:
             environment["ARCA_TEST_CERT_ID"] = str(certificate_id)
+        csr_certificate_id = getattr(cls, "csr_certificate_id", None)
+        if csr_certificate_id:
+            environment["ARCA_TEST_CSR_ID"] = str(csr_certificate_id)
         environment.update(extra or {})
         return environment
 
@@ -268,9 +275,27 @@ class TestPrivateKeySurvivesTheProcess(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def test_the_first_process_generated_a_key_and_a_csr(self):
-        self.assertEqual(self.generated["state"], "csr_generated")
         self.assertTrue(self.generated["key_digest"])
         self.assertTrue(self.generated["csr_digest"])
+
+    def test_and_seeded_a_second_record_left_at_csr_generated(self):
+        """The state whose second generation this proof is about.
+
+        The activated record cannot answer that question: once a certificate is
+        uploaded the guard refuses it for a different and equally true reason.
+        """
+        self.assertEqual(self.generated["csr_certificate_state"], "csr_generated")
+        self.assertNotEqual(
+            self.generated["csr_certificate_id"], self.generated["certificate_id"]
+        )
+        self.assertTrue(self.generated["csr_certificate_key_digest"])
+
+    def test_and_the_two_records_hold_different_keys(self):
+        """Each generation is its own key pair; sharing one would be the bug."""
+        self.assertNotEqual(
+            self.generated["csr_certificate_key_digest"],
+            self.generated["key_digest"],
+        )
 
     def test_and_committed_it_where_another_connection_can_see_it(self):
         """The column, read on a connection of its own. This is the change."""
@@ -412,31 +437,29 @@ class TestPrivateKeySurvivesTheProcess(unittest.TestCase):
         self.assertEqual(
             self.refused["key_digest_after"], self.refused["key_digest_before"]
         )
-        # And still the key the first process generated, two processes ago.
+        # And still the key the first process generated, several processes ago.
         self.assertEqual(
-            self.refused["key_digest_after"], self.generated["key_digest"]
+            self.refused["key_digest_after"],
+            self.generated["csr_certificate_key_digest"],
         )
 
     def test_and_so_is_the_csr(self):
         self.assertEqual(
             self.refused["csr_digest_after"], self.refused["csr_digest_before"]
         )
-        self.assertEqual(
-            self.refused["csr_digest_after"], self.generated["csr_digest"]
-        )
 
     def test_the_column_on_an_independent_connection_did_not_move_either(self):
         self.assertEqual(
             self.refused["column_digest_on_another_connection"],
-            self.generated["key_digest"],
+            self.generated["csr_certificate_key_digest"],
         )
 
     def test_the_filenames_are_unchanged(self):
         self.assertEqual(
-            self.refused["key_filename_after"], self.generated["key_filename"]
+            self.refused["key_filename_after"], self.refused["key_filename_before"]
         )
         self.assertEqual(
-            self.refused["csr_filename_after"], self.generated["csr_filename"]
+            self.refused["csr_filename_after"], self.refused["csr_filename_before"]
         )
 
     def test_the_state_is_unchanged(self):
@@ -449,6 +472,30 @@ class TestPrivateKeySurvivesTheProcess(unittest.TestCase):
 
     def test_and_no_attachment_appeared(self):
         self.assertEqual(self.refused["attachments_after"], "0")
+
+    # ------------------------------------------------------------------
+    # The other refusal: a record that is already active
+    # ------------------------------------------------------------------
+
+    def test_an_active_certificate_is_also_refused(self):
+        self.assertEqual(self.refused_active["active_state_before"], "active")
+        self.assertEqual(self.refused_active["active_refused"], "True")
+
+    def test_with_its_own_message_about_what_arca_issued(self):
+        """Two mistakes, two sentences. One branch cannot cover for the other."""
+        self.assertEqual(
+            self.refused_active["active_refusal_mentions_would_make"], "True"
+        )
+
+    def test_and_that_key_did_not_move_either(self):
+        self.assertEqual(self.refused_active["active_key_unchanged"], "True")
+        self.assertEqual(
+            self.refused_active["active_key_digest_after"],
+            self.generated["key_digest"],
+        )
+
+    def test_and_the_record_is_still_active(self):
+        self.assertEqual(self.refused_active["active_state_after"], "active")
 
     # ------------------------------------------------------------------
     # Process D: the copy
@@ -496,6 +543,7 @@ class TestPrivateKeySurvivesTheProcess(unittest.TestCase):
             ("generate", self.generated),
             ("reload", self.reloaded),
             ("refuse", self.refused),
+            ("refuse_active", self.refused_active),
             ("duplicate", self.duplicated),
         ):
             output = result["_stdout"] + result["_stderr"]
@@ -507,6 +555,7 @@ class TestPrivateKeySurvivesTheProcess(unittest.TestCase):
             ("generate", self.generated),
             ("reload", self.reloaded),
             ("refuse", self.refused),
+            ("refuse_active", self.refused_active),
             ("duplicate", self.duplicated),
         ):
             self.assertEqual(result.get("network"), "forbidden", role)

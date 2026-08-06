@@ -325,8 +325,11 @@ class TheKeyLandsInTheColumn(PrivateKeyCommon):
         )
 
     def test_and_an_invoicing_user_can_sign_without_reading_it(self):
-        certificate = self._generated("Signing as user")
-        user = self._invoicing_user()
+        # `_activated`, not `_generated`: `_sign_tra` reads the key *and* the
+        # certificate, so a record that only has a CSR raises before it ever
+        # reaches the question this test is asking.
+        certificate = self._activated("Signing as user")
+        user = self._invoicing_user("signer")
         wsaa = self.env["l10n_ar.arca.wsaa"].with_user(user)
         signed = wsaa._sign_tra(certificate.with_user(user), "<tra/>")
         self.assertTrue(signed)

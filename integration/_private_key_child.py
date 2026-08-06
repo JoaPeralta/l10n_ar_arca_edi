@@ -77,7 +77,20 @@ def certificates(env):
 
 
 def record(env):
+    """The activated record: key, CSR and certificate."""
     return certificates(env).browse(int(os.environ["ARCA_TEST_CERT_ID"]))
+
+
+def csr_record(env):
+    """The record left at `csr_generated`, for the second-generation refusal.
+
+    It has to be a different record from the activated one. Once a certificate
+    is uploaded the state is `active`, and `action_generate_key_and_csr` refuses
+    that with its own message about invalidating what ARCA issued -- a true
+    message about a different mistake, which would leave the refusal this proof
+    is about untested.
+    """
+    return certificates(env).browse(int(os.environ["ARCA_TEST_CSR_ID"]))
 
 
 def load_key(certificate):
@@ -171,17 +184,30 @@ def attachment_count(env, certificate_id, field):
 # ---------------------------------------------------------------------------
 
 
-def role_generate(env):
-    """Generate a key and CSR through the production path, and commit."""
+def new_certificate(env, name):
     company = env["res.company"].sudo().search([], order="id", limit=1)
-    certificate = certificates(env).create(
+    return certificates(env).create(
         {
-            "name": "cross-process private key",
+            "name": name,
             "company_id": company.id,
             "holder_cuit": HOLDER_CUIT,
             "environment": "testing",
         }
     )
+
+
+def role_generate(env):
+    """Seed both states the later processes need, and commit.
+
+    Two records, because the two questions need different states. The activated
+    one carries key, CSR and certificate, and is what `_sign_tra` and the copy
+    are asked about. The other stops at `csr_generated`, which is the state
+    whose second generation this whole proof is about.
+    """
+    pending = new_certificate(env, "cross-process csr only")
+    pending.action_generate_key_and_csr()
+
+    certificate = new_certificate(env, "cross-process private key")
     certificate.action_generate_key_and_csr()
     # The certificate half, self-signed over the key this record just made, so
     # `action_process_certificate` accepts it. Local crypto only: nothing is
@@ -192,6 +218,9 @@ def role_generate(env):
     env.cr.commit()
 
     emit("certificate_id", certificate.id)
+    emit("csr_certificate_id", pending.id)
+    emit("csr_certificate_state", pending.state)
+    emit("csr_certificate_key_digest", digest(pending.private_key))
     emit("state", certificate.state)
     emit("key_digest", digest(certificate.private_key))
     emit("cert_digest", digest(certificate.certificate))
@@ -272,7 +301,7 @@ def role_refuse(env):
     """A second generation, in a process that did not perform the first."""
     from odoo.exceptions import UserError
 
-    certificate = record(env)
+    certificate = csr_record(env)
     # Named for what they hold, not for what they are about: `before["key"]`
     # would be a digest and would read like the key itself, and the structural
     # test that keeps key material off stdout cannot tell those apart.
@@ -287,6 +316,9 @@ def role_refuse(env):
     }
     emit("key_digest_before", before["key_digest"])
     emit("csr_digest_before", before["csr_digest"])
+    emit("key_filename_before", before["key_filename"])
+    emit("csr_filename_before", before["csr_filename"])
+    emit("state_before", before["state"])
     emit("records_before", before["records"])
 
     try:
@@ -313,6 +345,33 @@ def role_refuse(env):
         "column_digest_on_another_connection",
         column_on_an_independent_connection(env, certificate.id),
     )
+
+
+def role_refuse_active(env):
+    """The other refusal: a record ARCA already issued a certificate for.
+
+    A different mistake and a different message. Asserted so that removing one
+    branch of the guard cannot hide behind the other still working.
+    """
+    from odoo.exceptions import UserError
+
+    certificate = record(env)
+    before = digest(certificate.private_key)
+    emit("active_state_before", certificate.state)
+
+    try:
+        certificate.action_generate_key_and_csr()
+    except UserError as error:
+        emit("active_refused", True)
+        emit("active_refusal_mentions_would_make", "would make" in str(error))
+    else:
+        emit("active_refused", False)
+        emit("active_refusal_mentions_would_make", False)
+
+    certificate.invalidate_recordset()
+    emit("active_key_digest_after", digest(certificate.private_key))
+    emit("active_key_unchanged", digest(certificate.private_key) == before)
+    emit("active_state_after", certificate.state)
 
 
 def role_duplicate(env):
@@ -346,6 +405,7 @@ ROLES = {
     "generate": role_generate,
     "reload": role_reload,
     "refuse": role_refuse,
+    "refuse_active": role_refuse_active,
     "duplicate": role_duplicate,
 }
 

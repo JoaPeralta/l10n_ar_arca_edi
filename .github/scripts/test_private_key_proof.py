@@ -79,7 +79,33 @@ class TestItReallyUsesSeparateProcesses(unittest.TestCase):
             and node.args
             and isinstance(node.args[0], ast.Constant)
         }
-        self.assertEqual(roles, {"generate", "reload", "refuse", "duplicate"})
+        self.assertEqual(
+            roles,
+            {"generate", "reload", "refuse", "refuse_active", "duplicate"},
+        )
+
+    def test_every_role_the_child_defines_is_actually_run(self):
+        """A role nobody spawns is a proof nobody performs."""
+        declared = {
+            key.value
+            for node in ast.walk(CHILD_TREE)
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "ROLES"
+                for target in node.targets
+            )
+            for key in node.value.keys
+        }
+        spawned = {
+            node.args[0].value
+            for node in ast.walk(DRIVER_TREE)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "_run_child"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+        }
+        self.assertEqual(declared, spawned)
 
     def test_the_generating_process_commits(self):
         """Without a commit the next process would find nothing, for a reason
@@ -99,6 +125,41 @@ class TestItReallyUsesSeparateProcesses(unittest.TestCase):
         )
         self.assertIn("env.registry.cursor()", source)
         self.assertIn("private_key", source)
+
+
+class TestTheTwoSidesAgree(unittest.TestCase):
+    """The driver reads markers by name. A typo is a KeyError in CI, at best.
+
+    Worse than a typo: a marker the child stopped emitting makes the assertion
+    that used it disappear into an error nobody reads as "the proof lost a
+    step". Both directions are checked here, where it costs nothing.
+    """
+
+    def emitted(self):
+        return {
+            node.args[0].value
+            for node in ast.walk(CHILD_TREE)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "emit"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+        }
+
+    def read(self):
+        results = "|".join(
+            ("generated", "reloaded", "refused", "refused_active", "duplicated")
+        )
+        return set(re.findall(rf'self\.(?:{results})\["(\w+)"\]', DRIVER_TEXT))
+
+    def test_the_scan_found_both_sides(self):
+        self.assertGreater(len(self.emitted()), 20)
+        self.assertGreater(len(self.read()), 20)
+
+    def test_every_marker_the_driver_reads_is_one_the_child_emits(self):
+        # Set by the driver itself on the result dict, not by the child.
+        internal = {"_stdout", "_stderr", "_returncode"}
+        self.assertEqual(self.read() - self.emitted() - internal, set())
 
 
 class TestOdooNeverDiscoversIt(unittest.TestCase):
