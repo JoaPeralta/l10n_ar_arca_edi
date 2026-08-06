@@ -108,7 +108,13 @@ def markers(output):
 
 @unittest.skipIf(SKIP_REASON is not None, SKIP_REASON or "")
 class TestPrivateKeySurvivesTheProcess(unittest.TestCase):
-    """Four processes, one database, one key."""
+    """Five processes, one database, two key pairs.
+
+    Two pairs because the two questions need different states. The activated
+    record -- key, CSR and certificate -- answers persistence, `_sign_tra` and
+    the copy. The one left at `csr_generated` answers the second generation,
+    which is the state that refusal is actually about.
+    """
 
     @classmethod
     def setUpClass(cls):
@@ -271,7 +277,7 @@ class TestPrivateKeySurvivesTheProcess(unittest.TestCase):
         self.assertEqual(state, "installed")
 
     # ------------------------------------------------------------------
-    # Process A: generation
+    # Process 1 (seed): both records generated and committed
     # ------------------------------------------------------------------
 
     def test_the_first_process_generated_a_key_and_a_csr(self):
@@ -376,7 +382,7 @@ class TestPrivateKeySurvivesTheProcess(unittest.TestCase):
         self.assertEqual(total, "t")
 
     # ------------------------------------------------------------------
-    # Process B: a new process, a new cursor, the same key
+    # Process 2 (reload): a new process, a new cursor, the same material
     # ------------------------------------------------------------------
 
     def test_a_later_process_loads_the_same_key(self):
@@ -424,7 +430,7 @@ class TestPrivateKeySurvivesTheProcess(unittest.TestCase):
         self.assertEqual(int(self.reloaded["sign_tra_digest_length"]), 64)
 
     # ------------------------------------------------------------------
-    # Process C: the second generation
+    # Process 3 (refuse): a second generation on the `csr_generated` record
     # ------------------------------------------------------------------
 
     def test_a_second_generation_is_refused(self):
@@ -474,7 +480,7 @@ class TestPrivateKeySurvivesTheProcess(unittest.TestCase):
         self.assertEqual(self.refused["attachments_after"], "0")
 
     # ------------------------------------------------------------------
-    # The other refusal: a record that is already active
+    # Process 4 (refuse_active): the other refusal, on the `active` record
     # ------------------------------------------------------------------
 
     def test_an_active_certificate_is_also_refused(self):
@@ -498,7 +504,7 @@ class TestPrivateKeySurvivesTheProcess(unittest.TestCase):
         self.assertEqual(self.refused_active["active_state_after"], "active")
 
     # ------------------------------------------------------------------
-    # Process D: the copy
+    # Process 5 (duplicate): the copy
     # ------------------------------------------------------------------
 
     def test_a_duplicate_gets_no_key(self):

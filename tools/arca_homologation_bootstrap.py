@@ -490,10 +490,14 @@ def verify_storage(env, certificate):
 
     problems = storage_problems(columns, sizes, legacy)
     if problems:
+        # Only what was actually measured. The previous version of this message
+        # ended "un filestore descartable pierde la clave, y con ella el
+        # ticket", which belonged to the attachment contract and conflated two
+        # separate things: where the material is stored, and whether the WSAA
+        # ticket survives. Nothing checked here says anything about the ticket.
         raise SystemExit(
             "[bootstrap] ABORTA: el material fiscal no quedó dentro de la fila:\n  - "
             + "\n  - ".join(problems)
-            + "\nUn filestore descartable pierde la clave, y con ella el ticket."
         )
     print("[bootstrap] Material fiscal verificado dentro de PostgreSQL")
 

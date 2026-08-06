@@ -17,7 +17,9 @@ then reproduces that shape in SQL -- drop the two columns, set
 attachment rows -- and then runs ``odoo -u l10n_ar_arca_edi``.
 
 That is precise, it needs no second checkout, and it makes the two cases differ
-in exactly one thing: whether any attachment exists.
+in exactly one thing: the presence of historical material. Case B inserts two
+synthetic ``ir.attachment`` rows, one per field; case A inserts none. Nothing
+else about the two databases differs.
 
 Case A -- nothing to lose
     No attachment rows. The upgrade succeeds, and the columns are created.
@@ -365,7 +367,13 @@ class TestUpgradeWithMaterialInAttachments(UpgradeCase):
     WITH_LEGACY_MATERIAL = True
 
     def test_the_setup_really_produced_the_previous_shape(self):
-        """Measured before the upgrade, and identical to case A but for one row."""
+        """Measured before the upgrade.
+
+        Identical to case A but for the presence of historical material: two
+        synthetic `ir.attachment` rows, one per field. Everything else about
+        the two databases is the same, which is what makes the difference in
+        outcome attributable to those rows and nothing else.
+        """
         self.assertEqual(self.before["columns"], [])
         self.assertEqual(self.before["version"], PREVIOUS_VERSION)
 

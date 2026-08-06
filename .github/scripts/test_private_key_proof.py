@@ -127,12 +127,22 @@ class TestItReallyUsesSeparateProcesses(unittest.TestCase):
         self.assertIn("private_key", source)
 
 
-class TestTheTwoSidesAgree(unittest.TestCase):
-    """The driver reads markers by name. A typo is a KeyError in CI, at best.
+class TestTheDriverReadsNothingTheChildDoesNotSend(unittest.TestCase):
+    """Every marker the driver reads by name must be one the child emits.
 
-    Worse than a typo: a marker the child stopped emitting makes the assertion
-    that used it disappear into an error nobody reads as "the proof lost a
-    step". Both directions are checked here, where it costs nothing.
+    The driver reads markers by name out of a dict. A name the child never
+    sends is a KeyError at run time, which reads like a broken harness rather
+    than like a proof that quietly lost a step -- and that is exactly how the
+    `refuse` role came to be aimed at the wrong record without anything going
+    red. This check costs nothing without Odoo and would have caught it.
+
+    One direction only, and named for it. The reverse -- every emitted marker
+    being read somewhere -- is a different and weaker property: some markers
+    are protocol (`role`, `done`, `network`) and some are read through `.get`
+    or kept for the log rather than asserted, so demanding set equality would
+    force an allowlist that has to be maintained and would fail for reasons
+    that are not defects. It is deliberately not checked here, and this class
+    does not claim to.
     """
 
     def emitted(self):
@@ -152,7 +162,8 @@ class TestTheTwoSidesAgree(unittest.TestCase):
         )
         return set(re.findall(rf'self\.(?:{results})\["(\w+)"\]', DRIVER_TEXT))
 
-    def test_the_scan_found_both_sides(self):
+    def test_the_scan_found_markers_on_both_files(self):
+        """A positive control. Two empty sets would satisfy the check below."""
         self.assertGreater(len(self.emitted()), 20)
         self.assertGreater(len(self.read()), 20)
 

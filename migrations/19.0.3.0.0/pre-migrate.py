@@ -59,7 +59,18 @@ def must_refuse(count):
 
 
 def refusal(count):
-    """The message an operator gets. It names a number and no material."""
+    """The message an operator gets. It names a number and no material.
+
+    What it must not say is what the previous version said: "move it by hand to
+    the new columns". This aborts in the ``pre`` stage, so at the moment anyone
+    reads it those columns do not exist yet -- the instruction is not executable
+    when it is given, which is the worst kind of instruction to give someone
+    holding a key they cannot regenerate.
+
+    So the steps are the ones that are safe from where the operator is standing:
+    stop, back everything up, change nothing, and prepare a migration reviewed
+    against that specific database before retiring anything.
+    """
     return (
         f"l10n_ar_arca_edi 19.0.3.0.0 no puede actualizar esta base.\n\n"
         f"Hay {count} adjunto(s) de ir.attachment que todavía guardan "
@@ -69,10 +80,18 @@ def refusal(count):
         f"sin poder firmar.\n\n"
         f"La actualización se detuvo antes de tocar el esquema. La base sigue "
         f"en la versión anterior y no quedó a medias.\n\n"
-        f"Qué hacer: alguien que sepa de qué clave se trata tiene que moverla a "
-        f"mano a las columnas nuevas, o confirmar que ese material ya no sirve y "
-        f"retirarlo. Este script no lee, no copia y no borra material fiscal a "
-        f"propósito."
+        f"Qué hacer, en este orden:\n"
+        f"  1. Dejar la actualización detenida. No reintentarla hasta el final.\n"
+        f"  2. Tomar un backup completo y verificado: PostgreSQL y filestore, "
+        f"los dos, del mismo momento.\n"
+        f"  3. No borrar, mover ni editar los adjuntos históricos. Son el "
+        f"material.\n"
+        f"  4. Preparar una migración específica revisada contra esta base, o "
+        f"una exportación e importación controladas del material.\n"
+        f"  5. Verificar la recuperación -- que la clave y el certificado "
+        f"quedaron legibles y que forman pareja -- antes de retirar el "
+        f"almacenamiento anterior.\n\n"
+        f"Este script no lee, no copia y no borra material fiscal, a propósito."
     )
 
 

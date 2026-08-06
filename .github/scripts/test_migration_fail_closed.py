@@ -143,16 +143,34 @@ class TestItOnlyCounts(unittest.TestCase):
             with self.subTest(column=column):
                 self.assertNotIn(column, migration.COUNT_LEGACY_ATTACHMENTS)
 
-    def test_no_code_in_the_file_reads_the_material(self):
-        """Code only: the docstring names these to say it never touches them."""
+    def test_nothing_in_the_file_reaches_for_the_material(self):
+        """Identifiers and SQL, not prose.
+
+        Text alone cannot answer this. The docstring names ``db_datas`` to say
+        it never touches it, and the refusal message names the filestore to
+        tell an operator to back it up -- both correct, both indistinguishable
+        from a read if you only grep. So this looks at what the code *names*:
+        every identifier it resolves, plus the one query it runs.
+        """
+        identifiers = set()
+        for node in ast.walk(MIGRATION_TREE):
+            if isinstance(node, ast.Name):
+                identifiers.add(node.id)
+            elif isinstance(node, ast.Attribute):
+                identifiers.add(node.attr)
         for forbidden in ("db_datas", "store_fname", "_file_read", "filestore"):
             with self.subTest(forbidden=forbidden):
-                self.assertNotIn(forbidden, EXECUTABLE)
+                self.assertNotIn(forbidden, identifiers)
+                self.assertNotIn(forbidden, migration.COUNT_LEGACY_ATTACHMENTS)
 
-    def test_and_the_scan_is_not_looking_at_an_empty_string(self):
-        """A positive control: stripping docstrings must leave the code."""
+    def test_and_the_scan_found_the_identifiers_it_was_looking_through(self):
+        """A positive control: an empty set would pass the loop above."""
+        identifiers = {
+            node.id for node in ast.walk(MIGRATION_TREE) if isinstance(node, ast.Name)
+        }
+        self.assertIn("cr", identifiers)
+        self.assertIn("count", identifiers)
         self.assertIn("COUNT(*)", EXECUTABLE)
-        self.assertIn("def migrate", EXECUTABLE)
 
     def test_it_writes_nothing(self):
         for statement in ("DELETE", "UPDATE", "INSERT", "ALTER", "DROP", "unlink"):
@@ -192,8 +210,33 @@ class TestTheMessageSaysNothingSecret(unittest.TestCase):
         self.assertIn("antes de tocar el esquema", message)
         self.assertIn("no qued", message)
 
-    def test_it_says_what_to_do(self):
-        self.assertIn("a mano", migration.refusal(1))
+    def test_it_says_what_to_do_and_every_step_is_doable_right_then(self):
+        """The columns do not exist yet when this is read.
+
+        An earlier version told the operator to "move it by hand to the new
+        columns". This aborts in the `pre` stage, so at that moment there are no
+        new columns -- the instruction could not be followed by the person
+        holding a key they cannot regenerate. These steps can all be taken from
+        where that person is standing.
+        """
+        message = migration.refusal(1)
+        for step in ("backup", "PostgreSQL y filestore", "No borrar", "Verificar"):
+            with self.subTest(step=step):
+                self.assertIn(step, message)
+
+    def test_and_it_no_longer_tells_anyone_to_use_columns_that_do_not_exist(self):
+        message = migration.refusal(1)
+        self.assertNotIn("a mano a las columnas", message)
+        self.assertNotIn("moverla a mano", message)
+
+    def test_it_tells_them_to_stop_rather_than_retry(self):
+        self.assertIn("detenida", migration.refusal(1))
+
+    def test_and_never_to_delete_the_old_material(self):
+        """It is the material. Deleting it is the unrecoverable move."""
+        message = migration.refusal(1)
+        self.assertIn("No borrar", message)
+        self.assertIn("Son el material", message)
 
     def test_it_never_names_material(self):
         message = migration.refusal(5)
