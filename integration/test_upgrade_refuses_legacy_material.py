@@ -62,9 +62,14 @@ PREVIOUS_VERSION = "19.0.2.0.0"
 # What the module upgrades *to*, read from the manifest rather than frozen.
 # It was a literal `19.0.3.0.0` and broke on the first patch release: the
 # assertion is "the module is recorded at the version it declares", not "at
-# 19.0.3.0.0 forever". The migration directory stays at 19.0.3.0.0 -- Odoo runs
-# every migration between the installed version and the target, so a later
-# patch still runs it.
+# 19.0.3.0.0 forever".
+#
+# The migration and its historical starting point stay fixed. This proof
+# reproduces an install at 19.0.2.0.0 and upgrades to the version declared
+# by the manifest, so Odoo runs 19.0.3.0.0 because that migration lies
+# strictly above the installed version and at or below the target.
+# A database already installed at 19.0.3.0.0 does not run that migration
+# again when upgrading only to 19.0.3.0.1.
 NEW_VERSION = ast.literal_eval(
     (REPO_ROOT / "__manifest__.py").read_text(encoding="utf-8")
 )["version"]
