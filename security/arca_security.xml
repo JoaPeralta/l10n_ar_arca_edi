@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo noupdate="1">
+
+    <!--
+        Multi-company isolation. Certificates carry the private key that signs
+        fiscal documents in a company's name, so a user working in one company
+        must not even see another company's certificate: two companies sharing
+        a database must never be able to sign for each other.
+    -->
+    <record id="l10n_ar_arca_certificate_company_rule" model="ir.rule">
+        <field name="name">ARCA certificate: multi-company</field>
+        <field name="model_id" ref="model_l10n_ar_arca_certificate"/>
+        <field name="global" eval="True"/>
+        <field name="domain_force">[('company_id', 'in', company_ids)]</field>
+    </record>
+
+    <record id="l10n_ar_arca_attempt_company_rule" model="ir.rule">
+        <field name="name">ARCA attempt: multi-company</field>
+        <field name="model_id" ref="model_l10n_ar_arca_attempt"/>
+        <field name="global" eval="True"/>
+        <field name="domain_force">[('company_id', 'in', company_ids)]</field>
+    </record>
+
+</odoo>

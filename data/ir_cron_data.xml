@@ -8,7 +8,37 @@
         <field name="code">model._cron_check_certificate_expiration()</field>
         <field name="interval_number">1</field>
         <field name="interval_type">days</field>
-        <field name="active">True</field>
+        <field name="active" eval="True"/>
+    </record>
+
+    <!--
+        Closes attempts whose answer never arrived. Without it an invoice could
+        sit in an unknown fiscal state until somebody noticed, which is exactly
+        the situation that leads to issuing the same voucher twice.
+    -->
+    <record id="ir_cron_reconcile_arca_attempts" model="ir.cron">
+        <field name="name">ARCA: Reconcile Unresolved Authorizations</field>
+        <field name="model_id" ref="model_l10n_ar_arca_attempt"/>
+        <field name="state">code</field>
+        <field name="code">model._cron_reconcile_open_attempts()</field>
+        <field name="interval_number">15</field>
+        <field name="interval_type">minutes</field>
+        <field name="active" eval="True"/>
+    </record>
+
+    <!--
+        Picks up invoices that were posted but never authorized, for instance
+        because ARCA was unreachable at the time. Inactive by default so that
+        authorizing invoices unattended stays an explicit decision.
+    -->
+    <record id="ir_cron_authorize_pending_invoices" model="ir.cron">
+        <field name="name">ARCA: Authorize Pending Invoices</field>
+        <field name="model_id" ref="account.model_account_move"/>
+        <field name="state">code</field>
+        <field name="code">model._cron_l10n_ar_arca_authorize_pending()</field>
+        <field name="interval_number">30</field>
+        <field name="interval_type">minutes</field>
+        <field name="active" eval="False"/>
     </record>
 
 </odoo>

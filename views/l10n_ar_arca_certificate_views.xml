@@ -9,7 +9,8 @@
             <list>
                 <field name="name"/>
                 <field name="company_id" groups="base.group_multi_company"/>
-                <field name="cuit"/>
+                <field name="holder_cuit"/>
+                <field name="issuer_cuit"/>
                 <field name="environment" widget="badge"
                     decoration-info="environment == 'testing'"
                     decoration-success="environment == 'production'"/>
@@ -66,7 +67,8 @@
                         <group string="Configuration">
                             <field name="company_id" groups="base.group_multi_company"
                                 readonly="state != 'draft'"/>
-                            <field name="cuit" readonly="state != 'draft'"/>
+                            <field name="holder_cuit" readonly="state != 'draft'"/>
+                            <field name="issuer_cuit" readonly="1"/>
                             <field name="environment" readonly="state != 'draft'"/>
                         </group>
                         <group string="Certificate Info" invisible="state not in ('active', 'expired')">
@@ -80,13 +82,14 @@
                     <notebook>
                         <page string="Files" name="files">
                             <group>
+                                <!--
+                                    The private key is shown as a fact, not as a
+                                    file: it never needs to leave the server, so
+                                    offering it as a download would only create a
+                                    way for it to.
+                                -->
                                 <group string="Private Key">
-                                    <field name="private_key" filename="private_key_filename"/>
-                                    <field name="private_key_filename" invisible="1"/>
-                                </group>
-                                <group string="CSR">
-                                    <field name="csr" filename="csr_filename"/>
-                                    <field name="csr_filename" invisible="1"/>
+                                    <field name="private_key_stored" readonly="1"/>
                                 </group>
                             </group>
                             <group string="CSR Content (copy to ARCA portal)"

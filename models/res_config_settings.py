@@ -1,7 +1,7 @@
 # Copyright 2026 Leonobitech
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
 
-from odoo import api, fields, models, _
+from odoo import _, api, fields, models
 from odoo.exceptions import UserError
 
 
@@ -11,6 +11,10 @@ class ResConfigSettings(models.TransientModel):
     # Certificate selector (stored on company)
     l10n_ar_arca_certificate_id = fields.Many2one(
         related="company_id.l10n_ar_arca_certificate_id",
+        readonly=False,
+    )
+    l10n_ar_arca_auto_request_cae = fields.Boolean(
+        related="company_id.l10n_ar_arca_auto_request_cae",
         readonly=False,
     )
 
@@ -24,10 +28,17 @@ class ResConfigSettings(models.TransientModel):
         readonly=False,
     )
 
-    # Company CUIT (auto-filled from selected company)
+    # The taxpayer invoices are issued under, taken from the company. Named for
+    # what it is: a bare "CUIT" here would sit next to the certificate's holder
+    # CUIT and invite exactly the confusion the two fields exist to prevent.
     l10n_ar_arca_company_cuit = fields.Char(
-        string="CUIT",
+        string="Issuer CUIT",
         compute="_compute_arca_company_cuit",
+        help=(
+            "CUIT reported to ARCA as the issuer of the invoices, taken from the "
+            "company. The certificate may be held by someone else, authorized in "
+            "WSASS to act for it."
+        ),
     )
 
     # Computed fields from selected certificate (readonly display)

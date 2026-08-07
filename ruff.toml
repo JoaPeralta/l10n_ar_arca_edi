@@ -1,0 +1,41 @@
+# Lint configuration for an Odoo addon.
+line-length = 100
+# Odoo 19 still supports 3.10, so 3.11-only spellings stay out.
+target-version = "py310"
+
+exclude = [
+    ".git",
+    "static",
+]
+
+[lint]
+select = [
+    "F",   # pyflakes
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "I",   # import sorting
+    "UP",  # pyupgrade
+    "B",   # bugbear
+    "C4",  # comprehensions
+]
+ignore = [
+    # Odoo injects `_` for translations; shadowing warnings are noise here.
+    "B008",
+    # Odoo models legitimately define many attributes at class level.
+    "E501",
+]
+
+[lint.per-file-ignores]
+# Odoo discovers models by importing them here; the imports are the point.
+"__init__.py" = ["F401"]
+# Manifests are data, not modules.
+"__manifest__.py" = ["B018"]
+# Tests import cryptography inside test bodies on purpose, to keep the
+# expensive imports out of collection.
+"tests/*" = ["E402"]
+
+[lint.isort]
+known-first-party = ["odoo"]
+
+[format]
+quote-style = "double"

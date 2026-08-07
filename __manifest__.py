@@ -2,7 +2,7 @@
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
 {
     "name": "Argentina - ARCA Electronic Invoicing",
-    "version": "19.0.1.0.0",
+    "version": "19.0.3.0.1",
     "category": "Accounting/Localizations",
     "summary": "Electronic invoicing integration with ARCA (ex-AFIP) for Argentina",
     "development_status": "Beta",
@@ -10,33 +10,32 @@
 Argentina ARCA Electronic Invoicing
 ====================================
 
-This module integrates Odoo with ARCA (Agencia de Recaudación y Control Aduanero)
-web services for electronic invoicing in Argentina.
+Requests the CAE for Argentine sales invoices through ARCA's WSFEv1 web
+service, using the fiscal data l10n_ar already computes.
 
-Features:
----------
-* Generate CSR (Certificate Signing Request) from Odoo
-* Manage digital certificates for ARCA authentication
-* WSAA: Authentication and authorization via CMS (Cryptographic Message Syntax)
-* WSFEv1: Electronic invoice authorization (CAE)
-* Support for both testing (homologación) and production environments
+Scope
+-----
+Authorized through WSFEv1 (mercado interno):
 
-Requirements:
--------------
-* OpenSSL (via pyOpenSSL / cryptography)
-* zeep (SOAP client)
-* lxml
+* Facturas A, B, C and M
+* Notas de Débito A, B, C and M
+* Notas de Crédito A, B, C and M
+* Recibos A, B, C and M
 
-Supported document types:
--------------------------
-* Facturas A, B, C, E
-* Notas de Crédito
-* Notas de Débito
+Explicitly out of scope, and refused with an explanatory message rather than
+sent and rejected by ARCA:
 
-ARCA Web Services:
-------------------
-* WSAA - Web Service de Autenticación y Autorización
-* WSFEv1 - Web Service de Factura Electrónica v1
+* Facturas E (export) -- authorized by WSFEX, a different web service
+* Facturas de Crédito MiPyME (FCE) -- require the Opcionales group
+* CAEA contingency authorization
+
+See ROADMAP.rst for the full list.
+
+Web services used
+-----------------
+* WSAA - authentication (per-service access tickets)
+* WSFEv1 - FECAESolicitar, FECompUltimoAutorizado, FECompConsultar,
+  FEParamGetPtosVenta, FEParamGetCondicionIvaReceptor, FEDummy
     """,
     "author": "Leonobitech, Odoo Community Association (OCA)",
     "website": "https://github.com/leonobitech/l10n_ar_arca_edi",
@@ -45,7 +44,6 @@ ARCA Web Services:
     "countries": ["ar"],
     "depends": [
         "l10n_ar",
-        "account_edi",
     ],
     "external_dependencies": {
         "python": [
@@ -56,6 +54,7 @@ ARCA Web Services:
     },
     "data": [
         "security/ir.model.access.csv",
+        "security/arca_security.xml",
         "data/paperformat.xml",
         "wizards/l10n_ar_arca_certificate_wizard_views.xml",
         "views/l10n_ar_arca_certificate_views.xml",
