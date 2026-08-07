@@ -331,6 +331,30 @@ class L10nArArcaCertificate(models.Model):
     def action_generate_key_and_csr(self):
         """Generate an RSA key pair and the CSR to submit to ARCA."""
         self.ensure_one()
+
+        # Audit finding H-05. This method is public and ends in
+        # `self.sudo().write(...)`, so without this line the write the ACLs
+        # would have refused is performed by a superuser cursor and succeeds:
+        # an invoicing user with read=1, write=0 on this model could call the
+        # button and have the server generate a key, replace the CSR and move
+        # the state.
+        #
+        # `check_access` rather than `has_group`, because the authorisation to
+        # follow is the model's own -- its ACLs and its record rules -- and not
+        # a second list of groups maintained inside this method, which would
+        # drift from the first one and would ignore any rule restricting which
+        # records a user may write.
+        #
+        # On `self`, never on `self.sudo()`: a superuser passes every check, so
+        # asking after elevating asks nothing.
+        #
+        # Before the state guards, and not only before the write. After them,
+        # the method answers a question it was never authorised to answer --
+        # whether a CSR exists, whether ARCA has issued a certificate -- to a
+        # caller who may not use it at all. Before them, the answer is
+        # `AccessError` in every state.
+        self.check_access("write")
+
         if self.state == "active":
             raise UserError(
                 _(
