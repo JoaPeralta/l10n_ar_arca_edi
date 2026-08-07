@@ -5,15 +5,15 @@ on:
     branches: ["**"]
   pull_request:
   workflow_dispatch:
-    inputs:
-      run_emission:
-        description: >-
-          Also issue a real voucher in homologación. This consumes a number at
-          the configured point of sale and cannot be undone. Leave off to run
-          only the read-only checks.
-        type: boolean
-        default: false
 
+# Every job here is offline and disposable, so a run superseded by the next push
+# is simply cancelled.
+#
+# This used to be more complicated: the group carried the event name and
+# cancelling was conditional, because a manual run could already be holding an
+# ARCA access ticket that cancelling would destroy. No job in this workflow can
+# reach ARCA any more -- that lives in arca-homologation.yml, which runs against
+# a database that keeps its ticket -- so the complication went with it.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -35,12 +35,24 @@ jobs:
           python-version: "3.12"
 
       - name: Install tooling
-        run: pip install --quiet ruff==0.6.9
+        run: pip install --quiet ruff==0.6.9 PyYAML==6.0.2
 
       # Correctness only. Enforcing a formatter upstream does not use would
       # bury real changes under a reformat of the whole module.
       - name: Ruff
         run: ruff check .
+
+      # Structural tests over the workflows and the operational tools: that no
+      # job here can reach ARCA, that the homologación runner stays read-only,
+      # and that the bootstrap never destroys what costs a ticket. All offline:
+      # no token, no network, no ARCA.
+      - name: Workflow and tooling tests
+        run: |
+          python -m unittest discover \
+            --start-directory .github/scripts \
+            --top-level-directory .github/scripts \
+            --pattern 'test_*.py' \
+            --verbose
 
       - name: Manifest is valid Python and declares what it needs
         run: |
@@ -172,7 +184,7 @@ jobs:
             --addons-path=/usr/lib/python3/dist-packages/odoo/addons,${GITHUB_WORKSPACE}/extra-addons \
             -i l10n_ar_arca_edi \
             --test-enable \
-            --test-tags '/l10n_ar_arca_edi,-arca_homologation,-arca_homologation_emission' \
+            --test-tags '/l10n_ar_arca_edi' \
             --without-demo=all \
             --log-level=info \
             --max-cron-threads=0 \
@@ -206,103 +218,72 @@ jobs:
           fi
           echo "$total tests passed"
 
+      # The guarantees the suite above cannot make. Under `current_test` nothing
+      # is committed: fiscal_transaction takes its single-cursor branch and
+      # checkpoint() degrades to flush(), so an ORM test proving "the value is
+      # still there" proves only that it is there in the transaction that wrote
+      # it. That was always true of the access ticket, and it is now equally
+      # true of the private key, which lives in a column of its own.
+      #
+      # This spawns real `odoo shell` processes against a database of its own.
+      # For the ticket: one process obtains it and exits, the next must find it
+      # in PostgreSQL. For the key: one process generates it and exits, the next
+      # must load it out of the column, sign with it, and be refused a second
+      # generation without a byte of the first one moving.
+      #
+      # Still offline -- _authenticate is replaced and zeep.Client is made
+      # unbuildable in every child, and no key material is ever printed.
+      - name: Ticket and private key survive their process
+        working-directory: extra-addons/l10n_ar_arca_edi
+        env:
+          PGHOST: db
+          PGPORT: "5432"
+          PGUSER: odoo
+          PGPASSWORD: odoo
+        run: |
+          set -o pipefail
+          # Exported here rather than declared in `env:` because this job runs in
+          # a container: `github.workspace` is the path on the *host*, while
+          # GITHUB_WORKSPACE inside the container is where the checkout actually
+          # is. Only the shell variable is right on this side of the mount.
+          export ARCA_TEST_ADDONS_PATH="/usr/lib/python3/dist-packages/odoo/addons,${GITHUB_WORKSPACE}/extra-addons"
+          python3 -m unittest discover \
+            --start-directory integration \
+            --top-level-directory integration \
+            --pattern 'test_*.py' \
+            --verbose 2>&1 | tee cross-process.log
+
+      # A skip here would mean a proof silently did not run. Both are checked:
+      # `skipIf` on a missing `odoo` or PostgreSQL is exactly how they would
+      # disappear without failing anything.
+      - name: The cross-process proofs actually ran
+        run: |
+          set -euo pipefail
+          log=extra-addons/l10n_ar_arca_edi/cross-process.log
+          if grep -q "skipped" "$log"; then
+            echo "::error::A cross-process proof was skipped."
+            grep -i "skip" "$log" || true
+            exit 1
+          fi
+          # Named individually: discovery finding only some of the files would
+          # leave the run green with part of the evidence.
+          for proof in TestTicketSurvivesTheProcess \
+                       TestPrivateKeySurvivesTheProcess \
+                       TestUpgradeWithNothingToLose \
+                       TestUpgradeWithMaterialInAttachments; do
+            if ! grep -q "${proof}" "$log"; then
+              echo "::error::${proof} did not run."
+              exit 1
+            fi
+            echo "${proof} ran."
+          done
+
       - name: Upload the log
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: odoo-test-log
-          path: odoo-test.log
+          path: |
+            odoo-test.log
+            extra-addons/l10n_ar_arca_edi/cross-process.log
           if-no-files-found: ignore
-
-  homologation:
-    name: ARCA homologación (real)
-    runs-on: ubuntu-latest
-    # Never automatic: this talks to ARCA, and it needs a certificate that
-    # cannot live in the repository.
-    if: github.event_name == 'workflow_dispatch'
-    container:
-      image: odoo:19.0-20260723
-      options: --user root
-    defaults:
-      run:
-        shell: bash
-    services:
-      db:
-        image: postgres:16
-        env:
-          POSTGRES_USER: odoo
-          POSTGRES_PASSWORD: odoo
-          POSTGRES_DB: postgres
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 10
-
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          path: extra-addons/l10n_ar_arca_edi
-
-      - name: Skip cleanly when no certificate is configured
-        id: creds
-        env:
-          # Only the holder CUIT is read here, and only to test for presence:
-          # nothing is echoed, so no secret can reach the log.
-          HOLDER: ${{ secrets.ARCA_HOMO_CERT_HOLDER_CUIT }}
-          REPRESENTED: ${{ secrets.ARCA_HOMO_REPRESENTED_CUIT }}
-        run: |
-          if [ -z "${HOLDER}" ] || [ -z "${REPRESENTED}" ]; then
-            echo "available=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::No homologación certificate configured; nothing was sent to ARCA."
-          else
-            echo "available=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Read-only checks against ARCA homologación
-        if: steps.creds.outputs.available == 'true'
-        env:
-          ARCA_HOMO_CERT_HOLDER_CUIT: ${{ secrets.ARCA_HOMO_CERT_HOLDER_CUIT }}
-          ARCA_HOMO_REPRESENTED_CUIT: ${{ secrets.ARCA_HOMO_REPRESENTED_CUIT }}
-          ARCA_HOMO_CERT: ${{ secrets.ARCA_HOMO_CERT }}
-          ARCA_HOMO_PRIVATE_KEY: ${{ secrets.ARCA_HOMO_PRIVATE_KEY }}
-          ARCA_HOMO_POS: ${{ secrets.ARCA_HOMO_POS }}
-        run: |
-          odoo \
-            --db_host=db --db_user=odoo --db_password=odoo \
-            -d homo_l10n_ar_arca_edi \
-            --addons-path=/usr/lib/python3/dist-packages/odoo/addons,${GITHUB_WORKSPACE}/extra-addons \
-            -i l10n_ar_arca_edi \
-            --test-enable \
-            --test-tags 'arca_homologation' \
-            --without-demo=all \
-            --log-level=info \
-            --max-cron-threads=0 \
-            --stop-after-init
-
-      - name: Issue a real voucher in homologación
-        # Two gates on purpose: the run has to ask for it, and the suite itself
-        # still requires the opt-in variable. A voucher number cannot be
-        # un-consumed, so neither gate is implied by having the credentials.
-        if: >-
-          steps.creds.outputs.available == 'true' &&
-          inputs.run_emission
-        env:
-          ARCA_HOMO_CERT_HOLDER_CUIT: ${{ secrets.ARCA_HOMO_CERT_HOLDER_CUIT }}
-          ARCA_HOMO_REPRESENTED_CUIT: ${{ secrets.ARCA_HOMO_REPRESENTED_CUIT }}
-          ARCA_HOMO_CERT: ${{ secrets.ARCA_HOMO_CERT }}
-          ARCA_HOMO_PRIVATE_KEY: ${{ secrets.ARCA_HOMO_PRIVATE_KEY }}
-          ARCA_HOMO_POS: ${{ secrets.ARCA_HOMO_POS }}
-          ARCA_HOMO_ALLOW_EMISSION: "1"
-        run: |
-          odoo \
-            --db_host=db --db_user=odoo --db_password=odoo \
-            -d homo_emission_l10n_ar_arca_edi \
-            --addons-path=/usr/lib/python3/dist-packages/odoo/addons,${GITHUB_WORKSPACE}/extra-addons \
-            -i l10n_ar_arca_edi \
-            --test-enable \
-            --test-tags 'arca_homologation_emission' \
-            --without-demo=all \
-            --log-level=info \
-            --max-cron-threads=0 \
-            --stop-after-init

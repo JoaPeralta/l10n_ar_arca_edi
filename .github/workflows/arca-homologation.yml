@@ -1,0 +1,154 @@
+name: ARCA homologación (base persistente)
+
+# Manual only. There is no push or schedule trigger, and there is no default
+# mode: someone has to ask for a specific inspection.
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: >-
+          What to inspect. Both modes are read-only and neither reaches ARCA.
+          preflight asserts the database is in the state the bootstrap should
+          have left it in; ticket-status adds the cached access ticket, reported
+          by expiry only.
+        type: choice
+        options:
+          - preflight
+          - ticket-status
+        default: preflight
+
+# Repository-wide and branch-independent, and deliberately the same group the
+# older homologación job uses: ARCA's limit follows the certificate and service,
+# not the ref, so every path that could reach it has to queue behind the same
+# lock.
+#
+# cancel-in-progress is false because cancelling does not undo anything ARCA has
+# already done -- it only guarantees the next run is refused.
+concurrency:
+  group: arca-homologation-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  inspect:
+    name: Inspect the persistent homologación database
+    runs-on: ubuntu-latest
+
+    # Protected environment: the connection secrets live here, and dispatching
+    # goes through whatever reviewers it requires.
+    environment: arca-homologation
+
+    # A physical bound. This job only reads a database; if it is still running
+    # after twenty minutes something is wrong and waiting does not fix it.
+    timeout-minutes: 20
+
+    permissions:
+      contents: read
+
+    container:
+      image: odoo:19.0-20260723
+      options: --user root
+
+    defaults:
+      run:
+        shell: bash
+
+    # No `services:` block on purpose. A service container is a database that
+    # dies with the job, which is exactly the failure this whole design exists
+    # to remove: the access ticket it holds would be destroyed while ARCA still
+    # considered it valid.
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: extra-addons/l10n_ar_arca_edi
+
+      # Metadata only. No connection variable is echoed -- not even the database
+      # name, which arrives as a secret: printing a secret reference gains
+      # nothing and the masking that would hide it is not a reason to try.
+      - name: Report what is about to run
+        run: |
+          echo "repository : ${GITHUB_REPOSITORY}"
+          echo "ref        : ${GITHUB_REF}"
+          echo "sha        : ${GITHUB_SHA}"
+          echo "mode       : ${{ inputs.mode }}"
+          echo "environment: testing (asserted by the runner)"
+
+      - name: Refuse to start without connection details
+        env:
+          PGHOST: ${{ secrets.ARCA_HOMO_PGHOST }}
+          PGDATABASE: ${{ secrets.ARCA_HOMO_PGDATABASE }}
+        run: |
+          # Presence only: nothing is echoed, so no value can reach the log.
+          if [ -z "${PGHOST}" ] || [ -z "${PGDATABASE}" ]; then
+            echo "::error::The persistent homologación database is not configured."
+            exit 1
+          fi
+          echo "Connection details are present."
+
+      # No --init and no --update: a session runs against a module that is
+      # already installed. Installing is provisioning and upgrading is an
+      # explicit, separate operation; doing either here would let a schema and
+      # the code reading it disagree halfway through a session.
+      #
+      # No --test-enable either. The durability this database exists to prove
+      # cannot be shown from a TransactionCase: under current_test
+      # fiscal_transaction takes the dedicated=False branch and checkpoint()
+      # degrades to flush().
+      - name: Inspect the database
+        env:
+          ARCA_HOMO_MODE: ${{ inputs.mode }}
+          ARCA_HOMO_CODE_SHA: ${{ github.sha }}
+          PGSSLMODE: require
+          PGHOST: ${{ secrets.ARCA_HOMO_PGHOST }}
+          PGPORT: ${{ secrets.ARCA_HOMO_PGPORT }}
+          PGUSER: ${{ secrets.ARCA_HOMO_PGUSER }}
+          PGPASSWORD: ${{ secrets.ARCA_HOMO_PGPASSWORD }}
+          PGDATABASE: ${{ secrets.ARCA_HOMO_PGDATABASE }}
+        run: |
+          set -o pipefail
+          # TLS is requested here and *verified* by the runner against
+          # pg_stat_ssl: this database is reachable through a public TCP proxy,
+          # so an unencrypted connection is refused rather than assumed away.
+          #
+          # The password is deliberately absent from this command. Odoo 19
+          # declares an `env_name` for every database option, so PGPASSWORD from
+          # the step environment above already reaches it; spelling it out as
+          # `--db_password` would only add a copy in /proc/<pid>/cmdline, which
+          # every process on the machine can read. The remaining options stay on
+          # the command line for now -- moving them is a separate change.
+          odoo shell \
+            --db_host="${PGHOST}" \
+            --db_port="${PGPORT}" \
+            --db_user="${PGUSER}" \
+            --database="${PGDATABASE}" \
+            --addons-path=/usr/lib/python3/dist-packages/odoo/addons,${GITHUB_WORKSPACE}/extra-addons \
+            --max-cron-threads=0 \
+            --no-http \
+            < "${GITHUB_WORKSPACE}/extra-addons/l10n_ar_arca_edi/tools/arca_homologation_runner.py" \
+            2>&1 | tee arca-homologation-inspect.log
+
+      # The regression this design exists to prevent, checked mechanically even
+      # though no mode here can authenticate. If this ever counts anything but
+      # zero, a mode that reaches ARCA got in without being noticed.
+      - name: No access ticket was requested
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ ! -f arca-homologation-inspect.log ]; then
+            echo "::notice::No log was produced."
+            exit 0
+          fi
+          requests=$(grep -c 'WSAA: requesting a ticket for service' arca-homologation-inspect.log || true)
+          if [ "$requests" -ne 0 ]; then
+            echo "::error::$requests WSAA ticket(s) were requested. No mode in this workflow may authenticate."
+            exit 1
+          fi
+          echo "Zero access tickets requested, as designed."
+
+      - name: Upload the inspection log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: arca-homologation-inspect-log
+          path: arca-homologation-inspect.log
+          if-no-files-found: ignore

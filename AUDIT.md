@@ -1,0 +1,558 @@
+# ARCA EDI audit log
+
+Living record of the audit that produced the `feat/production-hardening` branch.
+Baseline audited: `484ff615e678a6c33a855a34edfc0043745b3b99`.
+
+Findings are ordered by severity. Each one states what was wrong, why it
+matters, and how it was verified.
+
+## Ground truth used
+
+Claims about ARCA are checked against the official developer manual, not against
+the module's own README:
+
+- [Manual para el desarrollador, Facturación Electrónica v4.0](https://www.afip.gob.ar/ws/documentacion/manuales/manual-desarrollador-ARCA-COMPG-v4-0.pdf)
+  (194 pages; validation codes cited below refer to it)
+- Odoo 19 Community source for `l10n_ar`, `l10n_latam_invoice_document`,
+  `account`
+
+## CRITICAL
+
+### C1 - An irreversible external action inside a reversible transaction
+
+`_post()` called ARCA inside the posting transaction. ARCA authorization cannot
+be rolled back; a PostgreSQL transaction can. Any failure after the CAE was
+received - a later constraint, a concurrent update, a worker restart - rolled
+back the invoice while ARCA kept an authorized voucher. The invoice then no
+longer existed in Odoo, and nothing recorded that a fiscal document had been
+created in the company's name.
+
+Fixed by moving authorization out of the posting transaction. `_post()` only
+marks the invoice `pending`; the request runs from a `cr.postcommit` callback,
+so it starts only once the invoice is durably committed. `postcommit` is
+cleared on rollback, so a posting that fails never triggers a request.
+
+### C2 - No way to represent "we do not know"
+
+Every failure was raised as a `UserError`. A timeout after the request had been
+sent was indistinguishable from a connection that never opened. The user's only
+option was to press the button again, which sends a second FECAESolicitar - and
+because the number came from `FECompUltimoAutorizado`, the second attempt used
+the *next* number, producing two fiscal documents for one Odoo invoice.
+
+Fixed with an explicit outcome taxonomy (`ArcaAborted`, `ArcaBusinessError`,
+`ArcaUncertain`) and an `uncertain` invoice state that refuses further requests
+until reconciled through `FECompConsultar`.
+
+### C3 - No durable evidence that a request was made
+
+Nothing was written before the SOAP call, so a lost answer left no trace of
+which number had been attempted. Reconciliation was impossible even in
+principle.
+
+Fixed with `l10n_ar.arca.attempt`, written and committed *before* the request
+leaves the process, holding CUIT, point of sale, document type, attempted
+number, invoice and timestamps.
+
+### C4 - The number sent to ARCA was not the number on the invoice
+
+The module computed `FECompUltimoAutorizado() + 1` and sent that, while Odoo
+printed its own sequence number on the invoice. The two counters are
+independent and drift apart after any gap. The CAE was then stored against an
+invoice showing a different number, and `action_verify_arca` queried ARCA using
+the Odoo number - a different voucher.
+
+Fixed by sending Odoo's own document number, and validating it against ARCA's
+last authorized number before sending (validation 10016). A mismatch is
+reported as a numbering gap instead of being silently papered over.
+
+### C5 - Exempt and untaxed operations reported as VAT aliquots
+
+The tax loop treated `l10n_ar_vat_afip_code == 3` as "Exento". In Odoo 19
+`l10n_ar`, code `3` is **0% VAT**; `1` is Untaxed and `2` is Exempt
+(`addons/l10n_ar/models/account_tax_group.py`). Codes 1 and 2 were therefore
+sent inside `AlicIva`, which ARCA rejects (validation 10019), and genuinely
+exempt amounts were added to `ImpNeto` instead of `ImpOpEx`.
+
+Fixed by delegating the whole breakdown to `l10n_ar`'s own
+`_l10n_ar_get_amounts()` and `_get_vat()`, which are the localization's source
+of truth and already exclude codes `0`, `1` and `2` from the aliquot list.
+
+### C6 - No concurrency control on the numbering sequence
+
+Two workers could both read the same last authorized number and both attempt
+the next one. Nothing serialized them.
+
+Fixed with a PostgreSQL advisory lock keyed on company, point of sale and
+document type, so independent sequences still run in parallel.
+
+The first fix used a session scoped lock, on the reasoning that the protocol
+commits mid-protocol and a transaction scoped lock would be released by that
+commit. That reasoning was right about the commit and wrong about the remedy:
+see R2 below, where the lock moves to a transaction of its own.
+
+### C7 - No multi-company isolation on certificates
+
+`l10n_ar.arca.certificate` had no record rule at all. Any invoicing user could
+read every company's certificate records.
+
+Fixed with global record rules on certificates and attempts, plus a constraint
+that a company cannot select another company's certificate.
+
+## HIGH
+
+### H1 - Factura E declared as supported without WSFEX
+
+`SUPPORTED_ARCA_DOC_TYPES` included 19, 20 and 21, and the README advertised
+Factura E with a tick. Validation 700 of the manual lists the document types
+WSFEv1 accepts, and 19/20/21 are not among them - export vouchers are
+authorized by WSFEX, which the module does not implement. Any attempt would
+have failed at ARCA.
+
+Fixed: export documents are refused locally with a message that says why, and
+the manifest and README now state the real scope. The same treatment is applied
+to MiPyME FCE documents (201-213), which need the unimplemented `Opcionales`
+group.
+
+### H2 - Exchange rate sent inverted
+
+`MonCotiz` was set to `currency_id.rate`. ARCA defines MonCotiz as the value in
+pesos of one unit of the invoiced currency ("Para PES ... la misma debe ser 1",
+validation 10039). Odoo's rate is the opposite direction: `invoice_currency_rate`
+is documented in `account` as "Currency rate from company currency to document
+currency". A USD invoice was reported with a rate near 0.001 instead of ~1000.
+
+Fixed by inverting the invoice's own booked rate, in one place, with the
+reasoning recorded next to it.
+
+### H3 - Other taxes never reported, and the remainder hidden
+
+`ImpTrib` was always 0 and `ImpTotConc` was computed as a leftover
+(`total - net - iva - exempt`), then clamped with `max(..., 0)`. Perceptions
+were silently absorbed into "not taxed", and any discrepancy was hidden rather
+than surfaced.
+
+Fixed: every component comes from `_l10n_ar_get_amounts()`, and the sum is
+checked against the invoice total within ARCA's documented tolerance
+(validation 10048: relative error <= 0.01% or absolute <= 0.01). A mismatch
+refuses to send instead of guessing.
+
+### H4 - VAT aliquots not totalled per rate
+
+Aliquot lines were appended per tax line, so the same rate could appear twice.
+Validation 10022: "El campo Id en AlicIVA no debe repetirse. Deberá totalizarse
+por alícuota."
+
+Fixed by aggregating per aliquot id before sending.
+
+### H5 - Service dates ignored the fields that hold them
+
+For concept 2 or 3 the module sent the invoice date as both service start and
+end, ignoring `l10n_ar_afip_service_start` / `l10n_ar_afip_service_end`, which
+`l10n_ar` provides and users fill in.
+
+Fixed by using those fields, falling back to the invoice date.
+
+### H6 - Debit notes never referenced the original document
+
+`CbtesAsoc` was only built for `move_type in ('out_refund', 'in_refund')`.
+Debit notes are `out_invoice` moves with a debit-note document type, so they
+were sent with no association. The point of sale was also taken from the
+current journal rather than from the referenced document.
+
+Fixed: notes are detected by document type, the origin is taken from
+`reversed_entry_id` or `debit_origin_id`, its own point of sale and number are
+used, and the pairing is validated against the table in validation 10040.
+
+### H7 - One access ticket cached for all services
+
+WSAA tickets are issued per service, but the cache stored a single token on the
+certificate. Asking for a `wsfex` ticket returned the cached `wsfe` one.
+
+Fixed with a per-service cache keyed by service name, plus an advisory lock so
+several workers do not request the same ticket simultaneously - ARCA refuses a
+second ticket while a valid one exists.
+
+### H8 - Receptor VAT condition not validated against the document class
+
+The RG 5616 condition was copied straight from the partner's responsibility
+code, including code 11, which Odoo marks deprecated and ARCA does not accept.
+ARCA also rejects conditions that do not match the class of the voucher
+(validation 10243).
+
+Fixed by validating against the table on page 194 of the manual, keyed by
+document letter, with an error naming the customer and the conflict.
+
+### H9 - Certificate accepted without any verification
+
+`action_process_certificate` stored whatever was uploaded and set the record to
+active: no check that the certificate matched the stored private key, that it
+was issued for the configured CUIT, or that it had not expired.
+
+Fixed: public key comparison against the private key, CUIT check against the
+certificate subject, and validity window check, all before activation.
+
+### H10 - Private key offered as a download in the UI
+
+The key was rendered as a downloadable binary field. It is restricted to
+`base.group_system`, but it never needs to leave the server at all.
+
+Fixed: the form shows whether a key is stored, and nothing more.
+
+## MEDIUM
+
+- **M1** - `l10n_ar.arca.wsaa` and `l10n_ar.arca.wsfe` were `models.Model`,
+  creating real tables for stateless services, with write and create rights
+  granted. Now `AbstractModel`.
+- **M2** - A zeep `Client` was constructed per call, fetching and parsing the
+  WSDL every time. Now cached per URL and per process.
+- **M3** - `CUIT` was only checked for length. Now the verification digit is
+  validated with ARCA's published algorithm.
+- **M4** - The create-certificate wizard showed an editable CUIT field and then
+  ignored it, using the company tax number instead.
+- **M5** - `cert.not_valid_before` / `not_valid_after` are deprecated in
+  cryptography 42+, which is what Odoo 19 pins. Now uses the `_utc` accessors
+  with a fallback.
+- **M6** - `uniqueId` in the TRA was `int(now.timestamp())`, which collides for
+  two requests in the same second. Now random.
+- **M7** - Journals were auto-enabled for EDI when the point-of-sale system was
+  `RLI_RLM`, which means invoices are typed into ARCA's web portal by hand.
+  The module now contributes the `RAW_MAW` ("Electronic Invoice - Web Service")
+  option that `l10n_ar` already routes correctly but only Enterprise exposes.
+- **M8** - `account_edi` was declared as a dependency and used nowhere. Removed;
+  see "Deviations" below.
+- **M9** - An authorized invoice could be reset to draft. Now refused.
+
+## LOW / IMPROVEMENT
+
+- **L1** - The legacy Interleaved 2 of 5 barcode was built with wrong field
+  widths (3 and 5 digits for document type and point of sale, where RG 1702
+  specifies 2 and 4). Rather than fix a field that RG 4892/2020 replaced with
+  the QR code for electronic invoices, it was removed. The QR is the current
+  requirement and is implemented.
+- **L2** - `l10n_ar_arca_cae_due_date` was a `Char` holding `YYYYMMDD`. Now a
+  `Date`.
+- **L3** - The QR payload was only reachable through the final URL, so tests
+  could not assert its contents. It is now built by a separate method.
+- **L4** - Logging never included a correlation id, and the request payload was
+  not retained. Attempts now carry both. Tokens, signatures and CMS blobs are
+  never logged.
+
+## Deviations from the brief
+
+- **`account_edi` dependency removed.** The requested architecture lists it in
+  the chain, but the baseline module referenced it only in `__manifest__.py` and
+  used no part of it - no `account.edi.format`, no `account.edi.document`, no
+  hook. Carrying an unused dependency implies an integration that does not
+  exist. Restoring it is a one-line change to `depends` if it is wanted for
+  forward compatibility.
+
+## Second round: transactions and the lock
+
+Baseline for this round: `cbc399da5c7e675bc5cb17a9e7e8f11706e33522`.
+
+### R1 - The protocol committed a cursor it did not own
+
+`_l10n_ar_arca_checkpoint()` called `self.env.cr.commit()`. For the button that
+cursor is the one Odoo created for the RPC, and committing it confirms whatever
+else the request had pending -- changes the module knows nothing about. Odoo
+owns that cursor's atomicity; a module deciding when it becomes durable is
+outside its remit.
+
+The requirement that produced it stands: the attempt must be on disk before
+FECAESolicitar. So the protocol now runs on connections it opens itself. See
+`models/fiscal_transaction.py`:
+
+* a **work** connection, which the protocol commits at each checkpoint -- safe
+  precisely because that transaction contains nothing but its own writes;
+* a **lock** connection, which does nothing but hold the numbering lock.
+
+The caller's cursor is only read. A rollback in the browser's request cannot
+erase an attempt already sent, and a fiscal commit cannot confirm an unrelated
+edit.
+
+### R2 - A session advisory lock can outlive its transaction
+
+The lock was `pg_advisory_lock` -- session scoped -- released by an explicit
+`pg_advisory_unlock` in a `finally`. That unlock is not guaranteed to run: a
+failed statement leaves the transaction aborted, and PostgreSQL then rejects
+every command on it except `ROLLBACK`. `Cursor._close()` (odoo/sql_db.py) does
+exactly one thing before handing the connection back: `self.rollback()`. And
+`ConnectionPool.give_back()` resets nothing.
+
+So the sequence was: SQL error inside the critical section, `pg_advisory_unlock`
+refused, rollback, connection back in the pool **still holding a fiscal lock on
+(company, point of sale, document type)** until that backend died.
+
+Now the lock is `pg_try_advisory_xact_lock` on a connection whose transaction
+exists only to hold it. PostgreSQL releases a transaction scoped lock when the
+transaction ends, without being asked -- and the transaction always ends,
+because closing the cursor rolls it back and `__exit__` closes it even when the
+commit raises. There is no command that can be refused.
+
+Keeping it on a second connection is what allows the work transaction to commit
+mid-protocol: a transaction scoped lock taken on the working transaction would
+be released by the very commit that makes the attempt durable, leaving the
+request in flight unprotected. Both properties are asserted in
+`tests/test_concurrency.py`.
+
+### R3 - The WSAA ticket cache had both problems
+
+`_authentication_lock` was a session advisory lock on the caller's cursor, and
+the ticket was written in the caller's transaction. Two consequences: the same
+phantom-lock risk, and -- worse -- a rollback could discard our copy of a ticket
+ARCA still considered valid, after which ARCA refuses to issue another. The
+cache now uses the same fiscal transaction and is committed immediately.
+
+### R4 - The reconciler could race a live request
+
+`_cron_reconcile_open_attempts` reconciled every attempt in `sent` state,
+including one whose request was still on the wire. FECompConsultar would
+correctly report "no voucher", the invoice would go back to `pending`, and the
+real request could then land -- or be sent a second time.
+
+The reconciler now takes the same sequence lock, so a running protocol shuts it
+out, and only touches a `sent` attempt once it is older than any request could
+still be (`STALE_ATTEMPT_MINUTES`). `uncertain` attempts are taken immediately:
+their request has already finished.
+
+### R5 - Requesting the CAE on post was the default
+
+Posting an invoice and authorizing it fiscally are separate decisions, and
+`l10n_ar_arca_auto_request_cae` now defaults to off. Posting produces a complete,
+committed invoice with ARCA status `pending` and no call to ARCA at all; the CAE
+is requested by the button, the scheduled action, or -- for companies that opt
+in -- after the posting commits.
+
+## Third round: certificate holder versus represented taxpayer
+
+Baseline for this round: `8d0301c5438cf278ecf75b1b6b2455bc0d1c86c9`. Found while
+preparing homologación, before any call to ARCA.
+
+### R6 - One CUIT was doing the work of two
+
+The module stored a single `cuit` on the certificate and used it for everything:
+the CSR subject, the check against the certificate ARCA issues, and
+`Auth.Cuit` on every WSFEv1 call.
+
+Those are two different identities, and ARCA is explicit about it. WSASS issues
+a certificate to whoever signs in with their own fiscal key, and then
+*"Crear autorización a servicio"* authorizes that DN to act for another
+taxpayer. The manual defines the field accordingly: `Auth.Cuit` is the
+**"Cuit contribuyente (representado o Emisora)"** -- the wording appears
+identically on all 21 authenticated operations. ARCA even has an error for
+getting it wrong: **601, "CUIT representada no incluida en token"**.
+
+A single `cuit` therefore only works while the certificate holder and the
+invoicing taxpayer happen to be the same. It breaks exactly where homologación
+usually starts: WSASS is reached with a natural person's fiscal key, and the
+invoices belong to a company.
+
+Fixed by naming the two identities and sourcing them separately:
+
+* `l10n_ar.arca.certificate.holder_cuit` -- who owns the DN. Goes in the CSR
+  subject, and is what an uploaded certificate's subject is validated against.
+* `res.company._l10n_ar_arca_issuer_cuit()` -- who the invoices belong to,
+  taken from the company's own tax number rather than stored a second time,
+  where it could drift from the invoices it describes.
+
+Everything fiscal now takes the issuer: `Auth.Cuit`, the attempt record, the QR
+payload, the numbering lock, `FECompUltimoAutorizado` and `FECompConsultar`.
+The WSFEv1 methods take it as an explicit argument, so every call site had to
+say which identity it meant instead of inheriting one by accident.
+
+Two things fell out of it:
+
+* **The numbering lock now keys on the issuing CUIT** rather than on the Odoo
+  company id. That is what ARCA numbers by, so two companies configured with the
+  same CUIT share one sequence at ARCA and must share one lock here.
+* **Error 601 is reported with its cause**, pointing at the WSASS authorization
+  step rather than passing the raw message through.
+
+The test fixture was changed so holder and issuer differ (`30-71234567-1` holding
+a certificate for a company whose CUIT is `30111111118`), which means the whole
+suite now runs with them apart. `tests/test_representation.py` asserts each half
+of the split explicitly.
+
+### R7 - The homologación suite could not say which CUIT it meant
+
+`ARCA_HOMO_CUIT` was ambiguous once the identities were separated. Renamed to
+`ARCA_HOMO_CERT_HOLDER_CUIT` and `ARCA_HOMO_REPRESENTED_CUIT`, and the suite
+split in two: a read-only half that consumes no voucher number, and an emission
+half that issues a real one and requires `ARCA_HOMO_ALLOW_EMISSION` on top of
+the credentials.
+
+## Fourth round: one run, one access ticket
+
+Baseline for this round: `879e2d115420af71c3fe59bab464d25396dece65`. Found by
+running the homologación workflow for real.
+
+Authentication worked. ARCA accepted the homologación certificate, WSAA returned
+a token and a sign for `wsfe`, the ticket was valid for roughly twelve hours, and
+`FEDummy` answered. The run still failed, and ARCA was right:
+
+    El CEE ya posee un TA valido para el acceso al WSN solicitado
+
+### R8 - The session was split across seven test methods
+
+The read-only checks were seven separate `test_*` methods. Odoo rolls the test
+transaction back at the end of each one, and the WSAA ticket cache lives in the
+database, so the second method started with no copy of the ticket the first had
+obtained -- while ARCA still held it for another twelve hours. Every method after
+the first asked for a ticket that already existed.
+
+Retrying was never the answer, and neither was suppressing the error: ARCA
+reports the truth, and R3's persistence mechanism is what production depends on.
+The defect was in the shape of the external test. It is now a single
+`test_homologation_session`, and the optional emission continues inside that same
+method rather than in a class of its own. One certificate, one database, one
+transaction, one cache, one process, one ticket. After the reuse check the
+session leaves a stand-in over `_authenticate`, so a second request fails
+in-process instead of reaching ARCA.
+
+### R9 - The workflow started a second Odoo on a second database
+
+Emission ran as its own step, with its own `-d`, which by construction could not
+see the ticket the read-only step had obtained. The two steps are now one, `ARCA
+network session`, and `ARCA_HOMO_ALLOW_EMISSION` is set from the `run_emission`
+input on that single invocation. The step's output is captured and the number of
+`WSAA: requesting a ticket for service` lines is asserted to be exactly one, so a
+regression fails the build rather than ARCA.
+
+### R10 - A cancelled run left a ticket nobody held
+
+The workflow cancelled in-progress runs on any new one, including manual ones.
+A run cancelled after `loginCms` returned does not cancel the ticket: ARCA keeps
+it for twelve hours while the database holding the only copy is discarded.
+
+Manual runs are now never cancelled automatically -- the event name is part of
+the workflow concurrency group, so a push can never share a group with a
+`workflow_dispatch` -- and the ARCA job carries a repository-wide,
+branch-independent group with `cancel-in-progress: false`, so two sessions queue
+instead of overlapping.
+
+On top of that, `.github/scripts/arca_cooldown.py` runs before any step that can
+reach the network. It reads the previous manual attempts through the Actions API
+with the job's own `GITHUB_TOKEN` and refuses to start until 12 h 15 min after
+the last attempt whose network step actually began. It ignores the current
+attempt, attempts it blocked itself, and steps recorded as `skipped`; it
+recognises the historic step names; and anything it cannot classify counts as
+risky. A blocked attempt never reaches the network step, so it does not extend
+its own cooldown.
+
+### R11 - The cooldown was blind to re-runs
+
+`GITHUB_RUN_ID` does not change when a run is re-run; only `GITHUB_RUN_ATTEMPT`
+does. The first version excluded the whole current run id, so attempt 2 of a run
+whose attempt 1 had obtained a ticket sailed straight past the cooldown and into
+the refusal it exists to prevent -- the original defect, one level down.
+
+The unit of work is now `(run_id, attempt)`. Only the current attempt is
+excluded, every earlier attempt of the same run is examined, and each is read
+from `/repos/{owner}/{repo}/actions/runs/{id}/attempts/{n}/jobs` rather than from
+the `filter=latest` view, which reports the newest attempt and therefore says
+nothing about the earlier ones.
+
+### R12 - The run listing stopped at a fixed 30
+
+Blocked and skipped attempts cost nothing and accumulate, so thirty recent runs
+could easily sit between the preflight and the one attempt that actually took a
+ticket. The listing now pages until it can show that everything left was created
+before the cooldown plus the longest a run could plausibly last. A paging failure,
+or reaching the defensive limit of 1000 runs, blocks: a listing that stopped early
+is not evidence that ARCA is free.
+
+The calls also identify themselves with a `User-Agent` of
+`l10n-ar-arca-edi-cooldown/1.0`, so a throttled or refused request can be traced
+back to its cause.
+
+### R13 - The paging horizon ignored the re-run window
+
+R12's stop condition was `COOLDOWN + MAX_RUN_DURATION`, about 36 hours. But runs
+are listed by *creation*, and GitHub allows a re-run for thirty days after that.
+A run created a fortnight ago can have an attempt that talked to ARCA this
+morning, sitting a fortnight down the list -- and paging stopped long before
+reaching it.
+
+The horizon is now stated from the three things that actually bound it:
+
+    RELEVANCE_HORIZON = RERUN_ELIGIBILITY (30 days)
+                      + MAX_RUN_DURATION  (35 days)
+                      + COOLDOWN          (12 h 15 min)
+                      = 65 days, 12 h 15 min
+
+An attempt of a run created at `T` cannot have started its network step later
+than `T + RERUN_ELIGIBILITY + MAX_RUN_DURATION`, and only matters while that is
+within one cooldown of now.
+
+Paging is still not trusted with the one run that matters most. The current run
+is fetched by id through `GET /repos/{owner}/{repo}/actions/runs/{run_id}` and
+added to the listing when absent, so a re-run can always inspect its own earlier
+attempts even if the original run is old or falls past the defensive limit.
+Failing to read it blocks from attempt 2 on; on a first attempt there are no
+earlier attempts of its own to miss.
+
+### R14 - The run-duration bound was a job limit wearing the wrong name
+
+`MAX_RUN_DURATION` was first set to 24 h, justified by GitHub killing a job at
+six hours. That is the wrong limit: six hours caps how long a *job* may execute
+on a GitHub-hosted runner and says nothing about how long the run it belongs to
+can stay alive. GitHub caps a workflow run's total time -- execution, waiting and
+approval together -- at **35 days**.
+
+With the 24 h figure the horizon came to 31 days 12 h 15 min, so a page of
+forty-day-old runs looked like the end of the search and anything below it was
+never read, including a run created two months ago and re-run this morning.
+`MAX_RUN_DURATION` is now 35 days and the horizon is 65 days 12 h 15 min. The
+constant carries a comment saying which limit it is, because the two are easy to
+confuse and the cheaper one is the wrong one.
+
+### Accepted technical debt - persistent WSAA lease
+
+The homologation cooldown currently reconstructs whether a WSAA access ticket
+may still be alive by inspecting GitHub Actions history. The implementation is
+deliberately conservative and is acceptable for the current manual and
+occasional homologation runs, but GitHub history is not the desired long-term
+source of truth.
+
+A workflow run uses an ephemeral database. When the run ends, the local copy of
+the WSAA token and sign disappears while ARCA may continue to consider the
+ticket valid for roughly twelve hours. The current preflight compensates by
+examining runs, re-runs, attempts, pagination and the full relevant retention
+window.
+
+Before homologation becomes frequent or automated, replace this inferred state
+with an external persistent and atomic lease, keyed at least by:
+
+- ARCA environment;
+- certificate fingerprint;
+- service name.
+
+The lease should record:
+
+- holder run id and attempt;
+- acquired_at;
+- expires_at.
+
+A run must acquire the lease atomically before calling WSAA. A live lease must
+stop the run without contacting ARCA. Keep GitHub Actions concurrency to prevent
+simultaneous sessions; keep Actions history only as secondary audit evidence.
+
+The first implementation should persist only the lease, not Token or Sign.
+Persisting and reusing those credentials would require encryption, access
+control and explicit protection against logging.
+
+The current history-based cooldown remains the accepted interim mechanism.
+
+## Verification status
+
+Wording used deliberately, per the brief:
+
+- **Static review**: all findings above.
+- **Unit tests**: see `tests/`, run in CI against Odoo 19 + PostgreSQL.
+- **Real homologación**: authentication executed and confirmed - ARCA accepted
+  the certificate, WSAA issued a ticket for `wsfe`, and `FEDummy` answered. The
+  rest of the session was not completed: the run failed on R8 and the session was
+  rebuilt around one ticket. No voucher has been issued. See
+  `tests/test_homologation.py` and `readme/CONFIGURE.rst`.
+- **Production**: not enabled, not configured, nothing sent.

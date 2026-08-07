@@ -32,8 +32,9 @@
                 <group>
                     <field name="name" placeholder="e.g., MyCompany-Testing"/>
                     <field name="company_id" options="{'no_create': True, 'no_open': True}"/>
-                    <label for="cuit" string="CUIT" class="fw-bold"/>
-                    <field name="cuit" class="text-muted" nolabel="1"/>
+                    <field name="holder_cuit"
+                        placeholder="CUIT that will create the certificate in ARCA"/>
+                    <field name="issuer_cuit" readonly="1"/>
                     <field name="environment" widget="radio"/>
                 </group>
                 <footer>

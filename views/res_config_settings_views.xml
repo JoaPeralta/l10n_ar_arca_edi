@@ -24,9 +24,9 @@
                     </setting>
 
                     <setting>
-                        <span class="o_form_label fw-bold">CUIT</span>
+                        <span class="o_form_label fw-bold">Issuer CUIT</span>
                         <span class="fa fa-info-circle ms-1 text-primary"
-                            title="CUIT number from the selected company."/>
+                            title="The company's tax number, reported to ARCA as the issuer of the invoices. The certificate may be held by someone else, authorized in WSASS to act for it."/>
                         <div class="mt-2 text-muted">
                             <field name="l10n_ar_arca_company_cuit" readonly="1"/>
                         </div>
@@ -114,6 +114,11 @@
                             icon="fa-plug"/>
                     </setting>
 
+                    <setting string="Request CAE automatically"
+                        help="Request the CAE as soon as an invoice is posted. The request runs after the invoice is committed, so an ARCA failure never undoes the posting."
+                        invisible="l10n_ar_arca_cert_state != 'active'">
+                        <field name="l10n_ar_arca_auto_request_cae"/>
+                    </setting>
 
                 </block>
             </xpath>
