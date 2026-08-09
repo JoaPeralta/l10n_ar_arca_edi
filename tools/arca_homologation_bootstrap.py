@@ -527,7 +527,27 @@ def main(env, environ=None):
     check_gate(environ)
     check_module_installed(env)
 
-    build_marker = pathlib.Path(__file__).resolve().parent.parent / ".viarengo-build-sha"
+    # `globals().get`, not `__file__`, and for the same reason `env` is read
+    # that way at the bottom of this file: the documented way to run this is
+    # `odoo shell < tools/arca_homologation_bootstrap.py`, and `odoo shell`
+    # executes stdin with `exec(source, namespace)`. Code that arrives as a
+    # string was never loaded from a path, so `__file__` is simply not defined
+    # and naming it directly raises NameError.
+    #
+    # That is not hypothetical: it is what refused the first real Milestone A
+    # load against the persistent homologación database.
+    #
+    # No path is invented to paper over it. The marker is a fallback for an
+    # operator running this by hand inside the deployment image, where the file
+    # does exist; when there is no file there is no marker, and
+    # `resolve_code_sha` already treats that as "only ARCA_HOMO_CODE_SHA can
+    # answer" and refuses if it cannot.
+    script_file = globals().get("__file__")
+    build_marker = (
+        pathlib.Path(script_file).resolve().parent.parent / ".viarengo-build-sha"
+        if script_file
+        else None
+    )
 
     # Order matters: the columns are checked before any material is written, so
     # a database still on the previous version is refused rather than seeded
