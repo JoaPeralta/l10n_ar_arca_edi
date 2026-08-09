@@ -481,6 +481,32 @@ def count_legacy_attachments(env, certificate):
 
 def verify_storage(env, certificate):
     """Prove in SQL that the material is in the row, and nowhere else."""
+    # The material was written through the ORM, and everything below reads it
+    # with raw SQL. Odoo 19 keeps ORM writes in memory until something forces
+    # them out, so a cursor asking `OCTET_LENGTH` sees the row as it was before
+    # the write -- both columns NULL -- while the recordset in this same session
+    # holds the right bytes.
+    #
+    # That is not a theory. With the `__file__` defect fixed, the bootstrap
+    # reached this point against a real Odoo and aborted here:
+    #
+    #     almacenamiento certificate: columna=True bytes=None
+    #     almacenamiento private_key:  columna=True bytes=None
+    #
+    # immediately after `action_process_certificate()` had succeeded and the
+    # key/certificate pair had verified. The material was fine; the query was
+    # early.
+    #
+    # `flush_recordset`, not `flush_all`: the only pending writes this function
+    # reads are these two fields on this row, and a narrower flush is a smaller
+    # promise to keep.
+    #
+    # And a flush, never a commit. The whole point of the checks below is that
+    # they can still abort, and an abort has to be able to take the material
+    # with it. The transaction ends where it always did -- at the single
+    # `env.cr.commit()` in `main()`, after every verification has passed.
+    certificate.sudo().flush_recordset(MATERIAL_FIELDS)
+
     columns = read_material_columns(env)
     sizes = read_material_sizes(env, certificate)
     legacy = count_legacy_attachments(env, certificate)
