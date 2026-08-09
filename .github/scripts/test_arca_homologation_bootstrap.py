@@ -437,6 +437,145 @@ class TestTheOrderThatMakesItCorrect(unittest.TestCase):
         self.assertLess(order.index("record_installed_sha"), order.index("commit"))
 
 
+class TestItRunsTheWayOdooRunsIt(unittest.TestCase):
+    """The context `odoo shell` actually creates, rather than an import.
+
+    Every other test here imports this file, and an import defines `__file__`.
+    `odoo shell` does not: `odoo/cli/shell.py` reads stdin and hands it to
+    `exec(source, namespace)`, so the code runs from a string and the name is
+    simply absent.
+
+    That difference cost a real run. `arca-homologation-load-material.yml` run
+    31329285963 refused with `odoo-shell-failed` against the persistent
+    homologación database, and the deployment repository's real-Odoo
+    reproduction (PR #64, CI Integration run 31331259364) recovered what the
+    loader itself is not allowed to print:
+
+        File "odoo/cli/shell.py", line 82, in console
+            exec(sys.stdin.read(), local_vars)
+        File "<string>", line 530, in main
+        NameError: name '__file__' is not defined
+
+    So this executes the real source in a namespace without `__file__` -- the
+    one thing an import can never reproduce. A grep for the name would pass the
+    day someone reintroduced it through an alias.
+
+    The Odoo-facing steps are replaced with doubles inside that namespace after
+    the source is loaded. What is under test is `main()`'s own execution, not
+    those steps: each has its own coverage, and standing a real ORM up here
+    would trade the property being measured for a mock of it.
+    """
+
+    # Every step `main()` delegates to, replaced with a recorder. Listed rather
+    # than discovered, so a step added to `main()` without a decision here fails
+    # loudly instead of quietly running for real.
+    ODOO_FACING = (
+        "check_gate",
+        "check_module_installed",
+        "check_material_columns",
+        "disable_auto_request",
+        "target_company",
+        "find_or_create_certificate",
+        "enforce_testing",
+        "load_material",
+        "link_company",
+        "report_ticket",
+        "verify_xmlid_is_unique",
+        "verify_key_pair",
+        "verify_storage",
+        "record_installed_sha",
+    )
+
+    def exec_source(self, extra_globals=None):
+        """Load the real source the way `odoo shell` loads it."""
+        namespace = {"__name__": "__main__"}
+        namespace.update(extra_globals or {})
+        # No `env` in the namespace, so the module-level guard stays inert and
+        # this test decides when `main()` runs.
+        exec(compile(BOOTSTRAP_TEXT, "<string>", "exec"), namespace)  # noqa: S102
+        return namespace
+
+    def run_main(self, namespace, environ=None):
+        """Call `main()` with every Odoo-facing step recorded instead of run.
+
+        Returns `(calls, committed)`: what `main()` invoked, with the arguments
+        each was given, and whether the commit was reached.
+        """
+        calls = []
+
+        def recorder(name):
+            def record(*args, **kwargs):
+                calls.append((name, args, kwargs))
+                # Two of these feed later steps; anything truthy will do, since
+                # nothing under test reads them.
+                return object()
+
+            return record
+
+        for step in self.ODOO_FACING:
+            self.assertIn(step, namespace, f"main() no delega en {step}")
+            namespace[step] = recorder(step)
+
+        committed = []
+
+        class Cursor:
+            def commit(self):
+                committed.append(True)
+
+        class Env:
+            cr = Cursor()
+
+        namespace["main"](Env(), environ={} if environ is None else environ)
+        return calls, bool(committed)
+
+    def recorded_build_marker(self, calls):
+        """The `build_marker` `main()` handed to `record_installed_sha`.
+
+        Read out of the call rather than assumed: `main()` passes it
+        positionally, and a keyword lookup would silently answer `None` for the
+        wrong reason -- which is exactly the value one of these tests expects.
+        """
+        recorded = [(a, k) for name, a, k in calls if name == "record_installed_sha"]
+        self.assertEqual(len(recorded), 1)
+        args, kwargs = recorded[0]
+        if "build_marker" in kwargs:
+            return kwargs["build_marker"]
+        self.assertGreaterEqual(len(args), 3, "record_installed_sha sin build_marker")
+        return args[2]
+
+    def test_main_runs_without_a_file_name(self):
+        """The regression itself: no `__file__`, no NameError."""
+        calls, committed = self.run_main(self.exec_source())
+        self.assertTrue(committed, "el commit no llegó a ejecutarse")
+        self.assertEqual(calls[0][0], "check_gate")
+
+    def test_without_a_file_name_there_is_no_build_marker(self):
+        """`record_installed_sha` is told there is no marker, not a wrong one.
+
+        `resolve_code_sha` already treats `build_marker=None` as "only the
+        environment can answer", and that is covered elsewhere. What matters
+        here is the value it receives.
+        """
+        calls, _ = self.run_main(self.exec_source())
+        self.assertIsNone(
+            self.recorded_build_marker(calls),
+            "record_installed_sha debe recibir build_marker=None sin __file__",
+        )
+
+    def test_with_a_file_name_the_marker_is_still_derived_from_it(self):
+        """The image path keeps working.
+
+        An operator running this by hand inside the deployment image still gets
+        the baked-in marker as the fallback, unchanged.
+        """
+        namespace = self.exec_source({"__file__": str(BOOTSTRAP_PATH)})
+        calls, _ = self.run_main(namespace)
+        marker = self.recorded_build_marker(calls)
+        self.assertIsNotNone(marker)
+        self.assertEqual(pathlib.Path(marker).name, ".viarengo-build-sha")
+        self.assertEqual(pathlib.Path(marker).parent, REPO_ROOT)
+
+
 class TestItIsInertUntilOdooRunsIt(unittest.TestCase):
     """Importing the file must not touch a database -- these tests rely on it."""
 
