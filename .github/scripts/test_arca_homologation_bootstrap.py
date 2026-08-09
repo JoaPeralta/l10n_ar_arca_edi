@@ -383,6 +383,27 @@ class TestTheOrderThatMakesItCorrect(unittest.TestCase):
         order = calls_in("main")
         self.assertLess(order.index("verify_storage"), order.index("record_installed_sha"))
 
+    def test_the_material_is_flushed_before_it_is_read_in_sql(self):
+        """The ORM write has to reach the database before SQL asks about it.
+
+        Without this, `OCTET_LENGTH` reads the row as it was before the write
+        and both columns come back NULL, which aborted a real run.
+        """
+        order = calls_in("verify_storage")
+        self.assertIn("flush_recordset", order)
+        self.assertLess(
+            order.index("flush_recordset"), order.index("read_material_sizes")
+        )
+
+    def test_the_flush_is_not_a_commit(self):
+        """`main()` owns the only commit, and it happens after every check.
+
+        A commit inside `verify_storage` would make the material durable before
+        the checks that are allowed to abort had run.
+        """
+        self.assertNotIn("commit", calls_in("verify_storage"))
+        self.assertEqual(calls_in("main").count("commit"), 1)
+
     STEPS = (
         "check_module_installed",
         "check_material_columns",
