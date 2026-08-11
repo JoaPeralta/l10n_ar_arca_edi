@@ -270,7 +270,8 @@ jobs:
           for proof in TestTicketSurvivesTheProcess \
                        TestPrivateKeySurvivesTheProcess \
                        TestUpgradeWithNothingToLose \
-                       TestUpgradeWithMaterialInAttachments; do
+                       TestUpgradeWithMaterialInAttachments \
+                       TestUpgradePreservesCronDecisions; do
             if ! grep -q "${proof}" "$log"; then
               echo "::error::${proof} did not run."
               exit 1

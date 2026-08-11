@@ -11,6 +11,7 @@ from . import (
     test_payload,
     test_private_key_storage,
     test_qr,
+    test_report_cae_due_date,
     test_representation,
     test_scope,
     test_security,
