@@ -155,10 +155,26 @@
                                         <strong>C.A.E. N°:</strong> <span t-field="o.l10n_ar_arca_cae"/>
                                         <span style="margin-left: 15px;">
                                             <strong>CAE Exp. Date:</strong>
-                                            <t t-set="cae_due" t-value="o.l10n_ar_arca_cae_due_date"/>
-                                            <span t-if="cae_due and len(cae_due) == 8"
-                                                t-out="'%s/%s/%s' % (cae_due[6:8], cae_due[4:6], cae_due[0:4])"/>
-                                            <span t-else="" t-out="cae_due"/>
+                                            <!--
+                                                `l10n_ar_arca_cae_due_date` is a `fields.Date`, so this
+                                                receives a `datetime.date`. It used to be read as an
+                                                eight-character string (`len(cae_due) == 8`, then
+                                                sliced), which raised on every authorized voucher:
+
+                                                    TypeError: object of type 'datetime.date' has no len()
+
+                                                ARCA does answer `yyyymmdd` on the wire, but the transport
+                                                parses it and the ORM stores a date, so that branch was
+                                                dead code with a crash where the dead code was.
+
+                                                The format is pinned rather than left to the reader's
+                                                language: a plain `t-field` prints 12/31/2026 for an
+                                                English user and 31/12/2026 for a Spanish one, and a date
+                                                on a fiscal document must not be ambiguous. `dd/MM/yyyy`
+                                                is what this document has always printed.
+                                            -->
+                                            <span t-field="o.l10n_ar_arca_cae_due_date"
+                                                t-options='{"format": "dd/MM/yyyy"}'/>
                                         </span>
                                     </div>
                                     <div style="font-size: 0.75em; color: #555; margin-top: 3px; line-height: 1.3;">

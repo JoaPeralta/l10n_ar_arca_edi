@@ -1,5 +1,29 @@
 <?xml version="1.0" encoding="utf-8"?>
-<odoo>
+<!--
+    Initial configuration, not enforced configuration.
+
+    Whether a cron is running is an operational decision, taken per database
+    and often deliberately against the default: the homologación database has
+    both fiscal crons switched off while the first vouchers are authorized by
+    hand.
+
+    Loaded as ordinary records, these defaults were re-applied on every
+    `odoo -u l10n_ar_arca_edi`. Upgrading to pick up an unrelated fix switched
+    `Reconcile Unresolved Authorizations` back on, and that cron contacts ARCA.
+    An upgrade must never be a way to start talking to a fiscal authority.
+
+    `noupdate="1"` makes these values what a fresh install starts from and
+    nothing else. Odoo's loader skips a record whose noupdate is set whenever
+    the mode is not `init`, so the switches an administrator set are left
+    alone. The attribute is read from this file on every load, so it protects
+    the first upgrade too, not only the ones after it.
+
+    What this also means, and it is the price: `interval_number`, `code` and
+    `name` stop reaching databases that already have these records. A future
+    change to what a cron *runs* needs a migration script to carry it, because
+    this file will no longer deliver it on its own.
+-->
+<odoo noupdate="1">
 
     <record id="ir_cron_check_arca_certificate_expiration" model="ir.cron">
         <field name="name">ARCA: Check Certificate Expiration</field>
