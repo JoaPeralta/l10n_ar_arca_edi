@@ -4,10 +4,10 @@
 
 import importlib.util
 import os
-from pathlib import Path
 import sys
-from types import ModuleType
 import unittest
+from pathlib import Path
+from types import ModuleType
 from unittest.mock import patch
 
 

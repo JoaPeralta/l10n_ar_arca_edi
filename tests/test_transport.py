@@ -8,6 +8,7 @@ invoice. So each case is pinned down explicitly.
 """
 
 import types
+from unittest.mock import patch
 
 import requests
 import zeep
@@ -15,12 +16,25 @@ from urllib3.exceptions import NewConnectionError
 
 from odoo.tests import TransactionCase, tagged
 
+from ..models import arca_runtime
 from ..models.arca_errors import ArcaAborted, ArcaBusinessError, ArcaUncertain
 
 
 def _node(**attributes):
     """Minimal stand-in for a zeep response object."""
     return types.SimpleNamespace(**attributes)
+
+
+class _TransportCertificate:
+    id = 1
+    environment = "testing"
+
+    def _check_runtime_environment(self):
+        return arca_runtime.require_runtime_environment(self.environment)
+
+
+def _testing_runtime():
+    return patch.object(arca_runtime, "os", _node(environ={"ARCA_RUNTIME_ENV": "testing"}))
 
 
 def _errors(*pairs):
@@ -140,8 +154,8 @@ class TestArcaResponseParsing(TransactionCase):
                 )
             )
         )
-        certificate = _node(environment="testing", id=1)
-        with self.assertRaises(ArcaBusinessError):
+        certificate = _TransportCertificate()
+        with _testing_runtime(), self.assertRaises(ArcaBusinessError):
             self.wsfe._call(client, "FECAESolicitar", certificate)
 
     def test_http_error_from_arca_is_uncertain(self):
@@ -149,8 +163,8 @@ class TestArcaResponseParsing(TransactionCase):
             raise zeep.exceptions.TransportError("bad gateway", status_code=502)
 
         client = _node(service=_node(FECAESolicitar=raise_transport))
-        certificate = _node(environment="testing", id=1)
-        with self.assertRaises(ArcaUncertain):
+        certificate = _TransportCertificate()
+        with _testing_runtime(), self.assertRaises(ArcaUncertain):
             self.wsfe._call(client, "FECAESolicitar", certificate)
 
     def test_connection_refused_is_aborted(self):
@@ -158,8 +172,8 @@ class TestArcaResponseParsing(TransactionCase):
             raise requests.exceptions.ConnectTimeout("no route")
 
         client = _node(service=_node(FECAESolicitar=raise_connect))
-        certificate = _node(environment="testing", id=1)
-        with self.assertRaises(ArcaAborted):
+        certificate = _TransportCertificate()
+        with _testing_runtime(), self.assertRaises(ArcaAborted):
             self.wsfe._call(client, "FECAESolicitar", certificate)
 
     def test_arca_date_parsing(self):
