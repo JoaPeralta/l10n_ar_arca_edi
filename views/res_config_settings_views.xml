@@ -9,6 +9,12 @@
         <field name="arch" type="xml">
             <xpath expr="//app[@name='account']/block[1]" position="before">
                 <block title="ARCA Electronic Invoicing" id="arca_settings_block">
+                    <setting string="Service Environment" help="Configured on the Odoo service, not on an individual certificate.">
+                        <field name="l10n_ar_arca_runtime_environment" readonly="1"/>
+                        <span class="text-warning" invisible="l10n_ar_arca_runtime_environment">
+                            Not configured. ARCA operations are blocked.
+                        </span>
+                    </setting>
 
                     <!-- ============================================ -->
                     <!-- Company + CUIT                                -->
@@ -38,7 +44,7 @@
                     <setting invisible="l10n_ar_arca_has_certificate">
                         <span class="o_form_label fw-bold">Certificate</span>
                         <span class="fa fa-info-circle ms-1 text-primary"
-                            title="How to connect with ARCA:&#10;&#10;1. Click Create Certificate&#10;2. Fill name and select environment&#10;3. Click Generate Key &amp; CSR&#10;4. Copy CSR to ARCA portal:&#10;   • Testing: wsass-homo.afip.gob.ar&#10;   • Production: Administración de Certificados&#10;5. In ARCA: Nuevo Certificado → paste CSR → download .crt&#10;6. In ARCA: Crear autorización a servicio → select wsfe&#10;7. Back in Odoo: Upload Certificate (.crt)&#10;8. Click Test Connection"/>
+                            title="How to connect with ARCA:&#10;&#10;1. Click Create Certificate&#10;2. Fill in the name and verify the service environment&#10;3. Click Generate Key &amp; CSR&#10;4. Copy CSR to ARCA portal:&#10;   • Testing: wsass-homo.afip.gob.ar&#10;   • Production: Administración de Certificados&#10;5. In ARCA: Nuevo Certificado → paste CSR → download .crt&#10;6. In ARCA: Crear autorización a servicio → select wsfe&#10;7. Back in Odoo: Upload Certificate (.crt)&#10;8. Click Test Connection"/>
                         <div class="mt-2">
                             <button name="%(l10n_ar_arca_edi.l10n_ar_arca_create_certificate_wizard_action)d"
                                 type="action"
@@ -49,7 +55,7 @@
                         <div class="mt-2">
                             <span class="text-muted">Or select an existing one: </span>
                             <field name="l10n_ar_arca_certificate_id"
-                                domain="[('company_id', '=', company_id)]"
+                                domain="[('company_id', '=', company_id), ('environment', '=', l10n_ar_arca_runtime_environment)]"
                                 class="d-inline-block"
                                 options="{'no_create': True}"/>
                         </div>
@@ -65,7 +71,7 @@
                         help="Currently selected ARCA certificate."
                         invisible="not l10n_ar_arca_has_certificate">
                         <field name="l10n_ar_arca_certificate_id"
-                            domain="[('company_id', '=', company_id)]"
+                            domain="[('company_id', '=', company_id), ('environment', '=', l10n_ar_arca_runtime_environment)]"
                             options="{'no_create': True}"/>
                     </setting>
 

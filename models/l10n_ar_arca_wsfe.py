@@ -66,10 +66,10 @@ class L10nArArcaWsfe(models.AbstractModel):
     # ------------------------------------------------------------------
 
     @api.model
-    def _get_client(self, certificate, urls=None):
-        """Return a cached zeep client for the certificate's environment."""
-        urls = urls or WSFE_URL
-        wsdl_url = urls[certificate.environment]
+    def _get_client(self, certificate):
+        """Return a cached zeep client for the configured service environment."""
+        environment = certificate._check_runtime_environment()
+        wsdl_url = WSFE_URL[environment]
         with _WSDL_CLIENT_LOCK:
             client = _WSDL_CLIENT_CACHE.get(wsdl_url)
             if client is None:
@@ -146,6 +146,7 @@ class L10nArArcaWsfe(models.AbstractModel):
     @api.model
     def _call(self, client, operation_name, certificate, **kwargs):
         """Invoke a SOAP operation, translating failures into ARCA outcomes."""
+        certificate._check_runtime_environment()
         operation = getattr(client.service, operation_name)
         started = time.monotonic()
         try:

@@ -314,9 +314,9 @@ class TestTicketSurvivesTheProcess(unittest.TestCase):
             "a ticket cached for wsfe was served for wsfex",
         )
         self.assertEqual(
-            isolation["other_environment_authenticates"],
+            isolation["other_environment_refused"],
             "True",
-            "a testing ticket was served to a production certificate",
+            "the testing process did not refuse the production certificate",
         )
         self.assertWasOffline(isolation)
         self.assertNoSecretIn(isolation["_stdout"], isolation["_stderr"])

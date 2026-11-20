@@ -12,12 +12,13 @@ from cryptography.x509.oid import NameOID
 from odoo import _, api, fields, models
 from odoo.exceptions import UserError, ValidationError
 
-_logger = logging.getLogger(__name__)
+from .arca_runtime import (
+    ARCA_ENVIRONMENTS,
+    require_runtime_environment,
+    runtime_environment,
+)
 
-ARCA_ENVIRONMENTS = [
-    ("testing", "Testing (Homologación)"),
-    ("production", "Production"),
-]
+_logger = logging.getLogger(__name__)
 
 RSA_KEY_SIZE = 2048
 CUIT_CHECK_WEIGHTS = (5, 4, 3, 2, 7, 6, 5, 4, 3, 2)
@@ -87,8 +88,9 @@ class L10nArArcaCertificate(models.Model):
     environment = fields.Selection(
         ARCA_ENVIRONMENTS,
         required=True,
-        default="testing",
-        help="Production certificates issue legally binding invoices.",
+        readonly=True,
+        default=lambda self: runtime_environment() or False,
+        help="Environment assigned at creation. Production certificates issue legally binding invoices.",
     )
     state = fields.Selection(
         [
@@ -181,6 +183,28 @@ class L10nArArcaCertificate(models.Model):
         copy=False,
     )
 
+    @api.model_create_multi
+    def create(self, vals_list):
+        environment = require_runtime_environment()
+        bound_vals = []
+        for vals in vals_list:
+            if "environment" in vals:
+                require_runtime_environment(vals["environment"])
+            # An RPC context default is not the service authority.
+            bound_vals.append(dict(vals, environment=environment))
+        return super().create(bound_vals)
+
+    def write(self, vals):
+        if "environment" in vals and any(
+            record.environment != vals["environment"] for record in self
+        ):
+            raise UserError(_("An existing ARCA certificate cannot change environment."))
+        return super().write(vals)
+
+    def _check_runtime_environment(self):
+        self.ensure_one()
+        return require_runtime_environment(self.environment)
+
     # ------------------------------------------------------------------
     # Validation
     # ------------------------------------------------------------------
@@ -236,7 +260,7 @@ class L10nArArcaCertificate(models.Model):
 
     def _check_usable(self):
         """Refuse to use a certificate that cannot produce a valid signature."""
-        self.ensure_one()
+        self._check_runtime_environment()
         if self.state == "revoked":
             raise UserError(_("Certificate '%s' was revoked.", self.name))
         if self.state == "expired":
@@ -281,7 +305,7 @@ class L10nArArcaCertificate(models.Model):
         Reached through sudo on purpose: an invoicing user must be able to sign
         a request without being able to read the key itself.
         """
-        self.ensure_one()
+        self._check_runtime_environment()
         raw = self.sudo().private_key
         if not raw:
             raise UserError(_("Certificate '%s' has no private key.", self.name))
@@ -293,14 +317,14 @@ class L10nArArcaCertificate(models.Model):
             ) from exc
 
     def _get_certificate_pem(self):
-        self.ensure_one()
+        self._check_runtime_environment()
         raw = self.sudo().certificate
         if not raw:
             raise UserError(_("Certificate '%s' has no certificate file.", self.name))
         return base64.b64decode(raw)
 
     def _load_certificate(self):
-        self.ensure_one()
+        self._check_runtime_environment()
         try:
             return x509.load_pem_x509_certificate(self._get_certificate_pem())
         except Exception as exc:  # noqa: BLE001
@@ -354,6 +378,7 @@ class L10nArArcaCertificate(models.Model):
         # caller who may not use it at all. Before them, the answer is
         # `AccessError` in every state.
         self.check_access("write")
+        self._check_runtime_environment()
 
         if self.state == "active":
             raise UserError(
@@ -447,7 +472,7 @@ class L10nArArcaCertificate(models.Model):
         )
 
     def action_upload_certificate(self):
-        self.ensure_one()
+        self._check_runtime_environment()
         return {
             "type": "ir.actions.act_window",
             "name": _("Upload ARCA Certificate"),
@@ -464,7 +489,7 @@ class L10nArArcaCertificate(models.Model):
         authentication failure: a certificate for the wrong key, for the wrong
         CUIT, or already expired.
         """
-        self.ensure_one()
+        self._check_runtime_environment()
         try:
             cert = x509.load_pem_x509_certificate(base64.b64decode(certificate_b64))
         except Exception as exc:  # noqa: BLE001

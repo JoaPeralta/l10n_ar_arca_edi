@@ -68,3 +68,4 @@ class ResCompany(models.Model):
                         company=company.display_name,
                     )
                 )
+            certificate._check_runtime_environment()

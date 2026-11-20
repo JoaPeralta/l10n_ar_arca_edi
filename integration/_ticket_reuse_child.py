@@ -22,6 +22,7 @@ ever among them.
 
 import os
 import sys
+from unittest.mock import patch
 
 MARKER = "ARCA-TEST"
 
@@ -178,9 +179,16 @@ def role_prepare(env):
     # the same numbers the addon's own fixtures use.
     primary = build("cross-process primary", "20222222223", "testing")
     other = build("cross-process other holder", "30111111118", "testing")
-    # Its environment is the only thing that differs from `primary`, and nothing
-    # in this process can reach a network, so it stays inert.
-    production = build("cross-process other environment", "30712345671", "production")
+    # Seed only metadata in the opposite mode, then restore the child to testing.
+    # Do not generate or activate a second credential for this assertion.
+    with patch.dict(os.environ, ARCA_RUNTIME_ENV="production"):
+        production = env["l10n_ar.arca.certificate"].sudo().create(
+            {
+                "name": "cross-process other environment",
+                "company_id": company.id,
+                "holder_cuit": "30712345671",
+            }
+        )
 
     env.cr.commit()
     emit("primary_id", primary.id)
@@ -259,10 +267,15 @@ def role_isolation(env):
         "other_service_authenticates",
         tried_to_authenticate(int(os.environ["ARCA_TEST_CERT_ID"]), "wsfex"),
     )
-    emit(
-        "other_environment_authenticates",
-        tried_to_authenticate(int(os.environ["ARCA_TEST_PRODUCTION_CERT_ID"]), "wsfe"),
-    )
+    from odoo.exceptions import UserError
+
+    production = certificates.browse(int(os.environ["ARCA_TEST_PRODUCTION_CERT_ID"]))
+    try:
+        model._get_or_refresh_token(production, service="wsfe")
+    except UserError as exc:
+        emit("other_environment_refused", "does not match" in str(exc))
+    else:
+        emit("other_environment_refused", False)
 
 
 ROLES = {

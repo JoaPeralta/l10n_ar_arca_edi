@@ -551,6 +551,8 @@ def main(env, environ=None):
     # Nothing is computed before the gate: refusing has to be the first thing
     # this script can do.
     check_gate(environ)
+    if os.environ.get("ARCA_RUNTIME_ENV") != "testing":
+        raise SystemExit("[bootstrap] Refused: ARCA_RUNTIME_ENV must be testing.")
     check_module_installed(env)
 
     # `globals().get`, not `__file__`, and for the same reason `env` is read
@@ -584,6 +586,7 @@ def main(env, environ=None):
     company = target_company(env, environ)
     certificate = find_or_create_certificate(env, company, environ)
     enforce_testing(certificate)
+    certificate._check_runtime_environment()
     load_material(certificate, environ)
     link_company(certificate, company)
     report_ticket(certificate)

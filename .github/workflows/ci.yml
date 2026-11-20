@@ -142,6 +142,8 @@ jobs:
   test:
     name: Odoo 19 tests
     runs-on: ubuntu-latest
+    env:
+      ARCA_RUNTIME_ENV: testing
     container:
       image: odoo:19.0-20260723
       options: --user root

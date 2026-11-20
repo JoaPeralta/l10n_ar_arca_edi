@@ -8,6 +8,7 @@ import uuid
 from odoo import _, api, fields, models
 
 from .arca_errors import ArcaSequenceBusy
+from .arca_runtime import require_runtime_environment
 from .fiscal_transaction import fiscal_transaction
 
 _logger = logging.getLogger(__name__)
@@ -223,6 +224,8 @@ class L10nArArcaAttempt(models.Model):
             )
             return False
 
+        # A historical attempt cannot be reconciled against a different endpoint.
+        require_runtime_environment(self.environment, certificate.environment)
         wsfe = self.env["l10n_ar.arca.wsfe"]
         found = wsfe.fe_comp_consultar(
             certificate,

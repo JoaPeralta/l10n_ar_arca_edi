@@ -14,8 +14,10 @@ supplied `env`.
 
 import ast
 import importlib.util
+import os
 import pathlib
 import unittest
+from unittest.mock import Mock, patch
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 BOOTSTRAP_PATH = REPO_ROOT / "tools" / "arca_homologation_bootstrap.py"
@@ -524,11 +526,15 @@ class TestItRunsTheWayOdooRunsIt(unittest.TestCase):
         """
         calls = []
 
+        class Certificate:
+            def _check_runtime_environment(self):
+                calls.append(("check_certificate_runtime", (), {}))
+
         def recorder(name):
             def record(*args, **kwargs):
                 calls.append((name, args, kwargs))
-                # Two of these feed later steps; anything truthy will do, since
-                # nothing under test reads them.
+                if name == "find_or_create_certificate":
+                    return Certificate()
                 return object()
 
             return record
@@ -546,7 +552,8 @@ class TestItRunsTheWayOdooRunsIt(unittest.TestCase):
         class Env:
             cr = Cursor()
 
-        namespace["main"](Env(), environ={} if environ is None else environ)
+        with patch.dict(os.environ, ARCA_RUNTIME_ENV="testing"):
+            namespace["main"](Env(), environ={} if environ is None else environ)
         return calls, bool(committed)
 
     def recorded_build_marker(self, calls):
@@ -569,6 +576,21 @@ class TestItRunsTheWayOdooRunsIt(unittest.TestCase):
         calls, committed = self.run_main(self.exec_source())
         self.assertTrue(committed, "el commit no llegó a ejecutarse")
         self.assertEqual(calls[0][0], "check_gate")
+        steps = [name for name, _, _ in calls]
+        self.assertLess(steps.index("check_certificate_runtime"), steps.index("load_material"))
+
+    def test_injected_environment_cannot_override_the_process_mode(self):
+        for mode in (None, "production", "invalid"):
+            with self.subTest(mode=mode), patch.dict(os.environ, clear=True):
+                if mode is not None:
+                    os.environ["ARCA_RUNTIME_ENV"] = mode
+                namespace = self.exec_source()
+                namespace["check_gate"] = Mock()
+                namespace["check_module_installed"] = Mock()
+                with self.assertRaisesRegex(SystemExit, "ARCA_RUNTIME_ENV must be testing"):
+                    namespace["main"](None, environ={"ARCA_RUNTIME_ENV": "testing"})
+                namespace["check_gate"].assert_called_once()
+                namespace["check_module_installed"].assert_not_called()
 
     def test_without_a_file_name_there_is_no_build_marker(self):
         """`record_installed_sha` is told there is no marker, not a wrong one.

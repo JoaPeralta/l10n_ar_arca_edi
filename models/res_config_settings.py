@@ -4,6 +4,8 @@
 from odoo import _, api, fields, models
 from odoo.exceptions import UserError
 
+from .arca_runtime import ARCA_ENVIRONMENTS, runtime_environment
+
 
 class ResConfigSettings(models.TransientModel):
     _inherit = "res.config.settings"
@@ -40,6 +42,17 @@ class ResConfigSettings(models.TransientModel):
             "WSASS to act for it."
         ),
     )
+
+    l10n_ar_arca_runtime_environment = fields.Selection(
+        ARCA_ENVIRONMENTS,
+        string="Service Environment",
+        compute="_compute_arca_runtime_environment",
+    )
+
+    def _compute_arca_runtime_environment(self):
+        environment = runtime_environment() or False
+        for settings in self:
+            settings.l10n_ar_arca_runtime_environment = environment
 
     # Computed fields from selected certificate (readonly display)
     l10n_ar_arca_cert_state = fields.Selection(

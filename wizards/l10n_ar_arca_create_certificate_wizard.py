@@ -4,6 +4,11 @@
 from odoo import _, api, fields, models
 from odoo.exceptions import UserError
 
+from ..models.arca_runtime import (
+    ARCA_ENVIRONMENTS,
+    require_runtime_environment,
+    runtime_environment,
+)
 from ..models.l10n_ar_arca_certificate import is_valid_cuit
 
 
@@ -36,10 +41,13 @@ class L10nArArcaCreateCertificateWizard(models.TransientModel):
         help="The company's tax number, reported to ARCA as the issuer.",
     )
     environment = fields.Selection(
-        [("testing", "Testing (Homologación)"), ("production", "Production")],
-        required=True,
-        default="testing",
+        ARCA_ENVIRONMENTS, string="Service Environment", compute="_compute_environment"
     )
+
+    def _compute_environment(self):
+        environment = runtime_environment() or False
+        for wizard in self:
+            wizard.environment = environment
 
     @api.depends("company_id")
     def _compute_holder_cuit(self):
@@ -63,6 +71,7 @@ class L10nArArcaCreateCertificateWizard(models.TransientModel):
     def action_create(self):
         """Create the certificate record and select it for the company."""
         self.ensure_one()
+        environment = require_runtime_environment()
         # The company's own number is what ends up on the invoices, so it has to
         # be right before a certificate is worth creating.
         self.company_id._l10n_ar_arca_issuer_cuit()
@@ -77,10 +86,8 @@ class L10nArArcaCreateCertificateWizard(models.TransientModel):
             {
                 "name": self.name,
                 "company_id": self.company_id.id,
-                # The value shown in the wizard is the one used, so an override
-                # is not silently discarded.
                 "holder_cuit": self.holder_cuit,
-                "environment": self.environment,
+                "environment": environment,
             }
         )
         self.company_id.l10n_ar_arca_certificate_id = certificate

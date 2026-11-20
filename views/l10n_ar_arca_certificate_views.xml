@@ -69,7 +69,7 @@
                                 readonly="state != 'draft'"/>
                             <field name="holder_cuit" readonly="state != 'draft'"/>
                             <field name="issuer_cuit" readonly="1"/>
-                            <field name="environment" readonly="state != 'draft'"/>
+                            <field name="environment" readonly="1"/>
                         </group>
                         <group string="Certificate Info" invisible="state not in ('active', 'expired')">
                             <field name="cert_subject"/>

@@ -41,6 +41,20 @@ They are equal when a company uses its own certificate, and different when a
 person invoices on behalf of a company. The module supports both; it just needs
 to be told which is which.
 
+Service environment
+~~~~~~~~~~~~~~~~~~~
+
+Set ``ARCA_RUNTIME_ENV`` on each Odoo process: use ``testing`` for homologation
+and ``production`` for production. There is no default or in-app selector.
+A missing or invalid setting blocks certificate creation and fiscal operations.
+Existing certificates keep their original environment and data; certificates
+from another environment cannot be assigned or used. Standalone maintenance
+and homologation runners also require an explicit setting.
+
+Deploying Python code alone does not update the form views. Upgrade
+``l10n_ar_arca_edi`` in the target database and verify the effective views before
+treating the environment selector as removed.
+
 Step 1: Check the company's tax number
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -60,7 +74,7 @@ Step 2: Create the certificate record
    certificate. If a person will create it, enter that person's CUIT.
 #. **Invoices on behalf of** is shown read-only: it is the company's tax number
    and confirms which taxpayer will be reported to ARCA.
-#. Choose **Testing (Homologación)**.
+#. Verify that the read-only **Service Environment** matches this installation.
 #. Click **Create Certificate**, then **Generate Key & CSR**.
 
 The private key is generated on the server and stays there. The CSR subject

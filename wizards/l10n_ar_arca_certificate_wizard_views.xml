@@ -35,7 +35,7 @@
                     <field name="holder_cuit"
                         placeholder="CUIT that will create the certificate in ARCA"/>
                     <field name="issuer_cuit" readonly="1"/>
-                    <field name="environment" widget="radio"/>
+                    <field name="environment" readonly="1"/>
                 </group>
                 <footer>
                     <button name="action_create" type="object"

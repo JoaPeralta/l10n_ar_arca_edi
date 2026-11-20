@@ -108,6 +108,7 @@ class L10nArArcaWsaa(models.AbstractModel):
     @api.model
     def _read_cached_token(self, certificate, service):
         """Return cached credentials when they are still comfortably valid."""
+        certificate._check_runtime_environment()
         cache = certificate.sudo().l10n_ar_arca_token_cache or {}
         entry = cache.get(service)
         if not entry:
@@ -126,6 +127,7 @@ class L10nArArcaWsaa(models.AbstractModel):
 
     @api.model
     def _store_token(self, certificate, service, token, sign, expiration):
+        certificate._check_runtime_environment()
         cache = dict(certificate.sudo().l10n_ar_arca_token_cache or {})
         cache[service] = {
             "token": token,
@@ -174,7 +176,7 @@ class L10nArArcaWsaa(models.AbstractModel):
     @api.model
     def _authenticate(self, certificate, service):
         """Call LoginCms and cache the resulting credentials."""
-        certificate.ensure_one()
+        environment = certificate._check_runtime_environment()
         tra_xml = self._build_tra(service)
         cms_signed = self._sign_tra(certificate, tra_xml)
 
@@ -185,7 +187,7 @@ class L10nArArcaWsaa(models.AbstractModel):
             certificate.environment,
         )
 
-        wsdl_url = WSAA_URL[certificate.environment]
+        wsdl_url = WSAA_URL[environment]
         try:
             transport = Transport(timeout=WSAA_TIMEOUT, operation_timeout=WSAA_TIMEOUT)
             client = Client(wsdl_url, transport=transport)
