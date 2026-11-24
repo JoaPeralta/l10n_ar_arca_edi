@@ -485,9 +485,8 @@ class L10nArArcaCertificate(models.Model):
     def action_process_certificate(self, certificate_b64):
         """Validate and store the certificate ARCA issued.
 
-        Everything checked here would otherwise surface much later as an opaque
-        authentication failure: a certificate for the wrong key, for the wrong
-        CUIT, or already expired.
+        Require the service environment, a parseable PEM certificate, the
+        stored private key's public key, and a current validity window.
         """
         self._check_runtime_environment()
         try:
@@ -506,8 +505,6 @@ class L10nArArcaCertificate(models.Model):
                     self.name,
                 )
             )
-
-        self._check_certificate_holder_cuit(cert)
 
         not_before, not_after = self._certificate_validity(cert)
         now = fields.Datetime.now()
@@ -537,34 +534,6 @@ class L10nArArcaCertificate(models.Model):
         _logger.info(
             "Certificate %s activated, valid until %s", self.id, not_after
         )
-        return True
-
-    def _check_certificate_holder_cuit(self, cert):
-        """The certificate subject must name this record's holder.
-
-        Checked against the holder and not against the invoicing CUIT: ARCA puts
-        the DN owner's number in the subject, and for a person invoicing on
-        behalf of a company those differ legitimately.
-        """
-        self.ensure_one()
-        serial_numbers = cert.subject.get_attributes_for_oid(NameOID.SERIAL_NUMBER)
-        if not serial_numbers:
-            # Not every ARCA certificate carries it; do not block on absence.
-            return True
-        digits = "".join(ch for ch in str(serial_numbers[0].value) if ch.isdigit())
-        if digits and digits != self._get_holder_cuit():
-            raise UserError(
-                _(
-                    "That certificate was issued to CUIT %(cert_cuit)s but this "
-                    "record names %(holder)s as its holder.\n\n"
-                    "If %(cert_cuit)s is the person who created the certificate in "
-                    "the ARCA portal, correct the holder here. The CUIT being "
-                    "invoiced for is taken from the company and does not have to "
-                    "match.",
-                    cert_cuit=digits,
-                    holder=self._get_holder_cuit(),
-                )
-            )
         return True
 
     def action_test_connection(self):

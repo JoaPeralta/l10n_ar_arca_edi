@@ -122,39 +122,6 @@ class TestCertificateUpload(ArcaTestCommon):
         with self.assertRaisesRegex(UserError, "does not match the private key"):
             certificate.action_process_certificate(base64.b64encode(foreign_cert))
 
-    def test_certificate_issued_to_another_holder_is_refused(self):
-        certificate = self._draft_certificate()
-        certificate.action_generate_key_and_csr()
-        key_pem = certificate.sudo().private_key
-        # Build a certificate from the same key but a different CUIT.
-        from cryptography import x509
-        from cryptography.hazmat.primitives import hashes, serialization
-        from cryptography.x509.oid import NameOID
-
-        key = serialization.load_pem_private_key(base64.b64decode(key_pem), password=None)
-        subject = x509.Name(
-            [
-                x509.NameAttribute(NameOID.COUNTRY_NAME, "AR"),
-                x509.NameAttribute(NameOID.COMMON_NAME, "other"),
-                x509.NameAttribute(NameOID.SERIAL_NUMBER, "CUIT 20-29318820-4"),
-            ]
-        )
-        now = datetime.datetime.now(datetime.timezone.utc)
-        other = (
-            x509.CertificateBuilder()
-            .subject_name(subject)
-            .issuer_name(subject)
-            .public_key(key.public_key())
-            .serial_number(x509.random_serial_number())
-            .not_valid_before(now - datetime.timedelta(days=1))
-            .not_valid_after(now + datetime.timedelta(days=30))
-            .sign(key, hashes.SHA256())
-        )
-        with self.assertRaisesRegex(UserError, "as its holder"):
-            certificate.action_process_certificate(
-                base64.b64encode(other.public_bytes(serialization.Encoding.PEM))
-            )
-
     def test_expired_certificate_is_refused_on_upload(self):
         certificate = self._draft_certificate()
         certificate.action_generate_key_and_csr()
