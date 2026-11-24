@@ -31,7 +31,7 @@ def _load_upload_model(parse_certificate, runtime):
     runtime_tree = ast.parse(runtime_path.read_text(encoding="utf-8"))
     # Stub imports only; run the real service-environment guard.
     runtime_tree.body = [
-        node for node in runtime_tree.body if not isinstance(node, (ast.Import, ast.ImportFrom))
+        node for node in runtime_tree.body if not isinstance(node, ast.Import | ast.ImportFrom)
     ]
     namespace = {
         "_": _translate,
