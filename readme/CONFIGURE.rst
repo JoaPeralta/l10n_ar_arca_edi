@@ -29,8 +29,8 @@ Emisora)". So:
 **Certificate Holder CUIT**
     Whoever creates the certificate in the ARCA portal with their own fiscal
     key. In homologacion this is normally a natural person, because WSASS is
-    reached with a personal fiscal key. Stored on the certificate record, put in
-    the CSR subject, and checked against the certificate ARCA issues.
+    reached with a personal fiscal key. Stored on the certificate record and
+    included in the CSR subject.
 
 **Issuer CUIT**
     The taxpayer the invoices belong to. Taken from the Odoo company
@@ -126,10 +126,11 @@ Step 5: Upload the certificate in Odoo
 
 #. Back in Odoo, click **Upload Certificate** and upload the ``.crt``.
 
-It is accepted only if it matches the private key generated in Step 2, its
-subject names the **holder** CUIT, and it is within its validity window. The
-subject is not compared against the company's number: for a person invoicing on
-behalf of a company those legitimately differ.
+The upload must be a valid PEM certificate within its validity window, and its
+public key must match the private key generated in Step 2. The certificate
+record's environment must match ``ARCA_RUNTIME_ENV``. Odoo does not compare
+the uploaded certificate's subject with the holder or issuer CUIT. The upload
+does not change the stored holder CUIT or the existing CSR.
 
 Step 6: Test the connection
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~

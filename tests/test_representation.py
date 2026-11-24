@@ -14,13 +14,10 @@ test here runs with them different on purpose.
 """
 
 import base64
-import datetime
 
 from cryptography import x509
-from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.x509.oid import NameOID
 
-from odoo.exceptions import UserError
 from odoo.tests import tagged
 
 from .common import TEST_HOLDER_CUIT, ArcaTestCommon, FakeArcaService
@@ -68,91 +65,12 @@ class TestArcaRepresentation(ArcaTestCommon):
         self.assertEqual(serial, f"CUIT {expected_digits}")
         self.assertNotIn(self.issuer_cuit, serial)
 
-    def test_the_certificate_is_validated_against_the_holder(self):
-        """Accepted because the subject names the holder, not the company."""
+    def test_the_fixture_certificate_carries_the_holder(self):
+        """The uploaded certificate fixture has the holder in its subject."""
         self.assertEqual(self.certificate.state, "active")
         cert = self.certificate._load_certificate()
         serial = cert.subject.get_attributes_for_oid(NameOID.SERIAL_NUMBER)[0].value
         self.assertIn(self.certificate._get_holder_cuit(), serial.replace("-", ""))
-
-    def test_a_certificate_issued_to_someone_else_is_refused(self):
-        """The subject must match the holder, whoever the company is."""
-        certificate = self.env["l10n_ar.arca.certificate"].create(
-            {
-                "name": "Mismatched subject",
-                "company_id": self.company_ri.id,
-                "holder_cuit": TEST_HOLDER_CUIT,
-                "environment": "testing",
-            }
-        )
-        certificate.action_generate_key_and_csr()
-        key = serialization.load_pem_private_key(
-            base64.b64decode(certificate.sudo().private_key), password=None
-        )
-        # Same key, but ARCA issued it to a different person.
-        subject = x509.Name(
-            [
-                x509.NameAttribute(NameOID.COUNTRY_NAME, "AR"),
-                x509.NameAttribute(NameOID.COMMON_NAME, "somebody-else"),
-                x509.NameAttribute(NameOID.SERIAL_NUMBER, "CUIT 20-29318820-4"),
-            ]
-        )
-        now = datetime.datetime.now(datetime.timezone.utc)
-        foreign = (
-            x509.CertificateBuilder()
-            .subject_name(subject)
-            .issuer_name(subject)
-            .public_key(key.public_key())
-            .serial_number(x509.random_serial_number())
-            .not_valid_before(now - datetime.timedelta(days=1))
-            .not_valid_after(now + datetime.timedelta(days=30))
-            .sign(key, hashes.SHA256())
-        )
-        with self.assertRaisesRegex(UserError, "names .* as its holder"):
-            certificate.action_process_certificate(
-                base64.b64encode(foreign.public_bytes(serialization.Encoding.PEM))
-            )
-
-    def test_a_certificate_issued_to_the_company_is_not_accepted_for_a_person(self):
-        """The company's own CUIT is not a substitute for the holder's."""
-        certificate = self.env["l10n_ar.arca.certificate"].create(
-            {
-                "name": "Company subject, person holder",
-                "company_id": self.company_ri.id,
-                "holder_cuit": TEST_HOLDER_CUIT,
-                "environment": "testing",
-            }
-        )
-        certificate.action_generate_key_and_csr()
-        key = serialization.load_pem_private_key(
-            base64.b64decode(certificate.sudo().private_key), password=None
-        )
-        digits = self.issuer_cuit
-        subject = x509.Name(
-            [
-                x509.NameAttribute(NameOID.COUNTRY_NAME, "AR"),
-                x509.NameAttribute(NameOID.COMMON_NAME, "the-company"),
-                x509.NameAttribute(
-                    NameOID.SERIAL_NUMBER,
-                    f"CUIT {digits[:2]}-{digits[2:10]}-{digits[10]}",
-                ),
-            ]
-        )
-        now = datetime.datetime.now(datetime.timezone.utc)
-        company_cert = (
-            x509.CertificateBuilder()
-            .subject_name(subject)
-            .issuer_name(subject)
-            .public_key(key.public_key())
-            .serial_number(x509.random_serial_number())
-            .not_valid_before(now - datetime.timedelta(days=1))
-            .not_valid_after(now + datetime.timedelta(days=30))
-            .sign(key, hashes.SHA256())
-        )
-        with self.assertRaisesRegex(UserError, "names .* as its holder"):
-            certificate.action_process_certificate(
-                base64.b64encode(company_cert.public_bytes(serialization.Encoding.PEM))
-            )
 
     # ------------------------------------------------------------------
     # 3: WSAA signs with the holder's material, and carries no representation

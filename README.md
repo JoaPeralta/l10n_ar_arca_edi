@@ -106,7 +106,7 @@ ARCA works with two identities, and the module keeps them apart:
 
 | | Where it comes from | What it is used for |
 |---|---|---|
-| **Certificate holder** | `holder_cuit` on the certificate | CSR subject; validating the certificate ARCA issues |
+| **Certificate holder** | `holder_cuit` on the certificate | CSR subject |
 | **Issuer (represented)** | the Odoo company's Tax ID | `Auth.Cuit`, the QR, the attempt log, the numbering lock |
 
 WSASS issues a certificate to whoever signs in with their own fiscal key, and
