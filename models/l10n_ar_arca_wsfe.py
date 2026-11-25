@@ -7,6 +7,8 @@ import time
 
 import requests
 import zeep
+from requests.adapters import HTTPAdapter
+from urllib3.util.ssl_ import create_urllib3_context
 from zeep import Client
 from zeep.cache import InMemoryCache
 from zeep.transports import Transport
@@ -19,10 +21,14 @@ from .arca_errors import ArcaAborted, ArcaBusinessError, ArcaUncertain
 _logger = logging.getLogger(__name__)
 
 # WSFEv1 endpoints (mercado interno: Facturas A, B, C, M and their notes).
+WSFE_PRODUCTION_ORIGIN = "https://servicios1.afip.gov.ar/"
 WSFE_URL = {
     "testing": "https://wswhomo.afip.gov.ar/wsfev1/service.asmx?WSDL",
-    "production": "https://servicios1.afip.gov.ar/wsfev1/service.asmx?WSDL",
+    "production": f"{WSFE_PRODUCTION_ORIGIN}wsfev1/service.asmx?WSDL",
 }
+
+# ARCA production can offer finite-field DH parameters below OpenSSL's minimum.
+ARCA_CIPHERS = "DEFAULT:!DH"
 
 # Seconds. FECAESolicitar is the slow one; ARCA is routinely slow at month end.
 WSDL_TIMEOUT = 30
@@ -41,6 +47,20 @@ ERROR_CUIT_NOT_REPRESENTED = 601
 # trip plus XML parsing. Cache per URL, per process.
 _WSDL_CLIENT_CACHE = {}
 _WSDL_CLIENT_LOCK = threading.Lock()
+
+
+class FiscalHTTPAdapter(HTTPAdapter):
+    """Exclude finite-field DH without relaxing certificate verification."""
+
+    def init_poolmanager(self, *args, **kwargs):
+        kwargs["ssl_context"] = create_urllib3_context(ciphers=ARCA_CIPHERS)
+        return super().init_poolmanager(*args, **kwargs)
+
+    def proxy_manager_for(self, proxy, **kwargs):
+        if proxy not in self.proxy_manager:
+            # Set the context for the WSFE TLS tunnel, not the proxy's own TLS.
+            kwargs["ssl_context"] = create_urllib3_context(ciphers=ARCA_CIPHERS)
+        return super().proxy_manager_for(proxy, **kwargs)
 
 
 class L10nArArcaWsfe(models.AbstractModel):
@@ -79,6 +99,10 @@ class L10nArArcaWsfe(models.AbstractModel):
                     cache=InMemoryCache(),
                 )
                 try:
+                    if environment == "production":
+                        # The slash bounds the mount to this hostname. Zeep reuses
+                        # this session for WSDL retrieval and SOAP operations.
+                        transport.session.mount(WSFE_PRODUCTION_ORIGIN, FiscalHTTPAdapter())
                     client = Client(wsdl_url, transport=transport)
                 except Exception as exc:  # noqa: BLE001
                     # Failing to load the WSDL means nothing was ever sent.

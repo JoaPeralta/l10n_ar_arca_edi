@@ -2,8 +2,13 @@
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
 """Runtime admission using metadata-only fixtures; no cryptography or network."""
 
+import ssl
 from types import SimpleNamespace
 from unittest.mock import patch
+
+from requests import Response
+from requests.adapters import HTTPAdapter
+from urllib3.util.ssl_ import create_urllib3_context
 
 from odoo.exceptions import UserError
 from odoo.tests import TransactionCase, tagged
@@ -12,6 +17,7 @@ from ..models import arca_runtime as runtime_module
 from ..models import l10n_ar_arca_certificate as certificate_module
 from ..models import l10n_ar_arca_wsaa as wsaa_module
 from ..models import l10n_ar_arca_wsfe as wsfe_module
+from ..models.arca_errors import ArcaAborted
 
 
 def configured_runtime(mode=None):
@@ -111,8 +117,99 @@ class TestArcaRuntimeEnvironment(TransactionCase):
                 try:
                     self.assertIs(wsfe._get_client(record), client.return_value)
                     self.assertEqual(client.call_args.args[0], wsfe_module.WSFE_URL[mode])
+                    if mode == "testing":
+                        session = client.call_args.kwargs["transport"].session
+                        self.assertEqual(set(session.adapters), {"http://", "https://", "file://"})
+                        self.assertIs(type(session.get_adapter(wsfe_module.WSFE_URL[mode])), HTTPAdapter)
                 finally:
                     wsfe._clear_client_cache()
+
+    def test_production_wsfe_limits_the_tls_context_to_the_wsfe_host(self):
+        wsfe = self.env["l10n_ar.arca.wsfe"]
+        self.addCleanup(wsfe._clear_client_cache)
+        wsfe._clear_client_cache()
+        with configured_runtime("production"), patch.object(wsfe_module, "Client") as client:
+            wsfe._get_client(self._certificate())
+
+        wsdl_url = wsfe_module.WSFE_URL["production"]
+        transport = client.call_args.kwargs["transport"]
+        session = transport.session
+        default_adapter = session.adapters["https://"]
+        fiscal_adapter = session.get_adapter(wsdl_url)
+        self.assertIsNot(fiscal_adapter, default_adapter)
+        self.assertIs(type(default_adapter), HTTPAdapter)
+        self.assertIs(session.verify, True)
+        for url in (
+            wsfe_module.WSFE_URL["testing"],
+            wsaa_module.WSAA_URL["production"],
+            "https://servicios1.afip.gov.ar.example.test/wsfev1/service.asmx",
+            "https://servicios1.afip.gov.ar@example.test/wsfev1/service.asmx",
+        ):
+            self.assertIs(session.get_adapter(url), default_adapter)
+
+        proxy_manager = fiscal_adapter.proxy_manager_for("https://proxy.example.test")
+        self.assertIsNone(proxy_manager.proxy_config.ssl_context)
+        for manager in (fiscal_adapter.poolmanager, proxy_manager):
+            context = manager.connection_pool_kw["ssl_context"]
+            self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+            self.assertTrue(context.check_hostname)
+            self.assertEqual(context.security_level, create_urllib3_context().security_level)
+            self.assertNotIn("kx-dhe", {cipher["kea"] for cipher in context.get_ciphers()})
+
+    def test_production_wsfe_uses_the_same_adapter_for_wsdl_and_soap(self):
+        wsfe = self.env["l10n_ar.arca.wsfe"]
+        self.addCleanup(wsfe._clear_client_cache)
+        wsfe._clear_client_cache()
+        with configured_runtime("production"), patch.object(wsfe_module, "Client") as client:
+            wsfe._get_client(self._certificate())
+
+        wsdl_url = client.call_args.args[0]
+        soap_url = wsdl_url.removesuffix("?WSDL")
+        transport = client.call_args.kwargs["transport"]
+        session = transport.session
+        session.trust_env = False  # Keep the offline test independent of ambient proxy and CA settings.
+        wsdl, soap = Response(), Response()
+        wsdl.status_code = soap.status_code = 200
+        wsdl._content = b"<definitions/>"
+        soap._content = b"<Envelope/>"
+        # Odoo blocks external URLs at Session.send before Requests reaches an adapter.
+        with patch.object(session, "send", side_effect=[wsdl, soap]) as send:
+            self.assertEqual(transport.load(wsdl_url), wsdl.content)
+            self.assertIs(transport.post(soap_url, b"<Envelope/>", {}), soap)
+
+        self.assertEqual(len(send.call_args_list), 2)
+        fiscal_adapter = session.get_adapter(wsdl_url)
+        self.assertIsNot(fiscal_adapter, session.adapters["https://"])
+        for call, method, url, timeout in zip(
+            send.call_args_list,
+            ("GET", "POST"),
+            (wsdl_url, soap_url),
+            (wsfe_module.WSDL_TIMEOUT, wsfe_module.OPERATION_TIMEOUT),
+            strict=True,
+        ):
+            (request,) = call.args
+            self.assertIs(session.get_adapter(request.url), fiscal_adapter)
+            self.assertEqual((request.method, request.url), (method, url))
+            self.assertEqual(call.kwargs["timeout"], timeout)
+            self.assertIs(call.kwargs["verify"], True)
+
+    def test_wsaa_keeps_its_default_https_adapter_in_both_environments(self):
+        wsaa = self.env["l10n_ar.arca.wsaa"]
+        for mode in ("testing", "production"):
+            with (
+                self.subTest(mode=mode),
+                configured_runtime(mode),
+                patch.object(type(wsaa), "_sign_tra", return_value="synthetic CMS"),
+                patch.object(wsaa_module, "Client", side_effect=ValueError("offline test")) as client,
+                self.assertRaisesRegex(ArcaAborted, "offline test"),
+            ):
+                wsaa._authenticate(self._certificate(), "wsfe")
+
+            url = wsaa_module.WSAA_URL[mode]
+            self.assertEqual(client.call_args.args[0], url)
+            session = client.call_args.kwargs["transport"].session
+            self.assertEqual(set(session.adapters), {"http://", "https://", "file://"})
+            self.assertIs(type(session.get_adapter(url)), HTTPAdapter)
 
     def test_reconciliation_preserves_attempt_whose_mode_does_not_match(self):
         with configured_runtime("production"):
